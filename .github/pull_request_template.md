@@ -1,0 +1,1 @@
+- [ ] By submitting a contribution, I agree to the terms in `CLA.md`.
