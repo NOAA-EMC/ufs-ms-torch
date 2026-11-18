@@ -9,15 +9,13 @@ NetCDF, source-oracle IO, or host synchronization belongs on the target path.
 
 from __future__ import annotations
 
-from dataclasses import asdict
-import hashlib
 import struct
-import types
-from typing import Callable, Mapping, Sequence
+from typing import Mapping, Sequence
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
-from .cases import SURFACE_DIAG_OUTPUT_FIELDS, SURFACE_DIFF_OUTPUT_FIELDS, SurfaceCaseConfig
+from .cases import SurfaceCaseConfig
 
 
 GRAV = 9.80665
@@ -31,69 +29,6 @@ CON_ROCP = RD / CP
 CON_T0C = 273.15
 CON_KARMAN = 0.4
 _FPVS_TABLE_CACHE: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
-_COMPILED_RUN_CACHE: dict[tuple[object, ...], Callable[..., tuple[torch.Tensor, ...]]] = {}
-_COMPILED_REGION_CACHE: dict[tuple[object, ...], Callable[..., object]] = {}
-_REGION_INPUT_FIELDS = {
-    "wind": ("u1", "v1", "usfco", "vsfco"),
-    "temperature": ("tskin", "t1", "prslki", "lake_t2m"),
-    "humidity": ("q1", "tskin", "ps", "evap", "qsurf", "lake_q2m"),
-    "ruc_temperature": ("ps", "tskin", "shflx", "t1", "lake_t2m", "zf"),
-    "ruc_humidity": ("t1", "ps", "q1", "qsurf", "cdq", "wind", "evap", "lake_q2m", "zf"),
-    "dewpoint": ("ps",),
-}
-_REGION_CONFIG_FIELDS = {
-    "diffusion": ("ivegsrc", "sfc_z0_type", "redrag", "use_oceanuv", "thsfc_loc",
-                  "use_lake2m", "iopt_lake", "iopt_lake_clm", "default_real_bytes"),
-    "wind": ("use_oceanuv",),
-    "temperature": ("thsfc_loc",),
-    "humidity": (),
-    "ruc_temperature": ("diag_flux", "diag_log"),
-    "ruc_humidity": ("diag_flux", "diag_log"),
-    "dewpoint": (),
-}
-
-
-def _region_signature(value: object) -> object:
-    if isinstance(value, torch.Tensor):
-        return (tuple(value.shape), tuple(value.stride()), value.dtype, value.device,
-                value.requires_grad, value.layout)
-    if isinstance(value, Mapping):
-        return tuple((name, _region_signature(tensor)) for name, tensor in value.items())
-    if isinstance(value, tuple):
-        return tuple(_region_signature(item) for item in value)
-    if isinstance(value, SurfaceCaseConfig):
-        return value
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return (type(value), value)
-    raise TypeError(f"unsupported surface-region argument: {type(value).__name__}")
-
-
-def _run_surface_region(name: str, fn: Callable, *args: object,
-                        max_fusion_size: int | None = None):
-    if torch.compiler.is_compiling():
-        return fn(*args)
-    if name in _REGION_INPUT_FIELDS:
-        fields, *rest = args
-        args = ({field: fields[field] for field in _REGION_INPUT_FIELDS[name]}, *rest)
-    def signature(value):
-        if isinstance(value, SurfaceCaseConfig):
-            return tuple((field, getattr(value, field))
-                         for field in _REGION_CONFIG_FIELDS[name])
-        return _region_signature(value)
-    key = (name, id(fn), max_fusion_size, torch.is_grad_enabled(), torch.is_inference_mode_enabled(),
-           tuple(signature(value) for value in args))
-    compiled = _COMPILED_REGION_CACHE.get(key)
-    if compiled is None:
-        suffix = hashlib.sha256(repr(key).encode()).hexdigest()[:16]
-        code_name = f"{fn.__name__}_{suffix}"
-        code = fn.__code__.replace(co_name=code_name, co_qualname=code_name)
-        specialized = types.FunctionType(code, fn.__globals__, code_name,
-                                         fn.__defaults__, fn.__closure__)
-        specialized.__kwdefaults__ = fn.__kwdefaults__
-        options = {} if max_fusion_size is None else {"max_fusion_size": max_fusion_size}
-        compiled = torch.compile(specialized, fullgraph=True, dynamic=False, options=options)
-        _COMPILED_REGION_CACHE[key] = compiled
-    return compiled(*args)
 
 
 def _c(value: float, like: torch.Tensor) -> torch.Tensor:
@@ -128,10 +63,6 @@ def _round_r4(value: float) -> float:
     """Match unsuffixed Fortran real literals assigned to kind_phys constants."""
 
     return struct.unpack("f", struct.pack("f", float(value)))[0]
-
-
-def _r4(value: float) -> float:
-    return _round_r4(value)
 
 
 def _r4_tuple(*values: float) -> tuple[float, ...]:
@@ -477,33 +408,18 @@ def _apply_stability_outputs(
         out[field] = _where(mask, values[name], out[field])
 
 
-_STABILITY_OUTPUT_NAMES = ("rb", "fm", "fh", "fm10", "fh2", "cm", "ch", "stress", "ustar")
-
-
-def _stability_region(z1, zvfun, gdx, tv1, thv1, wind, z0max, ztmax, tvs, thsfc_loc):
-    values = stability(z1, zvfun, gdx, tv1, thv1, wind, z0max, ztmax, tvs,
-                       thsfc_loc=thsfc_loc)
-    return tuple(values[name] for name in _STABILITY_OUTPUT_NAMES)
-
-
-def _evaluate_stability(*args, thsfc_loc, compile_stability, max_fusion_size):
+def _evaluate_stability(*args, thsfc_loc):
     # Float32 evaluates in float64 and rounds each output once (no-op in float64). Every column
     # computes both stability branches and all three surface types; in the discarded lanes float32
     # backward factors (x**-1.5 at the 1e-30 floor, (a/b)/b) overflow, and 0 * inf is NaN.
     working = args[0].dtype
     if working == torch.float32:
         args = tuple(value.double() for value in args)
-    if not compile_stability:
-        values = stability(*args, thsfc_loc=thsfc_loc)
-    else:
-        values = dict(zip(_STABILITY_OUTPUT_NAMES, _run_surface_region(
-            "stability", _stability_region, *args, thsfc_loc, max_fusion_size=max_fusion_size), strict=True))
+    values = stability(*args, thsfc_loc=thsfc_loc)
     return {name: value.to(working) for name, value in values.items()}
 
 
-def sfc_diff_run(fields: Mapping[str, torch.Tensor], cfg: SurfaceCaseConfig, *,
-                 _compile_stability: bool = False,
-                 _region_fusion_size: int | None = None) -> dict[str, torch.Tensor]:
+def sfc_diff_run(fields: Mapping[str, torch.Tensor], cfg: SurfaceCaseConfig) -> dict[str, torch.Tensor]:
     q = fields
     out = dict(q)
     one = torch.ones_like(q["ps"])
@@ -535,8 +451,7 @@ def sfc_diff_run(fields: Mapping[str, torch.Tensor], cfg: SurfaceCaseConfig, *,
         zero,
     )
     land = _evaluate_stability(q["z1"], zvfun_lnd, gdx, tv1, thv1, q["wind"], z0_lnd, zt_lnd, tvs_lnd,
-                               thsfc_loc=cfg.thsfc_loc, compile_stability=_compile_stability,
-                               max_fusion_size=_region_fusion_size)
+                               thsfc_loc=cfg.thsfc_loc)
     out["ztmax_lnd"] = _where(dry_mask, zt_lnd, out["ztmax_lnd"])
     zvfun = _where(dry_mask, zvfun_lnd, zvfun)
     _apply_stability_outputs(out, "lnd", dry_mask, land)
@@ -549,8 +464,7 @@ def sfc_diff_run(fields: Mapping[str, torch.Tensor], cfg: SurfaceCaseConfig, *,
         tvs_ice = tvs_ice / q["prsik1"]
     tvs_ice = tvs_ice * virtfac
     ice = _evaluate_stability(q["z1"], zero, gdx, tv1, thv1, q["wind"], z0_ice, zt_ice, tvs_ice,
-                              thsfc_loc=cfg.thsfc_loc, compile_stability=_compile_stability,
-                              max_fusion_size=_region_fusion_size)
+                              thsfc_loc=cfg.thsfc_loc)
     out["ztmax_ice"] = _where(icy_mask, zt_ice, out["ztmax_ice"])
     zvfun = _where(icy_mask, zero, zvfun)
     _apply_stability_outputs(out, "ice", icy_mask, ice)
@@ -579,8 +493,7 @@ def sfc_diff_run(fields: Mapping[str, torch.Tensor], cfg: SurfaceCaseConfig, *,
         out["zvfun"] = zvfun
         return out
     water = _evaluate_stability(q["z1"], zero, gdx, tv1, thv1, windrel, z0_wat, zt_wat, tvs_wat,
-                                thsfc_loc=cfg.thsfc_loc, compile_stability=_compile_stability,
-                                max_fusion_size=_region_fusion_size)
+                                thsfc_loc=cfg.thsfc_loc)
     out["ztmax_wat"] = _where(wet_mask, zt_wat, out["ztmax_wat"])
     zvfun = _where(wet_mask, zero, zvfun)
     _apply_stability_outputs(out, "wat", wet_mask, water)
@@ -588,7 +501,9 @@ def sfc_diff_run(fields: Mapping[str, torch.Tensor], cfg: SurfaceCaseConfig, *,
     viscous_coefficient = 0.11 if cfg.default_real_bytes == 8 else _R4_0P11
     viscous = torch.div(viscous_coefficient * 1.4e-5, _max(out["ustar_wat"], 1.0e-30))
     z0_wave = viscous + 0.01 * q["z0rl_wav"]
-    z0_charnock = viscous + (0.018 / GRAV) * out["ustar_wat"] * out["ustar_wat"]
+    # Charnock (0.018); an optional trainable scale (0-d tensor field ``charnock_scale``) multiplies it.
+    charnock = 0.018 / GRAV if "charnock_scale" not in q else (0.018 / GRAV) * q["charnock_scale"]
+    z0_charnock = viscous + charnock * out["ustar_wat"] * out["ustar_wat"]
     cap = 0.00317 if cfg.redrag else 0.1
     wave_ok = (q["lakefrac"] == 0.0) & (q["fice"] == 0.0) & (q["z0rl_wav"] > 1.0e-7) & (q["z0rl_wav"] < 0.1)
     wav_out = (q["z0rl_wav"] <= 1.0e-7) | (q["z0rl_wav"] >= 0.1)
@@ -660,7 +575,7 @@ def fpvs(t: torch.Tensor, table: torch.Tensor | None = None) -> torch.Tensor:
 
 
 def _mix_surface_field(state: Mapping[str, torch.Tensor], base: str) -> torch.Tensor:
-    dry = state["dry"]
+    state["dry"]  # a required input: dry is the land case left by wet and icy
     icy = state["icy"]
     wet = state["wet"]
     land = state[f"{base}_lnd"]
@@ -706,7 +621,7 @@ def _wind_diagnostics(q, cfg, geometry):
 def _optional_lake_diagnostic(q, name, have_2m, value):
     if name in q:
         return _where(have_2m, q[name], value)
-    torch._assert_async((~have_2m).all(), "active lake diagnostic needs its host buffer")
+    torch_compat.assert_async((~have_2m).all(), "active lake diagnostic needs its host buffer")
     return value
 
 
@@ -803,166 +718,20 @@ def _dewpoint(q, geometry, t2_ruc, q2_ruc):
 
 
 def sfc_diag_run(fields: Mapping[str, torch.Tensor], cfg: SurfaceCaseConfig, *,
-                 fpvs_table: torch.Tensor | None = None,
-                 _geometry: tuple[torch.Tensor, ...] | None = None,
-                 _compile_regions: bool = False,
-                 _region_fusion_size: int | None = None,
-                 _diag_error: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+                 fpvs_table: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     q = fields
     out = dict(q)
     if fpvs_table is None:
         fpvs_table = fpvs_table_like(q["ps"])
-    geometry = _diagnostic_geometry(q, cfg) if _geometry is None else _geometry
-    def apply(name, fn, *args):
-        return (_run_surface_region(name, fn, *args, max_fusion_size=_region_fusion_size)
-                if _compile_regions else fn(*args))
-    out["f10m"], out["u10m_diag"], out["v10m_diag"] = apply("wind", _wind_diagnostics, q, cfg, geometry)
+    geometry = _diagnostic_geometry(q, cfg)
+    out["f10m"], out["u10m_diag"], out["v10m_diag"] = _wind_diagnostics(q, cfg, geometry)
     if cfg.lsm == cfg.lsm_ruc:
-        t2, out["t2m"] = apply("ruc_temperature", _ruc_temperature, q, cfg, geometry)
-        q2, out["q2m"] = apply("ruc_humidity", _ruc_humidity, q, cfg, geometry, t2, fpvs_table)
-        out["dpt2m"] = apply("dewpoint", _dewpoint, q, geometry, t2, q2)
+        t2, out["t2m"] = _ruc_temperature(q, cfg, geometry)
+        q2, out["q2m"] = _ruc_humidity(q, cfg, geometry, t2, fpvs_table)
+        out["dpt2m"] = _dewpoint(q, geometry, t2, q2)
     else:
-        t2, out["t2m"] = apply("temperature", _nonruc_temperature, q, cfg, geometry)
-        out["q2m"] = apply("humidity", _nonruc_humidity, q, cfg, geometry, t2, fpvs_table)
+        t2, out["t2m"] = _nonruc_temperature(q, cfg, geometry)
+        out["q2m"] = _nonruc_humidity(q, cfg, geometry, t2, fpvs_table)
         out["dpt2m"] = torch.full_like(t2, float("nan"))
-    out["errflg_diag"] = (torch.zeros((), dtype=torch.int64, device=q["ps"].device)
-                           if _diag_error is None else _diag_error)
+    out["errflg_diag"] = torch.zeros((), dtype=torch.int64, device=q["ps"].device)
     return out
-
-
-def run_sfc_diff_two_passes(fields: Mapping[str, torch.Tensor], cfg: SurfaceCaseConfig, *,
-                          _compile_stability: bool = False,
-                          _region_fusion_size: int | None = None) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    first = sfc_diff_run(fields, cfg, _compile_stability=_compile_stability,
-                         _region_fusion_size=_region_fusion_size)
-    second = sfc_diff_run(first, cfg, _compile_stability=_compile_stability,
-                          _region_fusion_size=_region_fusion_size)
-    return first, second
-
-
-def run_gfs_surface_layer(
-    fields: Mapping[str, torch.Tensor],
-    cfg: SurfaceCaseConfig,
-    *,
-    fpvs_table: torch.Tensor | None = None,
-    _compile_regions: bool = False,
-    _region_fusion_size: int | None = None,
-    _compile_stability: bool = False,
-) -> dict[str, torch.Tensor]:
-    if _compile_regions and not _compile_stability:
-        if fpvs_table is None:
-            fpvs_table = fpvs_table_like(fields["ps"])
-        values = _run_surface_region("diffusion", _diffusion_geometry_block, fields, cfg,
-                                     max_fusion_size=_region_fusion_size)
-        names = (*SURFACE_DIFF_OUTPUT_FIELDS, "errflg")
-        second = {**fields, **dict(zip(names, values[:len(names)], strict=True))}
-        return sfc_diag_run(second, cfg, fpvs_table=fpvs_table,
-                            _geometry=values[len(names):-1], _compile_regions=True,
-                            _region_fusion_size=_region_fusion_size,
-                            _diag_error=values[-1])
-    _, second = run_sfc_diff_two_passes(fields, cfg, _compile_stability=_compile_stability,
-                                       _region_fusion_size=_region_fusion_size)
-    return sfc_diag_run(second, cfg, fpvs_table=fpvs_table,
-                        _compile_regions=_compile_regions,
-                        _region_fusion_size=_region_fusion_size)
-
-
-def _diffusion_geometry_block(fields, cfg):
-    _, second = run_sfc_diff_two_passes(fields, cfg)
-    names = (*SURFACE_DIFF_OUTPUT_FIELDS, "errflg")
-    geometry = _diagnostic_geometry(second, cfg)
-    diag_error = torch.zeros((), dtype=torch.int64, device=fields["ps"].device)
-    return tuple(second[name] for name in names) + geometry + (diag_error,)
-
-
-def run_gfs_surface_layer_regional_compiled(fields, cfg, *, max_fusion_size: int | None = None,
-                                           stability_only: bool = False,
-                                           fpvs_table: torch.Tensor | None = None):
-    """Opt-in same-science regions with independent diagnostic dependencies."""
-    return run_gfs_surface_layer(fields, cfg, fpvs_table=fpvs_table, _compile_regions=True,
-                                 _region_fusion_size=max_fusion_size,
-                                 _compile_stability=stability_only)
-
-
-def _surface_output_names(fields: Mapping[str, torch.Tensor], output_names: Sequence[str] | None) -> tuple[str, ...]:
-    if output_names is not None:
-        return tuple(output_names)
-    return tuple(dict.fromkeys((*fields.keys(), *SURFACE_DIFF_OUTPUT_FIELDS, "errflg", *SURFACE_DIAG_OUTPUT_FIELDS, "errflg_diag")))
-
-
-def _compiled_run_key(
-    fields: Mapping[str, torch.Tensor],
-    cfg: SurfaceCaseConfig,
-    output_names: tuple[str, ...],
-    backend: str | None,
-    max_fusion_size: int | None = None,
-) -> tuple[object, ...]:
-    tensor_signature = tuple(
-        (name, tuple(value.shape), tuple(value.stride()), value.dtype, value.device,
-         value.requires_grad, value.layout)
-        for name, value in fields.items()
-    )
-    return (cfg, tuple(fields.keys()), output_names, backend, max_fusion_size,
-            torch.is_grad_enabled(), torch.is_inference_mode_enabled(), tensor_signature)
-
-
-def run_gfs_surface_layer_compiled(
-    fields: Mapping[str, torch.Tensor],
-    cfg: SurfaceCaseConfig,
-    *,
-    output_names: Sequence[str] | None = None,
-    backend: str | None = None,
-    max_fusion_size: int | None = None,
-    fpvs_table: torch.Tensor | None = None,
-) -> dict[str, torch.Tensor]:
-    """Run the surface core through a cached fullgraph torch.compile wrapper."""
-
-    if not hasattr(torch, "compile"):
-        raise RuntimeError("torch.compile is unavailable")
-    names = tuple(fields.keys())
-    selected_outputs = _surface_output_names(fields, output_names)
-    if max_fusion_size is not None and max_fusion_size < 1:
-        raise ValueError("max_fusion_size must be positive")
-    if fpvs_table is None:
-        fpvs_table = fpvs_table_like(fields["ps"])
-    if fpvs_table.device != fields["ps"].device or fpvs_table.dtype != fields["ps"].dtype or fpvs_table.shape != (7501,):
-        raise ValueError("surface FPVS table must have7501 entries on the input device/dtype")
-    table_signature = (tuple(fpvs_table.shape), tuple(fpvs_table.stride()), fpvs_table.dtype,
-                       fpvs_table.device, fpvs_table.requires_grad)
-    key = (*_compiled_run_key(fields, cfg, selected_outputs, backend, max_fusion_size), table_signature)
-    compiled = _COMPILED_RUN_CACHE.get(key)
-    if compiled is None:
-        def kernel(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
-            local_fields = dict(zip(names, args[:-1], strict=True))
-            out = run_gfs_surface_layer(local_fields, cfg, fpvs_table=args[-1])
-            return tuple(out[name] for name in selected_outputs)
-
-        compile_kwargs: dict[str, object] = {"fullgraph": True, "dynamic": False}
-        if max_fusion_size is not None:
-            compile_kwargs["options"] = {"max_fusion_size": max_fusion_size}
-        if backend is not None:
-            compile_kwargs["backend"] = backend
-        code_name = "surface_call_" + hashlib.sha256(repr(key).encode()).hexdigest()[:16]
-        specialized = types.FunctionType(
-            kernel.__code__.replace(co_name=code_name, co_qualname=code_name),
-            kernel.__globals__, code_name, kernel.__defaults__, kernel.__closure__)
-        compiled = torch.compile(specialized, **compile_kwargs)
-        _COMPILED_RUN_CACHE[key] = compiled
-    return dict(zip(selected_outputs, compiled(*(fields[name] for name in names), fpvs_table), strict=True))
-
-
-def config_as_dict(cfg: SurfaceCaseConfig) -> dict[str, object]:
-    return asdict(cfg)
-
-
-def run_gfs_surface_layer_efficient(fields, cfg, *, max_fusion_size: int = 128,
-                                    fpvs_table: torch.Tensor | None = None):
-    """Opt-in CPU-qualified scheduling; CUDA qualification is still pending.
-
-    Reusable stability regions preserve independent-output unused gradients.
-    Both policies execute the same surface equations and return the full map.
-    """
-    if torch.is_grad_enabled() and any(value.requires_grad for value in fields.values()):
-        return run_gfs_surface_layer_regional_compiled(
-            fields, cfg, max_fusion_size=max_fusion_size, stability_only=True, fpvs_table=fpvs_table)
-    return run_gfs_surface_layer_compiled(fields, cfg, max_fusion_size=max_fusion_size, fpvs_table=fpvs_table)

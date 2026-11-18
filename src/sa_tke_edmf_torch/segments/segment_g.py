@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import torch
+from ufs_physics_common.ordered_sum import level_sum
 
 from sa_tke_edmf_torch.compile import run_compile_island
 from sa_tke_edmf_torch.constants import (
@@ -16,17 +17,12 @@ from sa_tke_edmf_torch.constants import (
     F32_0P01,
     F32_0P001,
     F32_0P2,
-    F32_0P4,
     F32_0P55,
     F32_0P999,
     F32_3P14,
     FV,
     GRAV,
-    IM,
-    KM,
     NTCW,
-    NTRAC,
-    QMIN,
 )
 from sa_tke_edmf_torch.autodiff import safe_signed_denominator, safe_sqrt_nonnegative
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
@@ -35,8 +31,6 @@ from sa_tke_edmf_torch.constants import source_real
 
 if NTCW != 2:
     raise ImportError(f"_plume_block concatenates the qv, ql, tracer and TKE slots; it needs NTCW == 2, got {NTCW}")
-
-CHECKPOINT_FIELDS = ("xmf", "xlamue", "tcko", "qcko", "buou", "wush")
 
 
 def levels_over(base: torch.Tensor, first: int, levels: list[torch.Tensor]) -> torch.Tensor:
@@ -299,8 +293,10 @@ def _tracer_plume_recurrence(
         previous = piece[-1]
     if not pieces:
         return qcko_tracers_base
-    return torch.slice_scatter(qcko_tracers_base, torch.cat(pieces, dim=0).movedim(0, 1),
-                               dim=1, start=1, end=kmpbl)
+    # Joined in one compiled island (no layout normalization of the strided slot base): eager, between the
+    # islands of this loop, the cat of the pieces, the clone of the base and the transposed copy were three
+    # passes (round 8 wave 3, 60 km: 1.1 ms). Same rows, same values.
+    return levels_over(qcko_tracers_base, 1, [row for piece in pieces for row in piece])
 
 
 def _tracer_plume_levels(cnvflg, kpbl, previous, xlamueq_rows, zl_rows,
@@ -326,8 +322,10 @@ def _tracer_plume_levels(cnvflg, kpbl, previous, xlamueq_rows, zl_rows,
 
 
 def _plume_prepare(q1, zl, zm, thlx, thvx, hpbl, kpbl, vpert, buo,
-                   tkemean, vez0fun, xlamue, cnvflg, ce_scale):
-    """Tensor-only plume initialization; ordered recurrence bodies stay separate."""
+                   tkemean, vez0fun, xlamue, cnvflg, ce_scale, ce0_scale=None):
+    """Tensor-only plume initialization; ordered recurrence bodies stay separate.
+
+    ``ce0_scale``: the trainable scale of the updraft entrainment ce0 (0-d or 1-element tensor; None: no op)."""
     IM, KM, NTRAC = q1.shape
     dtype, device = q1.dtype, q1.device
     kmpbl = KM // 2
@@ -339,6 +337,8 @@ def _plume_prepare(q1, zl, zm, thlx, thvx, hpbl, kpbl, vpert, buo,
     initial_thlu = torch.where(cnvflg, thlx[:, 0] + ptem, thlu[:, 0])
     initial_qtu = torch.where(cnvflg, qtx[:, 0], qtu[:, 0])
     initial_buo = torch.where(cnvflg, GRAV * ptem / thvx[:, 0], buo[:, 0])
+    if ce0_scale is not None:
+        ce_scale = ce_scale * ce0_scale.reshape(())  # a 1-element view (region argument), as 0-d
     ce0t = ce_scale * vez0fun
     tke_boost = torch.minimum(safe_sqrt_nonnegative(tkemean / 2.0), torch.full((IM,), 5.0, dtype=dtype, device=device)) * ce_scale
     ce0t = torch.where((tkemean > 2.0) & cnvflg, torch.maximum(ce0t, tke_boost), ce0t)
@@ -384,21 +384,19 @@ def _plume_block(
     qmin: torch.Tensor,
     fpvs_table: torch.Tensor,
     real_coefficients: tuple[float, ...],
+    ce0_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Compose the existing ordered plume routines in one pure tensor region."""
     c01, c001, c2, F32_0P4, c55, c999, cpi = real_coefficients
-    KM = q1.shape[1]
     NTRAC = q1.shape[2]
-    IM = q1.shape[0]
     dtype = q1.dtype
-    device = q1.device
     def region(name, fn, *args):
         return run_compile_island("g_plume_recurrence", name, fn, *args)
 
     (wu2, thlu, qtu, qtx, initial_thlu, initial_qtu, initial_buo,
      ce0t, xlamue, xlamueq, xlamuem) = region(
         "plume_prepare", _plume_prepare, q1, zl, zm, thlx, thvx, hpbl, kpbl,
-        vpert, buo, tkemean, vez0fun, xlamue, cnvflg, F32_0P4)
+        vpert, buo, tkemean, vez0fun, xlamue, cnvflg, F32_0P4, ce0_scale)
     (thlu, qtu, buo) = region("first_thermo", _first_plume_thermo_recurrence, cnvflg, initial_thlu, initial_qtu, initial_buo, xlamue, xlamueq, zl, thlx, qtx, pix, plyr, thvx, thlu, qtu, buo, qmin, fpvs_table, c01)
     wu2 = region("wu2", _wu2_recurrence, cnvflg, xlamue, zm, buo, wush, wu2)
     (hpbl, kpbl, cnvflg, kpblx, kpbly) = region("update_pbl", _update_pbl_from_wu2, zm, hpbl, kpbl, cnvflg, wu2)
@@ -448,16 +446,18 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     hpbl = state.require("hpbl")
     kpbl = state.require("kpbl").to(torch.int64)
     vpert = state.require("vpert")
-    buo = state.require("buou").clone()
+    # Not copied: the plume block writes no input in place, and each of these outputs is a new tensor (levels_over,
+    # the mass-flux and entrainment forms, the qcko join). The copies moved 0.6 GB per 60 km step (round 8).
+    buo = state.require("buou")
     wush = state.require("wush")
     tkemean = state.require("tkemean")
     vez0fun = state.require("vez0fun")
-    xmf = state.require("xmf").clone()
-    tcko = state.require("tcko").clone()
-    qcko = state.require("qcko").clone()
-    ucko = state.require("ucko").clone()
-    vcko = state.require("vcko").clone()
-    xlamue = state.require("xlamue").clone()
+    xmf = state.require("xmf")
+    tcko = state.require("tcko")
+    qcko = state.require("qcko")
+    ucko = state.require("ucko")
+    vcko = state.require("vcko")
+    xlamue = state.require("xlamue")
     cnvflg = state.require("pcnvflg") > 0.5
     IM = q1.shape[0]
     require_float64("q1", q1, (IM, KM, NTRAC))
@@ -473,9 +473,10 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
 
     dtype = q1.dtype
     device = q1.device
-    kmpbl = KM // 2
     dt2 = state.require("delt")[0]
     a1 = torch.full((), state.config.get("bl_upfr", 0.08), dtype=dtype, device=device)
+    if "bl_upfr_scale" in state.fields:  # trainable scale (0-d tensor)
+        a1 = a1 * state.require("bl_upfr_scale").reshape(())
     qmin = torch.full((), source_real(1e-8, state.config), dtype=dtype, device=device)
     fpvs_table = fpvs_table_like(q1)
 
@@ -510,6 +511,7 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
         qmin,
         fpvs_table,
         tuple(source_real(v, state.config) for v in (0.01, 0.001, 0.2, 0.4, 0.55, 0.999, 3.14)),
+        state.fields.get("ce0_updraft_scale"),
     )
     return state.with_updates({
         'xmf': _out_0,
@@ -573,8 +575,8 @@ def _post_wu2_mass_flux_block(
     plume_active = cnvflg[:, None] & (plume_levels[None, :] < kpbl[:, None])
     dz_plume = zl[:, 1 : kmpbl + 1] - zl[:, :kmpbl]
     zeros = torch.zeros((ncol, kmpbl), dtype=dtype, device=device)
-    xlamavg = torch.where(plume_active, xlamue[:, :kmpbl] * dz_plume, zeros).cumsum(dim=1)[:, -1].clone()  # source order
-    sumx = torch.where(plume_active, dz_plume, zeros).cumsum(dim=1)[:, -1].clone()
+    xlamavg = level_sum(torch.where(plume_active, xlamue[:, :kmpbl] * dz_plume, zeros), 1)  # source order
+    sumx = level_sum(torch.where(plume_active, dz_plume, zeros), 1)
     sumx_safe = torch.where(cnvflg & (sumx != 0.0), sumx, torch.ones_like(sumx))
     xlamavg = torch.where(cnvflg, xlamavg / sumx_safe, xlamavg)
 
@@ -631,5 +633,3 @@ def _update_pbl_from_wu2(
     return hpbl, kpbl, cnvflg, kpblx, kpbly
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

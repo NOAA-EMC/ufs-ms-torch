@@ -9,10 +9,7 @@ import torch
 
 from sa_tke_edmf_torch.autodiff import safe_signed_denominator
 from sa_tke_edmf_torch.compile import run_compile_island
-from sa_tke_edmf_torch.constants import IM, KM, NTRAC
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
-
-CHECKPOINT_FIELDS = ("e_half", "e_diff", "q_half", "q_diff")
 
 
 def _tvd_limiter_block(
@@ -151,5 +148,3 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     )
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

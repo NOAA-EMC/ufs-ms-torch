@@ -7,10 +7,7 @@ from __future__ import annotations
 
 import torch
 
-from sa_tke_edmf_torch.constants import IM, KM, NTRAC, NTKE
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
-
-CHECKPOINT_FIELDS = ("rtg", "tkeh", "errflg")
 
 
 def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
@@ -23,7 +20,8 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     IM = q1.shape[0]
     require_float64("rtg", state.require("rtg"), (IM, KM, NTRAC))
     # satmedmfvdifq_run zeroes rtg on entry (oracle satmedmfvdifq.F:420); an incoming seed is discarded.
-    rtg = torch.zeros((IM, KM, NTRAC), dtype=q1.dtype, device=q1.device)
+    # One stride-0 zero (no [ncol, KM, ntrac] fill): segment O writes the whole of rtg as a new tensor from it.
+    rtg = q1.new_zeros(()).expand(IM, KM, NTRAC)
     require_float64("q1", q1, (IM, KM, NTRAC))
 
     te = torch.clamp_min(q1[:, :, NTKE - 1], 1.0e-9)
@@ -47,5 +45,3 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     )
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

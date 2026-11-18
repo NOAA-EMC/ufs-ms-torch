@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 from typing import Mapping
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from sa_tke_edmf_torch.diagnostics import add_diagnostic_
 
 from .containers import Statein, Stateout
@@ -91,10 +92,10 @@ def scale_radiation(
                                       and not working_like(value, inputs["gt0"])):
             raise ValueError(f"invalid radiation scaling operand {name}")
     for name in ("gt0", "gq0", "dqdt"):
-        torch._assert_async(
+        torch_compat.assert_async(
             torch.isfinite(inputs[name]).all(), f"non-finite dcyc2t3 entry {name}"
         )
-    torch._assert_async(
+    torch_compat.assert_async(
         (inputs["tsflw"] > 0).all(), "invalid held LW surface-air temperature"
     )
 
@@ -205,14 +206,14 @@ def scale_radiation(
             (control.index_of_process_shortwave, sw),
         ):
             index = inputs["dtidx"][control.index_of_temperature - 1, process - 1]
-            torch._assert_async(
+            torch_compat.assert_async(
                 (index <= dtend.shape[2]),
                 "radiation diagnostic slot outside allocation",
             )
             add_diagnostic_(dtend, heating * control.dtf, index)
         out["dtend"] = dtend
     for name in ("gt0", "gq0", "dqdt"):
-        torch._assert_async(
+        torch_compat.assert_async(
             torch.isfinite(out[name]).all(), f"non-finite dcyc2t3 exit {name}"
         )
     return out

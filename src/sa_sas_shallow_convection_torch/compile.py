@@ -12,6 +12,7 @@ import types
 from typing import Any, TypeVar
 
 import torch
+from ufs_physics_common.compile_policy import dispatcher, island, orchestrating
 
 TensorResult = TypeVar("TensorResult")
 
@@ -31,7 +32,6 @@ _enabled_categories: frozenset[str] = frozenset()
 _explicit_categories = False
 _recurrence_chunk_size: int | None = None
 _compile_cache: dict[tuple[Any, ...], Callable[..., Any]] = {}
-_compile_status: dict[str, dict[str, Any]] = {}
 _regional = False
 
 
@@ -63,10 +63,6 @@ def normalize_compile_categories(categories: Iterable[str] | str | None) -> froz
     if unknown:
         raise ValueError(f"unknown SA-SAS shallow compile categories: {sorted(unknown)}")
     return normalized
-
-
-def compile_categories_enabled() -> frozenset[str]:
-    return _enabled_categories
 
 
 def compile_categories_explicitly_set() -> bool:
@@ -109,15 +105,6 @@ def compile_categories(categories: Iterable[str] | str | None, *, recurrence_chu
     finally:
         _recurrence_chunk_size = previous_chunk_size
         restore_compile_categories(previous)
-
-
-def clear_compile_cache() -> None:
-    _compile_cache.clear()
-    _compile_status.clear()
-
-
-def compile_island_status() -> dict[str, dict[str, Any]]:
-    return {key: dict(value) for key, value in _compile_status.items()}
 
 
 def _tensor_spec(value: torch.Tensor) -> tuple[Any, ...]:
@@ -181,6 +168,7 @@ def _compile_specialized_callable(fn: Callable[..., TensorResult], key: tuple[An
     return specialized
 
 
+@dispatcher
 def run_compile_island(
     category: str,
     name: str,
@@ -188,50 +176,34 @@ def run_compile_island(
     *args: Any,
     **kwargs: Any,
 ) -> TensorResult:
-    # An outer compiled region composes the same pure chunk equations directly.
-    if torch.compiler.is_compiling():
-        return fn(*args, **kwargs)
     if category not in COMPILE_CATEGORIES:
         raise ValueError(f"unknown SA-SAS shallow compile category {category!r}")
-    if _regional:
+    # An outer compiled region composes the same pure chunk equations directly; an orchestration region calls
+    # the island's own region (``compile_policy.island``).
+    if _regional and (orchestrating() or not torch.compiler.is_compiling()):
         if category not in {"recurrence_chunks", "trigger"}:
             return fn(*args, **kwargs)
-        from ufs_physics_common.compile_policy import compiled
-
         parameters = fn.__code__.co_varnames[:fn.__code__.co_argcount]
         args = tuple(value.reshape(1) if parameter == "first" else value
                      for parameter, value in zip(parameters[:len(args)], args, strict=True))
-        if name in {"assemble_levels", "_compact_select", "_compact_merge"}:
-            return compiled(fn, normalize_layouts=False)(*args, **kwargs)
-        return compiled(fn)(*args, **kwargs)
-    status_key = f"{category}:{name}"
-    if category not in _enabled_categories:
-        _compile_status[status_key] = {"status": "eager_disabled"}
+        # The recurrence chunks write no input, so without gradients they read their packet slices in place
+        # instead of copying each non-contiguous slice at the region entry; values are unchanged.
+        borrowed = category == "recurrence_chunks" and not torch.is_grad_enabled()
+        return island(fn, args, kwargs, normalize_layouts=not borrowed and name not in {
+            "assemble_levels", "pack_profiles", "_compact_select", "_compact_merge"})
+    if torch.compiler.is_compiling():
         return fn(*args, **kwargs)
+    if category not in _enabled_categories:
+        return fn(*args, **kwargs)
+    # Outside a region, the compiled shallow islands other than the recurrence chunks run forward only.
     if category != "recurrence_chunks" and torch.is_grad_enabled() and (any(_has_gradient_tensor(arg) for arg in args) or any(_has_gradient_tensor(value) for value in kwargs.values())):
-        _compile_status[status_key] = {
-            "status": "eager_grad_enabled",
-            "reason": "compiled shallow recurrence islands are forward-only until backward compile closure is profiled",
-        }
         return fn(*args, **kwargs)
     if not hasattr(torch, "compile"):
-        _compile_status[status_key] = {"status": "compile_unavailable"}
         raise RuntimeError("torch.compile is unavailable")
 
     key = (fn, torch.is_grad_enabled(), _cache_key(category, name, args, kwargs))
     compiled = _compile_cache.get(key)
     if compiled is None:
-        _compile_status[status_key] = {"status": "compiling", "cache_key": repr(key)}
         compiled = torch.compile(_compile_specialized_callable(fn, key), fullgraph=True, dynamic=False, mode=None)
         _compile_cache[key] = compiled
-    _compile_status[status_key] = {"status": "compiled", "cache_key": repr(key)}
-    try:
-        return compiled(*args, **kwargs)
-    except Exception as exc:  # noqa: BLE001 - compile failures are benchmark evidence.
-        _compile_status[status_key] = {
-            "status": "runtime_failed",
-            "exception_type": type(exc).__name__,
-            "exception": str(exc).splitlines()[0],
-            "cache_key": repr(key),
-        }
-        raise
+    return compiled(*args, **kwargs)

@@ -7,27 +7,10 @@ from __future__ import annotations
 
 import torch
 
-from sa_sas_deep_convection_torch.compile import run_compile_island
-from sa_sas_deep_convection_torch.constants import GRAV, KM, NN, NTR
-from sa_sas_deep_convection_torch.state import tracer_layout, runtime_dimensions, SaSasDeepConvectionState, require_real
+from sa_sas_deep_convection_torch.samf_interstitials import detrain_cloud_condensate
 
-CHECKPOINT_FIELDS = (
-    "ten_t",
-    "ten_u",
-    "ten_v",
-    "ten_q",
-    "dqtr",
-    "cldwrk",
-    "rn",
-    "kbot",
-    "ktop",
-    "kcnv",
-    "ud_mf",
-    "dd_mf",
-    "dt_mf",
-    "cnvw",
-    "cnvc",
-)
+from sa_sas_deep_convection_torch.compile import run_compile_island
+from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real, tracer_layout
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -53,17 +36,19 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
     v1 = state.require("v1")
     q1 = state.require("q1")
     qtr = state.require("qtr")
-    new_t1 = state.require("new_t1").clone()
-    new_u1 = state.require("new_u1").clone()
-    new_v1 = state.require("new_v1").clone()
-    new_q1 = state.require("new_q1").clone()
-    new_qtr = state.require("new_qtr").clone()
-    cnvw = state.require("cnvw").clone()
-    cnvc = state.require("cnvc").clone()
-    ud_mf = state.require("ud_mf").clone()
-    dd_mf = state.require("dd_mf").clone()
-    dt_mf = state.require("dt_mf").clone()
-    wet_dep = state.require("wet_dep").clone()
+    # The islands below write no input (they copy before any indexed store), so the state's tensors enter them as
+    # they are: copies here cost one full pass each on the compacted buffer (round 8 wave 4).
+    new_t1 = state.require("new_t1")
+    new_u1 = state.require("new_u1")
+    new_v1 = state.require("new_v1")
+    new_q1 = state.require("new_q1")
+    new_qtr = state.require("new_qtr")
+    cnvw = state.require("cnvw")
+    cnvc = state.require("cnvc")
+    ud_mf = state.require("ud_mf")
+    dd_mf = state.require("dd_mf")
+    dt_mf = state.require("dt_mf")
+    wet_dep = state.require("wet_dep")
     pfld = state.require("pfld")
     sigmagfm = state.require("sigmagfm")
     ncol = cnvflg.shape[0]
@@ -166,19 +151,19 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
         state.require("delt"),
         state.require("cscale"),
         state.require("rd"),
+        state.require("q"),
+        state.require("cp"),
         bool(state.config.get("hwrf_samfdeep", False)),
         bool(state.config.get("progsigma", False)),
         int(state.config.get("ncloud", 0)),
         int(state.config.get("ntc", 0)),
-        int(state.config.get("ntk", 0)),
+        tracer_layout(state).ntk,
     )
 
-    ntrac = tracer_layout(state).ntrac
-    if ten_q.shape[2] != ntrac:
-        # samfdeepcnv sets only ten_q(:,:,1) of the host-tracer-sized array.
-        vapour = ten_q[:, :, 0]
-        ten_q = torch.zeros((ncol, KM, ntrac), dtype=ten_q.dtype, device=ten_q.device)
-        ten_q[:, :, 0] = vapour
+    from ..samf_interstitials import rain_host_tracer_tendencies
+
+    ten_q = rain_host_tracer_tendencies(state.require("gq0"), state.require("rain_evaporation_scale"),
+        ten_q[:, :, 0], state.require("delt"))
     return state.with_updates(
         {
             "new_t1": new_t1,
@@ -242,6 +227,8 @@ def _final_outputs_block(
     delt: torch.Tensor,
     cscale: torch.Tensor,
     rd: torch.Tensor,
+    entry_vapor: torch.Tensor,
+    cp: torch.Tensor,
     hwrf_samfdeep: bool,
     progsigma: bool,
     ncloud: int,
@@ -263,13 +250,8 @@ def _final_outputs_block(
     if ncloud > 0:
         cloud_liquid_layer = active_rain_levels & (levels >= kbcon[:, None]) & (levels <= ktcon[:, None])
         tem = dellal * xmb[:, None] * delt
-        ice_fraction = torch.clamp((263.16 - new_t1) * (1.0 / (263.16 - 233.16)), min=0.0, max=1.0)
-        has_water_slot = new_qtr[:, :, 1] > -999.0
-        qtr0 = new_qtr[:, :, 0]
-        qtr1 = new_qtr[:, :, 1]
-        qtr0 = torch.where(cloud_liquid_layer & has_water_slot, qtr0 + tem * ice_fraction, qtr0)
-        qtr1 = torch.where(cloud_liquid_layer & has_water_slot, qtr1 + tem * (1.0 - ice_fraction), qtr1)
-        qtr0 = torch.where(cloud_liquid_layer & ~has_water_slot, qtr0 + tem, qtr0)
+        qtr0, qtr1, new_t1 = detrain_cloud_condensate(new_qtr[:, :, 0], new_qtr[:, :, 1],
+            new_t1, new_q1, entry_vapor, tem, cloud_liquid_layer, cp)
         new_qtr = new_qtr.clone()
         new_qtr[:, :, 0] = qtr0
         new_qtr[:, :, 1] = qtr1
@@ -325,5 +307,3 @@ def _final_outputs_block(
     return new_t1, new_u1, new_v1, new_q1, new_qtr, wet_dep, cnvw, cnvc, ud_mf, dd_mf, dt_mf, ten_t, ten_u, ten_v, ten_q, dqtr
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

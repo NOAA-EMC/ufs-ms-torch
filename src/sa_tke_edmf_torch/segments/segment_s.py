@@ -8,11 +8,8 @@ from __future__ import annotations
 import torch
 from sa_tke_edmf_torch.autodiff import static_tensor
 
-from sa_tke_edmf_torch.constants import IM, KM, NTRAC
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
 from sa_tke_edmf_torch.tracers import pack_indices, uses_thompson_tempo_pack
-
-CHECKPOINT_FIELDS = ("ten_q", "dvdftra")
 
 
 def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
@@ -41,5 +38,3 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     return state.with_updates({"ten_q": ten_q, "dvdftra": dvdftra})
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

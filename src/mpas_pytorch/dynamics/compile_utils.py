@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch._subclasses.fake_tensor import is_fake
+from mpas_pytorch import _torch_compat as torch_compat
 from torch.utils import _pytree
 from torch.utils.checkpoint import _StopRecomputationError
 
@@ -143,16 +143,6 @@ _CUDA_INDUCTOR_GPU_PROMOTION_REQUIREMENTS = (
     "gpu_section_timing_snapshot",
     "gpu_memory_snapshot",
 )
-_COMPILE_KERNEL_KINDS = frozenset(
-    {
-        "pure_numeric",
-        "orchestration_blocked",
-        "legacy_alias",
-    }
-)
-_COMPILED_REVERSE_AD_POLICIES = frozenset(
-    {"blocked", "cpu_experiment", "cpu_validated", "cuda_validated"}
-)
 _COMPILED_FORWARD_AD_EXPERIMENT_TARGETS = frozenset(
     {
         "large_step_recovery_recovery_pack_region",
@@ -208,12 +198,6 @@ _CUDA_INDUCTOR_STAGE_ALIASES = {
     "hot": "combined_hot",
     "combined": "combined_hot",
 }
-# Historical benchmark receipts are development records, not wheel content or
-# runtime authority.  The installed policy starts closed and can only be opened
-# by package-owned evidence in a future release.
-_LEGACY_CUDA_INDUCTOR_GPU_VALIDATION_EVIDENCE: dict[
-    tuple[str, str, str], list[str]
-] = {}
 _CPU_INDUCTOR_EVIDENCE = _CUDA_INDUCTOR_CPU_PREQUALIFICATION_REQUIREMENTS
 _CPU_AD_EVIDENCE = ("cpu_reverse_ad", "cpu_forward_ad_jvp")
 _COMPILE_AD_EVIDENCE_SCOPES = (
@@ -294,7 +278,7 @@ EvidenceInput = str | CompileEvidenceRef
 
 _DYNAMICS_TENDENCY_WHOLE_STAGE_REVERSE_AOT_CPU_EVIDENCE = CompileEvidenceRef(
     evidence_id="cpu_compiled_reverse_ad_experimental",
-    callable_path="mpas_pytorch.dynamics.dyn_tend.atm_compute_dyn_tend_work",
+    callable_path="mpas_pytorch.dynamics.dyn_tend._dynamics_tendency_canonical_composition",
     device_type="cpu",
     validated_scopes=("compiled_reverse_ad",),
     authorizing=False,
@@ -312,32 +296,6 @@ def _evidence_refs(values: Iterable[EvidenceInput]) -> tuple[CompileEvidenceRef,
 
 def _evidence_ids(values: Iterable[CompileEvidenceRef]) -> frozenset[str]:
     return frozenset(value.evidence_id for value in values)
-
-
-def _has_authorizing_evidence(
-    values: Iterable[CompileEvidenceRef],
-    *,
-    device_type: str,
-) -> bool:
-    return any(
-        value.authorizing and value.device_type == device_type for value in values
-    )
-
-
-def _has_authorizing_scope_coverage(
-    values: Iterable[CompileEvidenceRef],
-    *,
-    device_type: str,
-    required_scopes: Iterable[str],
-) -> bool:
-    """Return whether validly scoped authority exists without combining legacy labels."""
-    required = set(required_scopes)
-    return any(
-        value.authorizing
-        and value.device_type == device_type
-        and required.issubset(value.validated_scopes)
-        for value in values
-    )
 
 
 def _spec_has_authorizing_cuda_promotion_evidence(spec: CompileKernelSpec) -> bool:
@@ -1000,17 +958,6 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         policy_visible=False,
     ),
     _candidate_helper_spec(
-        "explicit_scalar_transport_horizontal_flux_divergence",
-        callable="mpas_pytorch.dynamics.advance_scalars._explicit_scalar_transport_horizontal_flux_divergence_region",
-        owning_module="advance_scalars",
-        expected_callsite="advance_scalars.atm_advance_scalars_work:horizontal flux divergence region",
-        stage="explicit_scalar_transport",
-        gpu_evidence=(),
-        ad_evidence=_CPU_AD_EVIDENCE,
-        allow_staged_cuda=False,
-        policy_visible=False,
-    ),
-    _candidate_helper_spec(
         "explicit_scalar_transport_scalar_tend_column_region",
         callable="mpas_pytorch.dynamics.advance_scalars._explicit_scalar_transport_scalar_tend_column_region",
         owning_module="advance_scalars",
@@ -1050,7 +997,8 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         callable="mpas_pytorch.dynamics.advance_scalars._explicit_scalar_transport_vertical_interior_flux_region",
         owning_module="advance_scalars",
         expected_callsite=(
-            "advance_scalars.ExplicitScalarTransportNumericPlan:runner-bound interior "
+            "advance_scalars._explicit_scalar_transport_vertical_finish_region (inside the "
+            "vertical finish region) and the compatibility vertical divergence: interior "
             "third-order vertical flux. With a literal 12 Inductor multiplies by a "
             "rounded reciprocal and the compiled form is not bitwise equivalent; "
             "the plan passes the exact 12 as a run-owned tensor divisor"
@@ -1112,8 +1060,9 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         callable="mpas_pytorch.dynamics.advance_scalars._explicit_scalar_transport_vertical_finish_region",
         owning_module="advance_scalars",
         expected_callsite=(
-            "advance_scalars.ExplicitScalarTransportNumericPlan:runner-bound boundary flux, vertical "
-            "divergence, and scalar update after the interior flux region"
+            "advance_scalars.ExplicitScalarTransportNumericPlan:runner-bound boundary and interior "
+            "fluxes (the exact 12 as a run-owned tensor divisor), vertical divergence, and scalar "
+            "update"
         ),
         stage="explicit_scalar_transport",
         gpu_evidence=(),
@@ -1597,7 +1546,7 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         owning_module="dyn_tend",
         kind="pure_numeric",
         expected_callsite=(
-            "dyn_tend.atm_compute_dyn_tend_work:sole normal-velocity-tendency production region. It "
+            "dyn_tend._dynamics_tendency_canonical_composition:sole normal-velocity-tendency production region. It "
             "owns ordered vertical transport, PV-neighbor reduction, KE and "
             "divergence coupling, pressure/Euler updates, and optional "
             "curvature. Subhelpers are eager reference implementations. CPU "
@@ -1731,7 +1680,7 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         "dynamics_tendency_vertical_velocity_horizontal_advection_w_hadv_section",
         callable="mpas_pytorch.dynamics.dyn_tend._vertical_velocity_horizontal_advection_w_hadv_owned_section_region",
         owning_module="dyn_tend",
-        expected_callsite="dyn_tend.atm_compute_dyn_tend_work:vertical-velocity-horizontal-advection w horizontal advection section",
+        expected_callsite="dyn_tend._dynamics_tendency_canonical_composition:vertical-velocity-horizontal-advection w horizontal advection section",
         stage="dynamics_tendency_vertical_velocity_horizontal_advection_theta_horizontal_advection",
         gpu_evidence=(),
         ad_evidence=_CPU_AD_EVIDENCE,
@@ -1755,7 +1704,7 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         "dynamics_tendency_theta_horizontal_advection_theta_hadv_section",
         callable="mpas_pytorch.dynamics.dyn_tend._theta_horizontal_advection_theta_hadv_owned_section_region",
         owning_module="dyn_tend",
-        expected_callsite="dyn_tend.atm_compute_dyn_tend_work:theta-horizontal-advection theta horizontal advection section",
+        expected_callsite="dyn_tend._dynamics_tendency_canonical_composition:theta-horizontal-advection theta horizontal advection section",
         stage="dynamics_tendency_vertical_velocity_horizontal_advection_theta_horizontal_advection",
         gpu_evidence=(),
         ad_evidence=_CPU_AD_EVIDENCE,
@@ -1767,7 +1716,7 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         callable="mpas_pytorch.dynamics.dyn_tend._theta_horizontal_advection_theta_finalization_theta_tendency_region",
         owning_module="dyn_tend",
         expected_callsite=(
-            "dyn_tend.atm_compute_dyn_tend_work:contiguous theta-horizontal-advection horizontal "
+            "dyn_tend._dynamics_tendency_canonical_composition:contiguous theta-horizontal-advection horizontal "
             "advection through theta-finalization final theta tendency parent. Production "
             "returns only final solve-row theta/rthdynten and the optional "
             "active-cell Euler patch. CUDA staging remains fail-closed until "
@@ -1797,7 +1746,7 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         callable="mpas_pytorch.dynamics.dyn_tend._vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency_region",
         owning_module="dyn_tend",
         expected_callsite=(
-            "dyn_tend.atm_compute_dyn_tend_work:contiguous RK1 vertical-velocity-horizontal-mixing horizontal "
+            "dyn_tend._dynamics_tendency_canonical_composition:contiguous RK1 vertical-velocity-horizontal-mixing horizontal "
             "mixing through vertical-velocity-vertical-transport vertical/final w tendency parent; production "
             "returns only final solve-row w and final active-cell Euler state"
         ),
@@ -1834,7 +1783,7 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         ),
         owning_module="dyn_tend",
         expected_callsite=(
-            "dyn_tend.atm_compute_dyn_tend_work:theta-horizontal-mixing complete theta "
+            "dyn_tend._dynamics_tendency_canonical_composition:theta-horizontal-mixing complete theta "
             "horizontal-mixing section; owns ordered del2 reduction, turbulent "
             "tendency, optional del4 correction, and compact patch assembly"
         ),
@@ -1860,7 +1809,7 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         owning_module="dyn_tend",
         kind="pure_numeric",
         expected_callsite=(
-            "dyn_tend.atm_compute_dyn_tend_work:sole vertical-velocity-vertical-transport production region. It "
+            "dyn_tend._dynamics_tendency_canonical_composition:sole vertical-velocity-vertical-transport production region. It "
             "owns boundary/interior vertical fluxes and pointwise w updates; "
             "the subhelpers are eager proof references only. Eager "
             "regionalization and AD/JVP are supported. CPU Inductor is available "
@@ -1906,7 +1855,7 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         owning_module="dyn_tend",
         kind="pure_numeric",
         expected_callsite=(
-            "dyn_tend.atm_compute_dyn_tend_work:sole theta-vertical-advection-diabatic production region. It "
+            "dyn_tend._dynamics_tendency_canonical_composition:sole theta-vertical-advection-diabatic production region. It "
             "owns boundary/interior vertical fluxes, diabatic diagnostics, and "
             "pointwise theta updates; the subhelpers are eager proof references "
             "only. Eager regionalization and AD/JVP are supported. CPU Inductor "
@@ -1940,7 +1889,7 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         owning_module="dyn_tend",
         kind="pure_numeric",
         expected_callsite=(
-            "dyn_tend.atm_compute_dyn_tend_work:sole theta-vertical-mixing/theta-finalization production region. "
+            "dyn_tend._dynamics_tendency_canonical_composition:sole theta-vertical-mixing/theta-finalization production region. "
             "It owns optional vertical theta mixing, compact Euler-patch "
             "composition, final Euler accumulation, and optional physics. "
             "CPU eager/Inductor, reverse AD, and JVP are supported. CUDA remains "
@@ -2185,7 +2134,7 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
     ),
     _compile_kernel_spec(
         "dynamics_tendency_dyn_tend_whole_stage",
-        callable="mpas_pytorch.dynamics.dyn_tend.atm_compute_dyn_tend_work",
+        callable="mpas_pytorch.dynamics.dyn_tend._dynamics_tendency_canonical_composition",
         numeric_callable=(
             "mpas_pytorch.dynamics.dyn_tend._dynamics_tendency_canonical_composition"
         ),
@@ -2195,12 +2144,12 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
             "time_integration.execute_rk_step: runner-owned DynamicsTendencyNumericPlan binds "
             "97 static dimensions/topology/metric/namelist/control arguments and "
             "passes 41 evolving tensor arguments positionally through a generated "
-            "equation-free explicit binder to the same atm_compute_dyn_tend_work "
+            "equation-free explicit binder to the same _dynamics_tendency_canonical_composition "
             "entry-to-exit body. The numeric body returns the ten public padded "
             "outputs (each final producing section pads its own); the caller "
             "validates and passes them through after the compiled call. No "
-            "functools.partial or keyword dictionary crosses the compiled boundary. The caller fixes debug taps, "
-            "section timers, workspace mutation, and nested helper compilation "
+            "functools.partial or keyword dictionary crosses the compiled boundary. The caller fixes "
+            "workspace mutation and nested helper compilation "
             "outside the graph. "
             "This target is CPU/full-scope and explicit-target only. Staged CUDA "
             "execution remains disabled."
@@ -2219,17 +2168,6 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         allow_staged_cuda=False,
         compiled_reverse_ad_policy="cpu_experiment",
     ),
-    _compile_kernel_spec(
-        "dynamics_tendency_dyn_tend",
-        callable="mpas_pytorch.dynamics.dyn_tend.atm_compute_dyn_tend_work",
-        owning_module="dyn_tend",
-        kind="orchestration_blocked",
-        expected_callsite=(
-            "time_integration._atm_srk3_impl:full dynamics tendency wrapper. "
-            "Compilation changes numerical results, so the wrapper remains "
-            "fail-closed; registered pure subsections provide the compiled path"
-        ),
-    ),
 )
 
 
@@ -2244,7 +2182,6 @@ _CORE_HOT_KERNELS = _kernel_names_where(
     lambda spec: spec.policy_visible and spec.allow_core
 )
 _HOT_KERNELS = _kernel_names_where(lambda spec: spec.policy_visible and spec.allow_hot)
-_COMPILE_POLICY_KERNELS = _kernel_names_where(lambda spec: spec.policy_visible)
 _ORCHESTRATION_COMPILE_BLOCKED_KERNELS = _kernel_names_where(
     lambda spec: spec.kind == "orchestration_blocked"
 )
@@ -2263,20 +2200,9 @@ _NUMERIC_COMPILE_POLICY_KERNELS = _kernel_names_where(
 _CUDA_INDUCTOR_CANDIDATE_KERNELS = _kernel_names_where(
     lambda spec: spec.policy_visible and spec.allow_staged_cuda
 )
-_CUDA_INDUCTOR_CPU_PREQUALIFIED_KERNELS = _kernel_names_where(
-    lambda spec: (
-        spec.policy_visible
-        and spec.allow_staged_cuda
-        and set(_CPU_FORWARD_INDUCTOR_EVIDENCE).issubset(
-            _evidence_ids(spec.cpu_evidence)
-        )
-        and set(_CPU_AD_EVIDENCE).issubset(_evidence_ids(spec.ad_evidence))
-    )
-)
 _CUDA_INDUCTOR_GPU_VALIDATED_KERNELS = _kernel_names_where(
     _spec_has_authorizing_cuda_promotion_evidence
 )
-_CUDA_INDUCTOR_SIMPLE_KERNELS = _CUDA_INDUCTOR_GPU_VALIDATED_KERNELS
 _CUDA_INDUCTOR_VALIDATED_ENVIRONMENTS: frozenset[tuple[str, str, str | None]] = (
     frozenset(
         (
@@ -2290,25 +2216,6 @@ _CUDA_INDUCTOR_VALIDATED_ENVIRONMENTS: frozenset[tuple[str, str, str | None]] = 
         if ref.authorizing and ref.device_type == "cuda"
     )
 )
-_CUDA_INDUCTOR_GPU_VALIDATION_EVIDENCE: dict[tuple[str, str, str | None], list[str]] = {
-    environment: sorted(
-        {
-            str(ref.artifact_path)
-            for spec in _COMPILE_KERNEL_SPECS
-            if spec.name in _CUDA_INDUCTOR_GPU_VALIDATED_KERNELS
-            for ref in spec.gpu_evidence
-            if ref.authorizing
-            and ref.device_type == "cuda"
-            and (
-                str(ref.torch_version),
-                str(ref.cuda_version),
-                str(ref.compute_capability),
-            )
-            == environment
-        }
-    )
-    for environment in _CUDA_INDUCTOR_VALIDATED_ENVIRONMENTS
-}
 _CUDA_INDUCTOR_STAGE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
     (
         stage,
@@ -2341,11 +2248,6 @@ def set_compile_event_sink(sink: Callable[[dict[str, Any]], None] | None) -> Non
     global _COMPILE_EVENT_SINK
     with _COMPILE_EVENT_LOCK:
         _COMPILE_EVENT_SINK = sink
-
-
-def clear_compile_event_sink() -> None:
-    """Clear the process-local torch.compile telemetry sink."""
-    set_compile_event_sink(None)
 
 
 def compile_event_sink_enabled() -> bool:
@@ -2495,76 +2397,6 @@ def _dynamo_counter_snapshot() -> dict[str, Any]:
     }
 
 
-def compile_timing_counter_snapshot() -> dict[str, Any]:
-    """Take fixed-width counters suitable for a timed-region boundary.
-
-    No event sink is installed and no cache is traversed. Dynamo/Inductor
-    counters are read by fixed key, while MPAS counters advance only on wrapper
-    creation, fallback, error, or specialization admission.
-    """
-    try:
-        from torch._dynamo.utils import counters
-    except Exception:  # noqa: BLE001
-        counters = {}  # type: ignore[assignment]
-    stats: Mapping[str, Any] = counters.get("stats", {})
-    inductor: Mapping[str, Any] = counters.get("inductor", {})
-    frames: Mapping[str, Any] = counters.get("frames", {})
-    return {
-        **{name: int(value) for name, value in _COMPILE_RUNTIME_COUNTERS.items()},
-        "dynamo_unique_graphs": int(stats.get("unique_graphs", 0)),
-        "dynamo_calls_captured": int(stats.get("calls_captured", 0)),
-        "dynamo_frames_total": int(frames.get("total", 0)),
-        "dynamo_frames_ok": int(frames.get("ok", 0)),
-        "inductor_fxgraph_cache_hit": int(inductor.get("fxgraph_cache_hit", 0)),
-        "inductor_fxgraph_cache_miss": int(inductor.get("fxgraph_cache_miss", 0)),
-        "event_sink_enabled": compile_event_sink_enabled(),
-    }
-
-
-def compile_timing_counter_delta(
-    before: Mapping[str, Any],
-    after: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Compare timed-boundary snapshots and fail closed on compile activity."""
-    numeric_names = sorted(
-        name for name in set(before) | set(after) if name != "event_sink_enabled"
-    )
-    delta = {
-        name: int(after.get(name, 0)) - int(before.get(name, 0))
-        for name in numeric_names
-    }
-    forbidden_names = {
-        "wrapper_create",
-        "wrapper_cache_miss",
-        "eager_fallback",
-        "autodiff_bypass",
-        "compiled_call_error",
-        "specialization_revision",
-        "dynamo_unique_graphs",
-        "dynamo_frames_total",
-        "inductor_fxgraph_cache_miss",
-    }
-    forbidden = {
-        name: value
-        for name, value in delta.items()
-        if name in forbidden_names and value != 0
-    }
-    failures: list[str] = []
-    if bool(before.get("event_sink_enabled")) or bool(after.get("event_sink_enabled")):
-        failures.append("per-call compile event sink was enabled at a timing boundary")
-    if forbidden:
-        failures.append(f"compile activity occurred inside timed compute: {forbidden}")
-    return {
-        "status": "pass" if not failures else "fail",
-        "pass": not failures,
-        "before": dict(before),
-        "after": dict(after),
-        "delta": delta,
-        "forbidden_delta": forbidden,
-        "failures": failures,
-    }
-
-
 def _counter_delta(
     after: dict[str, Any],
     before: dict[str, Any],
@@ -2606,18 +2438,6 @@ def _stringify_sequence(values: object) -> list[str]:
     if not isinstance(values, (list, tuple)):
         return []
     return [str(value) for value in values]
-
-
-def _ops_per_graph_signature(values: object) -> list[list[str]]:
-    if not isinstance(values, (list, tuple)):
-        return []
-    out: list[list[str]] = []
-    for graph_ops in values:
-        if isinstance(graph_ops, (list, tuple)):
-            out.append([str(op) for op in graph_ops])
-        else:
-            out.append([str(graph_ops)])
-    return out
 
 
 def _guard_summary(values: object, *, limit: int = 48) -> list[dict[str, Any]]:
@@ -2712,108 +2532,6 @@ def _compile_call_explain_payload(
         "op_count": int(getattr(explained, "op_count", 0) or 0),
         "break_reasons": _stringify_sequence(getattr(explained, "break_reasons", [])),
     }
-
-
-def explain_compile_kernel(
-    fn_name: str,
-    fn: CompiledFn,
-    *args: object,
-    mode: str,
-    backend: str,
-    specialization_key: object | None = None,
-    **kwargs: object,
-) -> dict[str, Any]:
-    """
-    Return offline Dynamo explain metadata for a helper preflight.
-
-    This intentionally executes ``fn`` under ``torch._dynamo.explain`` and is
-    therefore for controlled preflight probes, not live performance timing.
-    """
-    key = (
-        fn_name,
-        _compile_function_cache_key(fn),
-        mode,
-        backend,
-        _normalize_specialization_key(specialization_key),
-    )
-    key_digest = _cache_key_digest(key)
-    start = time.perf_counter()
-    _emit_compile_event(
-        fn_name,
-        "preflight_explain_start",
-        cache_key=key_digest,
-        mode=mode,
-        backend=backend,
-        specialization_key=_normalize_specialization_key(specialization_key),
-        argument_signature=_argument_signature(args, kwargs),
-    )
-    try:
-        from torch._dynamo import explain
-
-        explained = explain(fn)(*args, **kwargs)
-    except Exception as exc:  # noqa: BLE001
-        result = {
-            "event": "torch_compile_preflight_explain",
-            "fn_name": fn_name,
-            "status": "failed",
-            "cache_key": key_digest,
-            "mode": mode,
-            "backend": backend,
-            "specialization_key": list(
-                _normalize_specialization_key(specialization_key)
-            ),
-            "explain_seconds": time.perf_counter() - start,
-            "error_type": type(exc).__name__,
-            "error": str(exc),
-        }
-        _emit_compile_event(
-            fn_name,
-            "preflight_explain_error",
-            **{
-                key: value
-                for key, value in result.items()
-                if key not in {"event", "fn_name"}
-            },
-        )
-        return result
-
-    out_guards = getattr(explained, "out_guards", []) or []
-    result = {
-        "event": "torch_compile_preflight_explain",
-        "fn_name": fn_name,
-        "status": "ok",
-        "cache_key": key_digest,
-        "mode": mode,
-        "backend": backend,
-        "specialization_key": list(_normalize_specialization_key(specialization_key)),
-        "explain_seconds": time.perf_counter() - start,
-        "graph_count": int(getattr(explained, "graph_count", 0) or 0),
-        "graph_break_count": int(getattr(explained, "graph_break_count", 0) or 0),
-        "guard_count": len(out_guards),
-        "guard_summary": _guard_summary(out_guards),
-        "op_count": int(getattr(explained, "op_count", 0) or 0),
-        "break_reasons": _stringify_sequence(getattr(explained, "break_reasons", [])),
-        "ops_per_graph": _ops_per_graph_signature(
-            getattr(explained, "ops_per_graph", [])
-        ),
-        "compile_times": str(getattr(explained, "compile_times", "")),
-        "argument_signature": _argument_signature(args, kwargs),
-    }
-    _emit_compile_event(
-        fn_name,
-        "preflight_explain_success",
-        **{
-            key: value
-            for key, value in result.items()
-            if key not in {"event", "fn_name"}
-        },
-    )
-    return result
-
-
-def compile_kernel_specs() -> tuple[CompileKernelSpec, ...]:
-    """Return the ordered dycore compile-kernel policy registry."""
-    return _COMPILE_KERNEL_SPECS
 
 
 def compile_kernel_spec(name: str) -> CompileKernelSpec | None:
@@ -3249,16 +2967,6 @@ def compile_callable_identity(fn_name: str, fn: CompiledFn) -> dict[str, Any]:
     }
 
 
-def compile_kernel_registry() -> dict[str, dict[str, Any]]:
-    """Return JSON-safe compile-kernel registry metadata keyed by kernel name."""
-    return {spec.name: spec.as_dict() for spec in _COMPILE_KERNEL_SPECS}
-
-
-def cuda_inductor_candidate_kernels() -> tuple[str, ...]:
-    """Return helpers eligible for the CUDA Inductor promotion ladder."""
-    return tuple(sorted(_CUDA_INDUCTOR_CANDIDATE_KERNELS))
-
-
 def cuda_inductor_stage_names() -> tuple[str, ...]:
     """Return the ordered staged CUDA compile ladder names."""
     return tuple(name for name, _helpers in _CUDA_INDUCTOR_STAGE_GROUPS)
@@ -3281,11 +2989,6 @@ def normalize_cuda_inductor_stage(stage: object | None) -> str | None:
     return normalized
 
 
-def cuda_inductor_stage_groups() -> dict[str, list[str]]:
-    """Return non-cumulative helper groups for each CUDA compile ladder stage."""
-    return {name: list(helpers) for name, helpers in _CUDA_INDUCTOR_STAGE_GROUPS}
-
-
 def cuda_inductor_stage_kernels(stage: object | None) -> tuple[str, ...]:
     """Return cumulative helpers enabled through a CUDA compile ladder stage."""
     normalized = normalize_cuda_inductor_stage(stage)
@@ -3297,125 +3000,6 @@ def cuda_inductor_stage_kernels(stage: object | None) -> tuple[str, ...]:
         if name == normalized:
             break
     return tuple(sorted(dict.fromkeys(helpers)))
-
-
-def _cuda_inductor_stage_policy_entry(
-    *,
-    stage: str,
-    index: int,
-    group: tuple[str, ...],
-    config: dict | None,
-    device: torch.device | str | None,
-    prior_effective: set[str],
-) -> tuple[dict[str, Any], set[str]]:
-    """Return one ladder row with requested and policy-effective helper sets."""
-    requested_cumulative = list(cuda_inductor_stage_kernels(stage))
-    effective_cumulative = [
-        helper
-        for helper in requested_cumulative
-        if helper in _CUDA_INDUCTOR_GPU_VALIDATED_KERNELS
-    ]
-    effective_set = set(effective_cumulative)
-    effective_new = [helper for helper in group if helper in effective_set]
-    blocked_new = [helper for helper in group if helper not in effective_set]
-    blocked_no_gpu_evidence_new = [
-        helper
-        for helper in group
-        if helper in _CUDA_INDUCTOR_CANDIDATE_KERNELS
-        and helper not in _CUDA_INDUCTOR_GPU_VALIDATED_KERNELS
-    ]
-    effective_delta = sorted(effective_set - prior_effective)
-    entry: dict[str, Any] = {
-        "index": index,
-        "name": stage,
-        "new_helpers": list(group),
-        "cumulative_helpers": requested_cumulative,
-        "requested_new_helpers": list(group),
-        "requested_cumulative_helpers": requested_cumulative,
-        "effective_new_helpers": effective_new,
-        "effective_cumulative_helpers": effective_cumulative,
-        "effective_delta_helpers": effective_delta,
-        "blocked_new_helpers": blocked_new,
-        "blocked_no_gpu_evidence_new_helpers": blocked_no_gpu_evidence_new,
-        "no_effective_delta": not effective_delta,
-        "performance_claim_status": (
-            "no_effective_delta" if not effective_delta else "effective_delta"
-        ),
-    }
-    if config is None and device is None:
-        return entry, effective_set
-
-    stage_config = dict(config or {})
-    stage_config["config_torch_compile_stage"] = stage
-    stage_config.setdefault("config_use_torch_compile", True)
-    runtime_enabled_cumulative = [
-        helper
-        for helper in requested_cumulative
-        if kernel_compile_enabled_for_device(helper, stage_config, device=device)
-    ]
-    runtime_enabled_set = set(runtime_enabled_cumulative)
-    entry.update(
-        {
-            "runtime_enabled_new_helpers": [
-                helper for helper in group if helper in runtime_enabled_set
-            ],
-            "runtime_enabled_cumulative_helpers": runtime_enabled_cumulative,
-        }
-    )
-    return entry, effective_set
-
-
-def cuda_inductor_stage_ladder(
-    config: dict | None = None,
-    *,
-    device: torch.device | str | None = None,
-) -> list[dict[str, Any]]:
-    """Return staged compile ladder metadata with requested/effective helper sets."""
-    ladder = []
-    prior_effective: set[str] = set()
-    for index, (name, group) in enumerate(_CUDA_INDUCTOR_STAGE_GROUPS, start=1):
-        entry, prior_effective = _cuda_inductor_stage_policy_entry(
-            stage=name,
-            index=index,
-            group=group,
-            config=config,
-            device=device,
-            prior_effective=prior_effective,
-        )
-        ladder.append(entry)
-    return ladder
-
-
-def cuda_inductor_stage_policy_report(
-    stage: object | None,
-    config: dict,
-    *,
-    device: torch.device | str | None,
-) -> dict[str, Any] | None:
-    """Return requested/effective/blocked helper metadata for one stage."""
-    normalized = normalize_cuda_inductor_stage(stage)
-    if normalized is None:
-        return None
-    ladder = cuda_inductor_stage_ladder(config, device=device)
-    for entry in ladder:
-        if entry["name"] == normalized:
-            return entry
-    return None
-
-
-def orchestration_compile_blocked_kernels() -> tuple[str, ...]:
-    """Return orchestration entry points that are never numeric compile regions."""
-    return tuple(sorted(_ORCHESTRATION_COMPILE_BLOCKED_KERNELS))
-
-
-def numeric_compile_policy_kernels() -> tuple[str, ...]:
-    """Return compile-policy names admitted as numeric regions."""
-    return tuple(sorted(_NUMERIC_COMPILE_POLICY_KERNELS))
-
-
-def cuda_inductor_cpu_prequalified_kernels() -> tuple[str, ...]:
-    """Return helpers with CPU eager/compile/AD/TS evidence."""
-    return tuple(sorted(_CUDA_INDUCTOR_CPU_PREQUALIFIED_KERNELS))
 
 
 def cuda_inductor_gpu_validated_kernel_registry() -> tuple[str, ...]:
@@ -3458,20 +3042,6 @@ def cuda_inductor_gpu_environment_validated(
     )
 
 
-def cuda_inductor_gpu_validation_environment(
-    device: torch.device | str | None = None,
-) -> dict[str, Any]:
-    """Return current CUDA validation-environment metadata."""
-    key = _cuda_inductor_runtime_environment(device)
-    return {
-        "torch_version": key[0],
-        "cuda_version": key[1],
-        "device_capability": key[2],
-        "validated": key in _CUDA_INDUCTOR_VALIDATED_ENVIRONMENTS,
-        "evidence": _CUDA_INDUCTOR_GPU_VALIDATION_EVIDENCE.get(key),
-    }
-
-
 def cuda_inductor_gpu_validated_kernels(
     device: torch.device | str | None = None,
 ) -> tuple[str, ...]:
@@ -3479,177 +3049,6 @@ def cuda_inductor_gpu_validated_kernels(
     if device is not None and not cuda_inductor_gpu_environment_validated(device):
         return ()
     return cuda_inductor_gpu_validated_kernel_registry()
-
-
-def cuda_inductor_promotion_requirements() -> dict[str, list[str]]:
-    """Return the evidence required before CPU and CUDA-safe promotion."""
-    return {
-        "cpu_prequalification": list(_CUDA_INDUCTOR_CPU_PREQUALIFICATION_REQUIREMENTS),
-        "cuda_safe_promotion": list(_CUDA_INDUCTOR_GPU_PROMOTION_REQUIREMENTS),
-    }
-
-
-def validate_cuda_inductor_promotion_registry() -> tuple[str, ...]:
-    """Check that CUDA-safe compile policy cannot outrun validation evidence."""
-    problems: list[str] = []
-    names = [spec.name for spec in _COMPILE_KERNEL_SPECS]
-    duplicate_names = sorted({name for name in names if names.count(name) > 1})
-    if duplicate_names:
-        problems.append(f"Duplicate compile-kernel registry entries: {duplicate_names}")
-    for spec in _COMPILE_KERNEL_SPECS:
-        if spec.kind not in _COMPILE_KERNEL_KINDS:
-            problems.append(f"{spec.name}: unknown compile kernel kind {spec.kind!r}")
-        if spec.compiled_reverse_ad_policy not in _COMPILED_REVERSE_AD_POLICIES:
-            problems.append(
-                f"{spec.name}: unknown compiled reverse-AD policy "
-                f"{spec.compiled_reverse_ad_policy!r}"
-            )
-        if spec.compiled_reverse_ad_policy != "blocked":
-            if spec.kind != "pure_numeric" or not spec.callable:
-                problems.append(
-                    f"{spec.name}: compiled autodiff requires a pure numeric callable"
-                )
-            if (
-                not spec.ad_evidence
-                and spec.compiled_reverse_ad_policy != "cpu_experiment"
-            ):
-                problems.append(
-                    f"{spec.name}: compiled autodiff requires recorded AD evidence"
-                )
-        if spec.compiled_reverse_ad_policy == "cpu_validated" and not (
-            _has_current_authorizing_scope_coverage(
-                spec,
-                spec.ad_evidence,
-                evidence_group="ad_evidence",
-                device_type="cpu",
-                required_scopes=("compiled_reverse_ad",),
-            )
-        ):
-            problems.append(
-                f"{spec.name}: validated CPU reverse autodiff requires callable-scoped "
-                "authorizing reverse-AD evidence"
-            )
-        if spec.compiled_reverse_ad_policy == "cuda_validated" and not (
-            _has_current_authorizing_scope_coverage(
-                spec,
-                spec.ad_evidence,
-                evidence_group="ad_evidence",
-                device_type="cuda",
-                required_scopes=("compiled_reverse_ad",),
-            )
-        ):
-            problems.append(
-                f"{spec.name}: validated CUDA reverse autodiff requires callable-scoped "
-                "authorizing CUDA reverse-AD evidence"
-            )
-        if spec.stage is not None and spec.stage not in _CUDA_INDUCTOR_STAGE_ORDER:
-            problems.append(f"{spec.name}: unknown staged CUDA group {spec.stage!r}")
-        if spec.allow_staged_cuda and spec.stage is None:
-            problems.append(f"{spec.name}: staged CUDA helper requires a stage")
-        if spec.kind == "orchestration_blocked" and (
-            spec.allow_core
-            or spec.allow_hot
-            or spec.allow_full
-            or spec.allow_staged_cuda
-        ):
-            problems.append(f"{spec.name}: blocked orchestration cannot be allowed")
-        if spec.kind == "legacy_alias":
-            if spec.callable is not None:
-                problems.append(f"{spec.name}: legacy alias should not name a callable")
-            if (
-                spec.allow_core
-                or spec.allow_hot
-                or spec.allow_full
-                or spec.allow_staged_cuda
-            ):
-                problems.append(f"{spec.name}: legacy alias cannot be compile-enabled")
-        if spec.kind == "pure_numeric" and not spec.callable:
-            problems.append(f"{spec.name}: pure numeric entry requires a callable")
-        if spec.gpu_evidence and not spec.allow_staged_cuda:
-            problems.append(
-                f"{spec.name}: GPU evidence is only meaningful for staged CUDA helpers"
-            )
-        if _has_authorizing_evidence(spec.gpu_evidence, device_type="cuda"):
-            if not _has_authorizing_scope_coverage(
-                spec.cpu_evidence,
-                device_type="cpu",
-                required_scopes=_CPU_FORWARD_INDUCTOR_EVIDENCE,
-            ):
-                problems.append(
-                    f"{spec.name}: authorizing GPU evidence requires authorizing CPU "
-                    "forward evidence"
-                )
-            if not _has_authorizing_scope_coverage(
-                spec.ad_evidence,
-                device_type="cpu",
-                required_scopes=_CPU_AD_EVIDENCE,
-            ):
-                problems.append(
-                    f"{spec.name}: authorizing GPU evidence requires authorizing CPU AD evidence"
-                )
-        for evidence_group, refs in (
-            ("cpu_evidence", spec.cpu_evidence),
-            ("gpu_evidence", spec.gpu_evidence),
-            ("ad_evidence", spec.ad_evidence),
-        ):
-            for ref in refs:
-                if not ref.evidence_id:
-                    problems.append(
-                        f"{spec.name}: {evidence_group} has an empty evidence ID"
-                    )
-                if not ref.authorizing:
-                    continue
-                problems.extend(
-                    _authorizing_evidence_problems(
-                        spec,
-                        ref,
-                        evidence_group=evidence_group,
-                    )
-                )
-    if not _CUDA_INDUCTOR_CANDIDATE_KERNELS <= _COMPILE_POLICY_KERNELS:
-        extra = sorted(_CUDA_INDUCTOR_CANDIDATE_KERNELS - _COMPILE_POLICY_KERNELS)
-        problems.append(f"CUDA Inductor candidates outside compile policy: {extra}")
-    if not _CUDA_INDUCTOR_CPU_PREQUALIFIED_KERNELS <= _CUDA_INDUCTOR_CANDIDATE_KERNELS:
-        extra = sorted(
-            _CUDA_INDUCTOR_CPU_PREQUALIFIED_KERNELS - _CUDA_INDUCTOR_CANDIDATE_KERNELS
-        )
-        problems.append(f"CPU-prequalified kernels outside CUDA candidate set: {extra}")
-    if _CUDA_INDUCTOR_CANDIDATE_KERNELS & _ORCHESTRATION_COMPILE_BLOCKED_KERNELS:
-        bad = sorted(
-            _CUDA_INDUCTOR_CANDIDATE_KERNELS & _ORCHESTRATION_COMPILE_BLOCKED_KERNELS
-        )
-        problems.append(
-            f"CUDA Inductor candidates include orchestration kernels: {bad}"
-        )
-    if (
-        not _CUDA_INDUCTOR_GPU_VALIDATED_KERNELS
-        <= _CUDA_INDUCTOR_CPU_PREQUALIFIED_KERNELS
-    ):
-        extra = sorted(
-            _CUDA_INDUCTOR_GPU_VALIDATED_KERNELS
-            - _CUDA_INDUCTOR_CPU_PREQUALIFIED_KERNELS
-        )
-        problems.append(f"GPU-validated kernels without CPU prequalification: {extra}")
-    if _CUDA_INDUCTOR_SIMPLE_KERNELS != _CUDA_INDUCTOR_GPU_VALIDATED_KERNELS:
-        problems.append(
-            "CUDA Inductor safe list must be exactly the GPU-validated kernel set"
-        )
-    expected_environments = {
-        (
-            str(ref.torch_version),
-            str(ref.cuda_version),
-            str(ref.compute_capability),
-        )
-        for spec in _COMPILE_KERNEL_SPECS
-        if spec.name in _CUDA_INDUCTOR_GPU_VALIDATED_KERNELS
-        for ref in spec.gpu_evidence
-        if ref.authorizing and ref.device_type == "cuda"
-    }
-    if set(_CUDA_INDUCTOR_VALIDATED_ENVIRONMENTS) != expected_environments:
-        problems.append(
-            "CUDA validated environments must derive from authorizing GPU evidence"
-        )
-    return tuple(problems)
 
 
 def _resolve_config_scalar(
@@ -3679,8 +3078,6 @@ def _resolve_config_scalar(
 
 def compile_enabled(config: dict) -> bool:
     """Return whether compile wrapping is enabled for this run."""
-    if os.environ.get("MPAS_DISABLE_TORCH_COMPILE", "0") == "1":
-        return False
     # A caller's per-call execution choice (private, so not part of the continuation
     # identity): run this call's regions eagerly, e.g. a derivative request that the
     # compiled regions are not qualified for.
@@ -4111,141 +3508,6 @@ def compile_backend(config: Mapping[str, Any]) -> str:
     return backend
 
 
-def compile_policy_snapshot(
-    config: dict,
-    *,
-    device: torch.device | str | None,
-    kernel_names: tuple[str, ...] | None = None,
-) -> dict[str, Any]:
-    """Return the effective compile policy for known dycore kernels."""
-    cfg = dict(config)
-    compile_on = compile_enabled(cfg)
-    backend = compile_backend(cfg)
-    mode = compile_mode(cfg)
-    scope = (
-        str(_resolve_config_scalar(cfg, "config_torch_compile_scope", "hot"))
-        .strip()
-        .lower()
-    )
-    target_kernels = compile_target_kernels(cfg)
-    stage = cuda_inductor_stage(cfg)
-    device_type = _device_type(device)
-    policy = cuda_inductor_policy(cfg)
-    candidates = tuple(sorted(kernel_names or _COMPILE_POLICY_KERNELS))
-    enabled = (
-        [
-            name
-            for name in candidates
-            if kernel_compile_enabled_for_device(name, cfg, device=device)
-        ]
-        if compile_on
-        else []
-    )
-    return {
-        "compile_enabled": bool(compile_on),
-        "device_type": device_type,
-        "backend": backend,
-        "mode": mode,
-        "scope": scope,
-        "target_kernels": list(target_kernels) if target_kernels is not None else None,
-        "compile_kernel_registry": compile_kernel_registry(),
-        "cuda_inductor_stage": stage,
-        "cuda_inductor_stage_ladder": cuda_inductor_stage_ladder(
-            cfg,
-            device=device,
-        ),
-        "cuda_inductor_stage_report": cuda_inductor_stage_policy_report(
-            stage,
-            cfg,
-            device=device,
-        ),
-        "cuda_inductor_policy": policy,
-        "cuda_inductor_candidate_kernels": list(cuda_inductor_candidate_kernels()),
-        "cuda_inductor_cpu_prequalified_kernels": list(
-            cuda_inductor_cpu_prequalified_kernels()
-        ),
-        "cuda_inductor_gpu_validated_kernel_registry": list(
-            cuda_inductor_gpu_validated_kernel_registry()
-        ),
-        "cuda_inductor_gpu_validated_kernels": list(
-            cuda_inductor_gpu_validated_kernels(device)
-        ),
-        "cuda_inductor_gpu_validation_environment": cuda_inductor_gpu_validation_environment(
-            device
-        ),
-        "cuda_inductor_promotion_requirements": cuda_inductor_promotion_requirements(),
-        "orchestration_compile_blocked_kernels": list(
-            orchestration_compile_blocked_kernels()
-        ),
-        "numeric_compile_policy_kernels": list(numeric_compile_policy_kernels()),
-        "candidate_kernels": list(candidates),
-        "enabled_kernels": enabled,
-        "disabled_kernels": [name for name in candidates if name not in enabled],
-    }
-
-
-def validate_effective_compile_request(
-    config: dict,
-    *,
-    device: torch.device | str | None,
-) -> None:
-    """Fail closed when an explicit compile request enables no numeric helper.
-
-    Target-kernel and staged compile runs are used as evidence for numerical and
-    performance claims.  If the requested names are unknown, legacy aliases,
-    orchestration-blocked wrappers, or evidence-blocked helpers, the run must not
-    proceed as a misleading "compiled" gate with an empty effective kernel set.
-    """
-    if not compile_enabled(config):
-        return
-
-    target_kernels = compile_target_kernels(config)
-    stage = cuda_inductor_stage(config)
-    if target_kernels is None and stage is None:
-        return
-
-    snapshot = compile_policy_snapshot(config, device=device)
-    enabled = tuple(str(name) for name in snapshot.get("enabled_kernels", ()))
-
-    if target_kernels is not None:
-        requested = tuple(str(name) for name in target_kernels)
-        unknown = tuple(
-            name for name in requested if name not in _COMPILE_POLICY_KERNELS
-        )
-        not_numeric = tuple(
-            name
-            for name in requested
-            if name in _COMPILE_POLICY_KERNELS
-            and name not in _NUMERIC_COMPILE_POLICY_KERNELS
-        )
-        disabled = tuple(
-            name
-            for name in requested
-            if name in _NUMERIC_COMPILE_POLICY_KERNELS
-            and not kernel_compile_enabled_for_device(name, config, device=device)
-        )
-        if unknown or not_numeric or disabled or not enabled:
-            details: list[str] = []
-            if unknown:
-                details.append(f"unknown={list(unknown)}")
-            if not_numeric:
-                details.append(f"not_numeric_or_not_promoted={list(not_numeric)}")
-            if disabled:
-                details.append(f"disabled_by_device_policy={list(disabled)}")
-            if not enabled:
-                details.append("effective_enabled_kernels=[]")
-            raise ValueError(
-                "torch.compile target request does not resolve to an effective "
-                "numeric kernel set; " + ", ".join(details)
-            )
-
-    if stage is not None and not enabled:
-        raise ValueError(
-            "torch.compile staged request does not resolve to any effective "
-            f"numeric kernels for stage {stage!r} on device {_device_type(device)!r}"
-        )
-
-
 def _unpin_cache_key(value: object) -> object:
     """Replace pinned tensor key elements by their plain value (recursively).
 
@@ -4471,7 +3733,7 @@ def _judged_call_signatures(
 def _call_is_fake(args: tuple, kwargs: Mapping[str, Any]) -> bool:
     """Whether the call's first tensor is a fake tensor (shape propagation of an enclosing trace)."""
     tensor = _first_tensor((args, kwargs))
-    return tensor is not None and is_fake(tensor)
+    return tensor is not None and torch_compat.is_fake(tensor)
 
 
 def _call_device_type(args: tuple, kwargs: dict) -> str | None:
@@ -4616,6 +3878,7 @@ def maybe_compile_kernel(
                 if fn_name in (
                     "column_ordered_factor",
                     "acoustic_step_acoustic_flux_solve_region",
+                    "acoustic_step_acoustic_flux_solve_pack_region",
                     "vertical_implicit_coefficients_vert_imp_coefs",
                 ):
                     # Ordered 55-level sweeps exceed Inductor's default fusion

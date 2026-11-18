@@ -12,6 +12,8 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any, Callable, Mapping
 
 import torch
+from torch.nn.utils import get_total_norm
+from mpas_pytorch import _torch_compat as torch_compat
 from tempo_torch.mp_tempo import MpTempoInitialization, mp_tempo_init
 from tempo_torch.torch_native import TorchFrozenTables
 from rrtmgp_radiation_torch.setup import _solar_state
@@ -49,8 +51,8 @@ from .radiation_seeds import (RadiationSeeds, RadiationSeedStream, advance_mpas_
     radiation_seed_offset)
 from .reservoirs import physical_reservoirs
 from . import runtime_policy
-from .runtime_policy import (glue, boundary_guard_mode, saved_tensor_offload_enabled, column_chunk, cycle_observers_enabled, raise_compaction, scheme,
-    step_graphs_enabled, compaction_state, cycle_checkpoint_enabled, restore_compaction_state)
+from .runtime_policy import (glue, saved_tensor_offload_enabled, column_chunk, cycle_observers_enabled, raise_compaction,
+    step_graphs_enabled, compaction_state, restore_compaction_state)
 from .surface import initialize_surface
 from .surface_containers import NativeSurface, SoilParameters, SurfaceControl
 
@@ -179,7 +181,6 @@ class _CoupledCycleTail:
 
 _PROJECTION_SUPPORT_KEYS = ("def_1", "def_2", "def_3", "diss_est", "smc", "stc", "slc")
 _FIXED_PROJECTION_KEYS = ("def_1", "def_2", "def_3", "diss_est", "lightning_threat")
-_SOIL_PROJECTION_KEYS = ("smc", "stc", "slc")
 # The group reset creates all other consumed work. These inputs survive it.
 _POST_DYNAMICS_WORK_KEYS = ("otsptflag", "prcpmp", "rainmp", "icemp", "snowmp", "graupelmp")
 
@@ -236,7 +237,7 @@ def _compact_coupled_dycore_phase(phase: _CoupledDycorePhase, *, mesh) -> _Coupl
     if context is None:
         context = _native_step_context(phase.native_state, mesh)
         pressure_padding = phase.native_state["surface_pressure"][context.support["nCells"]:]
-        torch._assert_async(
+        torch_compat.assert_async(
             ((pressure_padding == 0) & ~torch.signbit(pressure_padding)).all(),
             "native coupled phase requires positive-zero interface-pressure padding")
     elif set(phase.native_state) != set(NATIVE_STATE_KEYS):
@@ -271,7 +272,7 @@ def _materialize_coupled_dycore_phase(phase: _CoupledDycorePhase, *, mesh, confi
         ntrac=phase.native_state["scalars"].shape[2], soil_levels=support["smc"].shape[1],
         lightning_threat=support["lightning_threat"], device=reference.device, dtype=reference.dtype)
     statein = replace(statein, **{name: support[name] for name in _PROJECTION_SUPPORT_KEYS})
-    forward_mode = torch.autograd.forward_ad._current_level >= 0
+    forward_mode = torch_compat.forward_ad_active()
     step_config = dycore_step_config(config, mesh,
         differentiable=torch.is_grad_enabled() or forward_mode, forward_mode=forward_mode)
     native = _materialize_native_step(phase.native_state, phase.native_context,
@@ -295,9 +296,9 @@ def _materialize_coupled_dycore_phase(phase: _CoupledDycorePhase, *, mesh, confi
 
 
 def mark_cold_boundary(native_state, *, mesh, config, dt) -> None:
-    """``mark_complete_step_boundary`` under the runtime policy's boundary guard (``set_boundary_guard``),
-    as the cycle binds its own boundaries: in "stamps" mode no byte copy of the state and mesh is kept."""
-    with boundary_guard(boundary_guard_mode()):
+    """``mark_complete_step_boundary`` under the cycle's boundary guard (host stamps), as the cycle binds
+    its own boundaries: no byte copy of the state and mesh is kept."""
+    with boundary_guard("stamps"):
         mark_complete_step_boundary(native_state, mesh=mesh, config=config, dt=dt)
 
 
@@ -431,7 +432,7 @@ def require_finite_state(state: "CoupledCycleState") -> None:
     """Device check that every floating tensor of a cycle's output state is finite (no host read).
 
     Compiled regions drop the schemes' own ``torch._assert_async`` checks by default
-    (``compile_policy.set_compiled_asserts``); this one check per kept cycle runs outside them.
+    (``compile_policy`` module docstring); this one check per kept cycle runs outside them.
     """
     from torch.autograd import forward_ad
     from .step_graphs import flatten_state
@@ -441,10 +442,23 @@ def require_finite_state(state: "CoupledCycleState") -> None:
         values = [forward_ad.unpack_dual(value).primal for value in flatten_state(state)[0].values()
                   if isinstance(value, torch.Tensor) and value.is_floating_point() and value.numel()]
         if values:
-            # The max-norm of each tensor is NaN or inf exactly when the tensor has a nonfinite element; one
-            # read per tensor (0.036 s per x1.10242 state on 4 CPU threads, against 0.091 s for isfinite).
-            finite = torch.isfinite(torch.stack(torch._foreach_norm(values, float("inf"))))
-            torch._assert_async(finite.all(), "nonfinite coupled state after a cycle")
+            torch_compat.assert_async(all_finite(values), "nonfinite coupled state after a cycle")
+
+
+def all_finite(values: list[torch.Tensor]) -> torch.Tensor:
+    """Device Boolean: every element of every tensor in ``values`` is finite (no host read).
+
+    The max-norm of a tensor is NaN or inf exactly when the tensor has a nonfinite element; one read per tensor
+    (0.036 s per x1.10242 state on 4 CPU threads, against 0.091 s for isfinite). CUDA's fused multi-tensor
+    ``_foreach_norm`` (``get_total_norm`` with ``foreach``) takes only a list of one dtype whose tensors are all dense: one mixed list fell back to one
+    reduction kernel per tensor (600 per 60 km step, 8 ms on an A100). So each dtype's contiguous tensors form one
+    list and the other tensors another.
+    """
+    groups: dict[tuple[torch.dtype, bool], list[torch.Tensor]] = {}
+    for value in values:
+        groups.setdefault((value.dtype, value.is_contiguous()), []).append(value)
+    return torch.stack([torch.isfinite(get_total_norm(group, float("inf"), foreach=True))
+                        for group in groups.values()]).all()
 
 
 def _state_digest(state: "CoupledCycleState") -> torch.Tensor:
@@ -649,7 +663,7 @@ class _CycleRecompute(torch.autograd.Function):
 
 
 def _checkpointed_cycle(previous, arguments: Mapping[str, Any], *, operator=None, state_of=None):
-    """One cycle whose graph backward recomputes from ``previous`` (``set_cycle_checkpoint``).
+    """One cycle whose graph backward recomputes from ``previous`` (cycle checkpointing, ``runtime_policy``).
 
     The cycle runs under grad, then its graph is cut to one ``_CycleRecompute`` node, so until
     backward the cycle holds ``previous`` and that node. (A non-reentrant ``torch.utils.checkpoint``
@@ -674,7 +688,7 @@ def _checkpointed_cycle(previous, arguments: Mapping[str, Any], *, operator=None
             result = operator(state, **run_arguments)
             digest = _state_digest(state_of(result))
             if forward_digest:
-                torch._assert_async(digest == forward_digest[0], "recomputed coupled cycle differs from its forward")
+                torch_compat.assert_async(digest == forward_digest[0], "recomputed coupled cycle differs from its forward")
             else:
                 forward_digest.append(digest)
             return result
@@ -708,7 +722,7 @@ def _bound_in_policy_guard_mode(fn):
     def call(previous, **arguments):
         offload = (torch.autograd.graph.save_on_cpu(pin_memory=previous.sec.device.type == "cuda")
                    if torch.is_grad_enabled() and saved_tensor_offload_enabled() else contextlib.nullcontext())
-        with boundary_guard(boundary_guard_mode()), offload, partition_scope((arguments.get("config") or {}).get("_halo_exchanger")):
+        with boundary_guard("stamps"), offload, partition_scope((arguments.get("config") or {}).get("_halo_exchanger")):
             return fn(previous, **arguments)
     return call
 
@@ -757,11 +771,11 @@ def _run_coupled_cycle_to_dycore(previous: CoupledCycleState, *, mesh, config, d
     if step_graphs_enabled():
         # One captured graph replays every step of its variant, so the checks hold no step number:
         # the carried device step counter and the variant the static step index selected.
-        torch._assert_async((clock.kdt == previous.completed_dycore_steps + 1) & (clock.lsswr == sw)
+        torch_compat.assert_async((clock.kdt == previous.completed_dycore_steps + 1) & (clock.lsswr == sw)
             & (clock.lslwr == lw) & (clock.first_time_step == first),
             "coupled static step variant disagrees with the device clock")
     else:
-        torch._assert_async(clock.kdt == previous.step_index,
+        torch_compat.assert_async(clock.kdt == previous.step_index,
             "coupled static step_index disagrees with the device clock")
     observe = cycle_observers_enabled()
     if previous.step_index > 1 and observe:
@@ -800,6 +814,7 @@ def _run_coupled_cycle_to_dycore(previous: CoupledCycleState, *, mesh, config, d
     radiation = _run_capacity_region(run_native_radiation, statein, grid, previous.prefix.sfcprop, carry, seeds,
         replace(radiation_config, jdat=date, solhr=clock.solhr, lsswr=sw, lslwr=lw,
                 aer_jdat=forcing_date if radiation_config.iaerflg else None),
+        parameter_scales=physics_arguments.get("parameter_scales"),
         clock=clock, tables=radiation_tables, capacity_check=sw or lw)
     # The original setup updates these held controls only on SW-active calls.
     solar = ({n: radiation.stages["setup"][n] for n in ("slag", "sdec", "cdec")}
@@ -858,7 +873,10 @@ def _run_coupled_cycle_from_dycore(phase: _CoupledDycorePhase, *, mesh, config, 
         h2o_table = ozone_control["h2o_table"]
         h2o = dict(h2o_log_pressure=h2o_table.po3, h2o_forcing=glue(update_h2o_forcing)(
             _static_h2o_weights(grid, h2o_table), h2o_table, forecast_day, ozone=ozone_table))
-    micro_projection, micro_entry = glue(prepare_microphysics_prefix)(phase.native_state,
+    # The prefix never reads the stale qv alias (NativeAtmosphere.from_mpas_state), a tracer-slot view of scalars:
+    # passed, the region's layout normalization copies it, a strided read of the whole tracer array.
+    native = {name: value for name, value in phase.native_state.items() if name != "qv"}
+    micro_projection, micro_entry = glue(prepare_microphysics_prefix)(native,
         mesh, phase.statein, grid, phase.prefix, log_pressure=ozone_table.po3,
         forcing=forcing, dtp=dtp,
         control={**photochemistry_control,"first_time_step":first}, crtrh=crtrh, rhcmax=rhcmax, **h2o)
@@ -1022,7 +1040,7 @@ def advance_native_coupled_phase(previous: NativeCoupledPhase, *, on_overflow="r
     if on_completed_cycle is not None:
         if not callable(on_completed_cycle):
             raise TypeError("on_completed_cycle must be callable")
-        if torch.is_grad_enabled() or torch.autograd.forward_ad._current_level >= 0:
+        if torch.is_grad_enabled() or torch_compat.forward_ad_active():
             raise ValueError("on_completed_cycle requires forward-only no-grad execution")
         arguments = {**arguments, "_on_completed_cycle": on_completed_cycle}
     return _run_native_coupled_step(previous, on_overflow=on_overflow, **arguments)
@@ -1151,7 +1169,7 @@ def _run_coupled_operation(previous, arguments, *, on_overflow, operator=None, s
     if operator is not None and step_graphs_enabled():
         raise ValueError("native coupled phases do not yet support captured step graphs")
     device = previous.sec.device
-    checkpointed = torch.is_grad_enabled() and cycle_checkpoint_enabled()
+    checkpointed = torch.is_grad_enabled()
     selected_state = _completed_cycle_state if state_of is None else state_of
     result = None
     while True:
@@ -1170,7 +1188,7 @@ def _run_coupled_operation(previous, arguments, *, on_overflow, operator=None, s
         finally:
             _CAPACITY_RETRY.reset(token)
         if on_overflow == "assert":
-            torch._assert_async(overflow_flag(device) == 0,
+            torch_compat.assert_async(overflow_flag(device) == 0,
                 "a compacted column buffer overflowed: rerun with on_overflow='rerun' or larger buffers")
             break
         regions = consensus_regions(overflowed_regions(device), arguments["config"].get("_halo_exchanger"))
@@ -1221,7 +1239,7 @@ def run_coupled_interval(previous: CoupledCycleState, *, duration_seconds: int,
     Global and CPU-partitioned multicycle intervals retain native-five phases internally.
     The final operator returns the unchanged full last-cycle observation record.
     Captured step graphs, LBCs and accelerator partitions retain their current boundary.
-    Under grad, each operation is checkpointed (``set_cycle_checkpoint``).
+    Under grad, each operation is checkpointed (cycle checkpointing, ``runtime_policy``).
     Each kept boundary must be finite (``require_finite_state``, a device check).
     """
     if on_overflow not in ("assert", "rerun"):
@@ -1236,6 +1254,7 @@ def run_coupled_interval(previous: CoupledCycleState, *, duration_seconds: int,
         and native_boundary_supported(arguments["config"])):
         phase = _run_native_coupled_start(previous, on_overflow=on_overflow, **arguments)
         output_fields = _native_coupled_output_fields(previous, phase, mesh=arguments["mesh"])
+        previous = None  # the start state is not needed again; a caller that hands it over frees it here
         for _ in range(count - 2):
             phase = _run_native_coupled_step(phase, on_overflow=on_overflow, **arguments)
         return _run_coupled_operation(phase, {**arguments, "_output_fields": output_fields}, on_overflow=on_overflow,

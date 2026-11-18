@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from mpas_pytorch.constants import UFS_CONSTANTS, ConstantsProfile
 from mpas_pytorch.diagnostics import native_output_diagnostics
 from mpas_pytorch.dynamics.vector_reconstruction import mpas_reconstruct_2d
@@ -103,7 +104,7 @@ def refresh_host_diagnostics(
     ):
         raise ValueError("invalid native refresh scalar extent")
     cell_field("exchanged_u", exchanged_u, ne)
-    torch._assert_async(
+    torch_compat.assert_async(
         torch.isfinite(exchanged_u[:ne]).all(), "nonfinite refresh edge velocity"
     )
 
@@ -132,17 +133,17 @@ def refresh_host_diagnostics(
             raise ValueError(f"invalid native refresh coordinate extent: {name}")
     active = torch.arange(slots, device=device)[None, :] < counts[:owned, None]
     donors = edges[:owned]
-    torch._assert_async(
+    torch_compat.assert_async(
         ((counts[:owned] > 0) & (counts[:owned] <= slots)).all(),
         "invalid native refresh stencil count",
     )
-    torch._assert_async(
+    torch_compat.assert_async(
         (~active | ((donors >= 1) & (donors <= ne))).all(),
         "invalid native refresh edge donor",
     )
     # Mask coefficients before multiplication, including unused NaN IC slots.
     safe_coeffs = torch.where(active[..., None], coeffs[:owned], 0.0)
-    torch._assert_async(
+    torch_compat.assert_async(
         torch.isfinite(safe_coeffs).all(), "nonfinite refresh coefficient"
     )
     payload = {
@@ -184,7 +185,7 @@ def refresh_host_diagnostics(
     def retain_tail(
         value: torch.Tensor, active_value: torch.Tensor, count: int
     ) -> torch.Tensor:
-        torch._assert_async(
+        torch_compat.assert_async(
             torch.isfinite(active_value[:count]).all(), "nonfinite refreshed diagnostic"
         )
         return torch.cat((active_value[:count], value[count:]), dim=0)

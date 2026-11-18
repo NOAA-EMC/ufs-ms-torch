@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from math import pi
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from .containers import static_tensor
 from .clock import _nint_nonnegative
@@ -75,14 +76,14 @@ def interstitial_4(fields, *, control):
             if not working_like(value, q):
                 raise TypeError(f"interstitial4 {name} requires the working dtype {q.dtype}")
             if name != "dtend":  # pass-through diagnostic array: not re-read for finiteness
-                torch._assert_async(torch.isfinite(value).all(),f"nonfinite interstitial4 {name}")
+                torch_compat.assert_async(torch.isfinite(value).all(),f"nonfinite interstitial4 {name}")
     for name in ("prsl","save_tcp","spechum","save_qi"):
         if fields[name].shape != q.shape[:2]:
             raise ValueError(f"invalid interstitial4 {name} dimensions")
     for name in ("con_rd","con_eps","con_pi"):
         if fields[name].shape != ():
             raise ValueError(f"interstitial4 {name} requires a scalar tensor")
-        torch._assert_async(fields[name] > 0.,f"interstitial4 {name} must be positive")
+        torch_compat.assert_async(fields[name] > 0.,f"interstitial4 {name} must be positive")
     processes = []
     for name in ("conv_trans","dcnv","scnv"):
         index = control["index_of_process_"+name]
@@ -94,7 +95,7 @@ def interstitial_4(fields, *, control):
     def accumulate(current, variable, source_process, enabled=True):
         target,source = indices[100+variable-1,transport],indices[100+variable-1,source_process]
         active = enabled & (target > 0) & (source > 0)
-        torch._assert_async(~active | ((target <= ledger.shape[2]) & (source <= ledger.shape[2])),
+        torch_compat.assert_async(~active | ((target <= ledger.shape[2]) & (source <= ledger.shape[2])),
                             "interstitial4 diagnostic slot exceeds allocation")
         # In place on the owned ledger: read the source and target slots, write the target only.
         address = source.to(torch.int64).clamp(1,ledger.shape[2]).reshape(1)-1
@@ -122,7 +123,7 @@ def interstitial_4(fields, *, control):
 
     humidity = fields["spechum"]
     temperature = fields["save_tcp"]
-    torch._assert_async(((humidity >= 0.) & (humidity < 1.) & (temperature > 0.) & (fields["prsl"] > 0.)).all(),
+    torch_compat.assert_async(((humidity >= 0.) & (humidity < 1.) & (temperature > 0.) & (fields["prsl"] > 0.)).all(),
                         "invalid interstitial4 humidity/temperature/pressure")
     old_number = q[:,:,6]
     mass = q[:,:,3]-fields["save_qi"]
@@ -139,7 +140,7 @@ def interstitial_4(fields, *, control):
         new_number = torch.clamp_min(old_number+make_ice_number(mass*density,temperature,fields["con_pi"])*inverse,0.)
     if control["ldiag3d"] and control["qdiag3d"]:
         target = indices[100+control["ntinc"]-1,transport]
-        torch._assert_async(target <= ledger.shape[2],"interstitial4 ice diagnostic exceeds allocation")
+        torch_compat.assert_async(target <= ledger.shape[2],"interstitial4 ice diagnostic exceeds allocation")
         # Preserve the source's left-associated ledger+new-old cancellation.
         destination = target.to(torch.int64).clamp(1,ledger.shape[2]).reshape(1)-1
         held = ledger.index_select(2,destination)
@@ -172,7 +173,7 @@ def convective_cloud_clock(kdt,lsswr,fhour,*,nsswr,fhswr):
                              ("fhour",fhour,(torch.float64,)),("fhswr",fhswr,WORKING_DTYPES)):
         if value.shape != () or value.dtype not in dtype or value.device != fhour.device:
             raise ValueError(f"invalid cloud clock {name}")
-    torch._assert_async(torch.isfinite(fhour) & torch.isfinite(fhswr) & (fhswr > 0.) & (fhour >= 0.) & (kdt > 0),
+    torch_compat.assert_async(torch.isfinite(fhour) & torch.isfinite(fhswr) & (fhswr > 0.) & (fhour >= 0.) & (kdt > 0),
                         "invalid cloud clock interval")
     elapsed = torch.minimum(torch.minimum(fhswr/3600.,fhour),fhour.new_full((), 99.))
     convert = torch.remainder(kdt,nsswr) == 0
@@ -189,7 +190,7 @@ def cnvc90(history, *, clstp, rainc, kbot, ktop, prsi):
         shape = () if name == "clstp" else prsi.shape if name == "prsi" else (ncol,)
         if value.shape != shape or not working_like(value, prsi) or value.device != prsi.device:
             raise ValueError(f"invalid cnvc90 {name}")
-        torch._assert_async(torch.isfinite(value).all(),f"nonfinite cnvc90 {name}")
+        torch_compat.assert_async(torch.isfinite(value).all(),f"nonfinite cnvc90 {name}")
     for value in (kbot,ktop):
         if value.shape != (ncol,) or value.dtype not in (torch.int32,torch.int64) or value.device != prsi.device:
             raise ValueError("invalid cnvc90 integer cloud bounds")
@@ -207,7 +208,7 @@ def cnvc90(history, *, clstp, rainc, kbot, ktop, prsi):
     positive = convert & (acv > 0.)
     bottom = _nint_nonnegative(torch.where(positive,acvb,0.))
     top = _nint_nonnegative(torch.where(positive,acvt,0.))
-    torch._assert_async((~positive | ((bottom >= 1) & (bottom <= ninterface) & (top >= 0) & (top < ninterface))).all(),
+    torch_compat.assert_async((~positive | ((bottom >= 1) & (bottom <= ninterface) & (top >= 0) & (top < ninterface))).all(),
                         "cnvc90 history exceeds interface bounds")
     b_index = torch.where(positive,bottom-1,0).clamp(0,ninterface-1)
     t_index = torch.where(positive,top,0).clamp(0,ninterface-1)

@@ -648,156 +648,12 @@ class StaticPairRelation:
             fill_value=fill_value,
         )
 
-    def gather_pair_patch_or_base(
-        self,
-        field: torch.Tensor,
-        patch: torch.Tensor | None,
-        *,
-        patch_row_start: int,
-        patch_row_end: int,
-        slot_start: int | None = None,
-        slot_stop: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather relation sides from an active patch, falling back to base rows.
-
-        ``first_local``/``second_local`` are precomputed by the runner-owned
-        payload builder.  That keeps repeated row-range arithmetic and clamp/where
-        setup out of hot numeric call sites while preserving the same materialized
-        replacement semantics as ``base[patch_row_start:patch_row_end] = patch``.
-        """
-        if patch is None:
-            return self._slot_slice_pair_gather(field, slot_start, slot_stop)
-        patch_row_start = int(patch_row_start)
-        patch_row_end = int(patch_row_end)
-        if patch_row_end <= patch_row_start or patch.shape[0] == 0:
-            return self._slot_slice_pair_gather(field, slot_start, slot_stop)
-
-        first = self._slot_slice(self.first, slot_start, slot_stop)
-        second = self._slot_slice(self.second, slot_start, slot_stop)
-        first_local = self._slot_slice(self.first_local, slot_start, slot_stop)
-        second_local = self._slot_slice(self.second_local, slot_start, slot_stop)
-        first_local_valid = self._slot_slice(
-            self.first_local_valid, slot_start, slot_stop
-        )
-        second_local_valid = self._slot_slice(
-            self.second_local_valid, slot_start, slot_stop
-        )
-        assert first is not None and second is not None
-
-        return (
-            self._gather_side_patch_or_base(
-                field,
-                patch,
-                first,
-                first_local,
-                first_local_valid,
-                self.first_local_all,
-                patch_row_start,
-                patch_row_end,
-            ),
-            self._gather_side_patch_or_base(
-                field,
-                patch,
-                second,
-                second_local,
-                second_local_valid,
-                self.second_local_all,
-                patch_row_start,
-                patch_row_end,
-            ),
-        )
-
     def average(
         self, field: torch.Tensor, *, fill_value: float | torch.Tensor = 0.0
     ) -> torch.Tensor:
         """Gather both sides and return their ordered arithmetic mean."""
         first, second = self.gather_pair(field, fill_value=fill_value)
         return 0.5 * (first + second)
-
-    def average_vjp(
-        self, grad_output: torch.Tensor, n_source_rows: int
-    ) -> torch.Tensor:
-        """Explicit transpose of ``average`` with respect to ``field``."""
-        grad = self._mask_values(grad_output)
-        out = grad_output.new_zeros(
-            (int(n_source_rows), *grad_output.shape[self.first.ndim :])
-        )
-        flat_first = self.first.reshape(-1).to(dtype=torch.int64)
-        flat_second = self.second.reshape(-1).to(dtype=torch.int64)
-        flat_grad = grad.reshape(-1, *grad.shape[self.first.ndim :])
-        out.index_add_(0, flat_first, 0.5 * flat_grad)
-        out.index_add_(0, flat_second, 0.5 * flat_grad)
-        return out
-
-    def _apply_fill(
-        self, values: torch.Tensor, fill_value: float | torch.Tensor
-    ) -> torch.Tensor:
-        return self._fill_invalid(
-            values, self.valid, fill_value, valid_all=self.valid_all
-        )
-
-    def _mask_values(self, values: torch.Tensor) -> torch.Tensor:
-        return self._fill_invalid(values, self.valid, 0.0, valid_all=self.valid_all)
-
-    def _slot_slice_pair_gather(
-        self,
-        field: torch.Tensor,
-        slot_start: int | None,
-        slot_stop: int | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        first = self._slot_slice(self.first, slot_start, slot_stop)
-        second = self._slot_slice(self.second, slot_start, slot_stop)
-        assert first is not None and second is not None
-        return gather_rows(field, first), gather_rows(field, second)
-
-    @staticmethod
-    def _slot_slice(
-        value: torch.Tensor | None,
-        slot_start: int | None,
-        slot_stop: int | None,
-    ) -> torch.Tensor | None:
-        if value is None or slot_start is None or slot_stop is None or value.ndim < 2:
-            return value
-        return value[:, int(slot_start) : int(slot_stop)]
-
-    @staticmethod
-    def _gather_side_patch_or_base(
-        field: torch.Tensor,
-        patch: torch.Tensor,
-        indices: torch.Tensor,
-        local_indices: torch.Tensor | None,
-        local_valid: torch.Tensor | None,
-        local_all: bool | None,
-        patch_row_start: int,
-        patch_row_end: int,
-    ) -> torch.Tensor:
-        if local_indices is None or local_valid is None:
-            rel = indices - patch_row_start
-            local_valid = (indices >= patch_row_start) & (indices < patch_row_end)
-            safe_local = torch.clamp(rel, min=0, max=patch.shape[0] - 1)
-        else:
-            safe_local = local_indices
-
-        return static_patch_gather(
-            field,
-            patch,
-            indices,
-            safe_local,
-            local_valid,
-            local_all,
-        )
-
-    @staticmethod
-    def _fill_invalid(
-        values: torch.Tensor,
-        valid: torch.Tensor | None,
-        fill_value: float | torch.Tensor,
-        *,
-        valid_all: bool | None,
-    ) -> torch.Tensor:
-        if valid is None or valid_all is True:
-            return values
-        return _fill_static_invalid(values, valid, fill_value, valid_all=valid_all)
 
     def to(self, device: torch.device | str) -> StaticPairRelation:
         target = torch.device(device)
@@ -879,51 +735,6 @@ class StaticSlotRelation:
             return values
         return _fill_static_invalid(values, self.valid, fill_value, valid_all=None)
 
-    def gather_patch_or_base(
-        self,
-        field: torch.Tensor,
-        patch: torch.Tensor | None,
-        *,
-        patch_row_start: int,
-        patch_row_end: int,
-        slot_start: int | None = None,
-        slot_stop: int | None = None,
-    ) -> torch.Tensor:
-        """Gather from an active patch, falling back to base rows when needed."""
-        if patch is None:
-            indices = StaticPairRelation._slot_slice(
-                self.indices, slot_start, slot_stop
-            )
-            assert indices is not None
-            return gather_rows(
-                field,
-                indices,
-            )
-        patch_row_start = int(patch_row_start)
-        patch_row_end = int(patch_row_end)
-        indices = StaticPairRelation._slot_slice(self.indices, slot_start, slot_stop)
-        local_indices = StaticPairRelation._slot_slice(
-            self.local_indices,
-            slot_start,
-            slot_stop,
-        )
-        local_valid = StaticPairRelation._slot_slice(
-            self.local_valid,
-            slot_start,
-            slot_stop,
-        )
-        assert indices is not None
-        return StaticPairRelation._gather_side_patch_or_base(
-            field,
-            patch,
-            indices,
-            local_indices,
-            local_valid,
-            self.local_all,
-            patch_row_start,
-            patch_row_end,
-        )
-
     def reduce(
         self,
         field: torch.Tensor,
@@ -949,37 +760,6 @@ class StaticSlotRelation:
             valid_all_by_slot,
             slot_factor=slot_factor,
         )
-
-    def reduce_vjp(
-        self,
-        grad_output: torch.Tensor,
-        n_source_rows: int,
-        *,
-        weights: torch.Tensor | None | object = _USE_RELATION_WEIGHTS,
-        valid_mask: torch.Tensor | None = None,
-        slot_factor: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Explicit transpose of ``reduce`` with respect to ``field``."""
-        if weights is _USE_RELATION_WEIGHTS:
-            weights = self.weights
-        weights_tensor = cast(torch.Tensor | None, weights)
-        if valid_mask is None:
-            valid_mask = self.valid
-        out = grad_output.new_zeros((int(n_source_rows), grad_output.shape[-1]))
-        for slot in range(self.indices.shape[1]):
-            contrib = grad_output
-            if slot_factor is not None:
-                contrib = contrib * slot_factor
-            if weights_tensor is not None:
-                contrib = contrib * weights_tensor[:, slot].unsqueeze(1)
-            if valid_mask is not None:
-                contrib = _mask_static_values(
-                    contrib,
-                    valid_mask[:, slot],
-                    valid_all=None,
-                )
-            out.index_add_(0, self.indices[:, slot].to(dtype=torch.int64), contrib)
-        return out
 
     def to(self, device: torch.device | str) -> StaticSlotRelation:
         target = torch.device(device)
@@ -1100,7 +880,6 @@ class DycoreStaticPayloads:
         self._entries: dict[str, StaticPayloadEntry] = dict(entries or {})
         self._validated_static_input_keys: set[Any] = set()
         self._static_scalar_values: dict[Any, Any] = {}
-        self._vertical_scan_plan_cache: dict[Any, Any] = {}
         self._numeric_plans: dict[tuple[str, Any], Any] = {}
         self.device = torch.device(device) if device is not None else None
 
@@ -1117,7 +896,6 @@ class DycoreStaticPayloads:
         self._entries.clear()
         self._validated_static_input_keys.clear()
         self._static_scalar_values.clear()
-        self._vertical_scan_plan_cache.clear()
         self._numeric_plans.clear()
 
     def has_validated_static_inputs(self, cache_key: Any) -> bool:
@@ -1131,14 +909,6 @@ class DycoreStaticPayloads:
     def cached_static_scalar(self, cache_key: Any, default: Any = _MISSING) -> Any:
         """Return a cached static scalar value or a private missing sentinel."""
         return self._static_scalar_values.get(cache_key, default)
-
-    def mark_static_scalar(self, cache_key: Any, value: Any) -> None:
-        """Record a Python scalar extracted from immutable runner metadata."""
-        self._static_scalar_values[cache_key] = value
-
-    def vertical_scan_plan_cache(self) -> dict[Any, Any]:
-        """Return the runner-owned tridiagonal scan metadata cache."""
-        return self._vertical_scan_plan_cache
 
     def get_or_build_numeric_plan(
         self,
@@ -1198,51 +968,6 @@ class DycoreStaticPayloads:
         self._entries[name] = StaticPayloadEntry(cache_key=cache_key, payload=typed)
         return typed
 
-    def get_or_build_mesh_connectivity(
-        self,
-        mesh: Mapping[str, torch.Tensor],
-        *,
-        nCells: int,
-        nEdges: int,
-        nVertices: int,
-        nCellsSolve: int | None = None,
-        nEdgesSolve: int | None = None,
-        name: str = "mesh_connectivity",
-    ) -> MeshConnectivity:
-        """Return runner-owned package-level mesh connectivity."""
-        cache_key = mesh_connectivity_cache_key(
-            mesh,
-            nCells=nCells,
-            nEdges=nEdges,
-            nVertices=nVertices,
-            nCellsSolve=nCellsSolve,
-            nEdgesSolve=nEdgesSolve,
-        )
-        if cache_key is None:
-            return MeshConnectivity.from_mpas_mesh(
-                dict(mesh),
-                nCells=nCells,
-                nEdges=nEdges,
-                nVertices=nVertices,
-                nCellsSolve=nCellsSolve,
-                nEdgesSolve=nEdgesSolve,
-            )
-        return cast(
-            MeshConnectivity,
-            self.get_or_build(
-                name,
-                cache_key,
-                lambda: MeshConnectivity.from_mpas_mesh(
-                    dict(mesh),
-                    nCells=nCells,
-                    nEdges=nEdges,
-                    nVertices=nVertices,
-                    nCellsSolve=nCellsSolve,
-                    nEdgesSolve=nEdgesSolve,
-                ),
-            ),
-        )
-
     def to(self, device: torch.device | str) -> DycoreStaticPayloads:
         """Return a payload store with cached tensors moved to ``device``.
 
@@ -1274,7 +999,6 @@ class DycoreStaticPayloads:
             "payload_types": payload_types,
             "validated_static_input_count": len(self._validated_static_input_keys),
             "static_scalar_count": len(self._static_scalar_values),
-            "vertical_scan_plan_count": len(self._vertical_scan_plan_cache),
             "numeric_plan_count": len(self._numeric_plans),
             "numeric_plan_names": sorted({name for name, _ in self._numeric_plans}),
             "numeric_plan_counts": {

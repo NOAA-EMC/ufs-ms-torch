@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from typing import Mapping
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from .clock import _nint_nonnegative
 from .containers import Statein
@@ -63,10 +64,10 @@ def prepare_surface_composites(
     control: SurfaceCompositesControl,
 ) -> SurfaceCompositesResult:
     """Source writes before dcyc2t3; caller supplies freshly reset group scratch."""
-    torch._assert_async(
+    torch_compat.assert_async(
         (sfcprop.use_lake_model == 0).all(), "unexpected active lake model"
     )
-    torch._assert_async((sfcprop.slmsk >= 0).all(), "negative source surface mask")
+    torch_compat.assert_async((sfcprop.slmsk >= 0).all(), "negative source surface mask")
     if control.frac_grid:
         # frac_grid branch (cice is the ice fraction of the water area); cplflx is off.
         frland = sfcprop.landfrac

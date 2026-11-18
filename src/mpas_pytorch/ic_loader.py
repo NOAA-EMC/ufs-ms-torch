@@ -821,14 +821,6 @@ def _validate_coeffs_reconstruct(
         )
 
 
-def _active_tensor_missing_or_zero(value: Any, active_count: int) -> bool:
-    if not isinstance(value, torch.Tensor):
-        return True
-    if value.ndim == 0 or value.shape[0] < active_count:
-        return True
-    return bool(torch.count_nonzero(value[:active_count]).item() == 0)
-
-
 def _pad_active_tensor(active: torch.Tensor, active_count: int) -> torch.Tensor:
     pad_shape = list(active.shape)
     pad_shape[0] = 1

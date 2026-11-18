@@ -84,7 +84,6 @@ _CACHE_COUNTERS = {
                      "autograd_cache_guard_miss")}
 COMPILE_PHASES = ("dynamo_bytecode_tracing", "dynamo_guards", "dynamo_other", "backend_other", "aot_autograd",
                   "inductor_lowering", "inductor_scheduling_codegen", "inductor_load_and_build", "inductor_other")
-RUNTIME_PHASES = ("autotune", "coordinate_descent")
 
 
 def phase_split(sums: dict[str, float]) -> dict[str, Any]:

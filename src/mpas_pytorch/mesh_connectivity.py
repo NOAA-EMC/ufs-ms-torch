@@ -250,17 +250,6 @@ class MeshConnectivity:
             vorticity_col_ind=vorticity_col_ind,
         )
 
-    def memory_bytes(self) -> int:
-        """Return total memory footprint of cached tensors."""
-        total = 0
-        for value in self.__dict__.values():
-            if isinstance(value, torch.Tensor):
-                total += value.numel() * value.element_size()
-        return total
-
-    def memory_megabytes(self) -> float:
-        return self.memory_bytes() / (1024.0 * 1024.0)
-
     def to(self, device: torch.device | str) -> MeshConnectivity:
         """
         Return a new MeshConnectivity with all tensor fields moved to ``device``.

@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from gfs_surface_layer_torch.driver import EPS, EPSM1, RD, RVRDM1, sfc_diag_run, stability
 
 from .land import (
@@ -164,7 +165,7 @@ COMPOSITE_WRITES = _TRANSFER_FIELDS + (
 
 def surface_composites_post(f, *, huge: float):
     """Source composite_land/wet/icy/wet_and_icy for the selected policy."""
-    torch._assert_async(
+    torch_compat.assert_async(
         (f["use_lake_model"] == 0).all(), "unexpected active lake model"
     )
     land, water = f["islmsk"] == 1, f["islmsk"] == 0
@@ -228,7 +229,7 @@ def surface_composites_post_fractional(f, *, huge: float, thsfc_loc: bool, lheat
     type's transfer coefficients; cells with several types (fractional sea ice) call sfc_diff's
     stability with the composite roughness, temperatures and the recomputed zvfun.
     """
-    torch._assert_async((f["use_lake_model"] == 0).all(), "unexpected active lake model")
+    torch_compat.assert_async((f["use_lake_model"] == 0).all(), "unexpected active lake model")
     out = {n: f[n] for n in COMPOSITE_WRITES}
     txl = f["landfrac"]
     wfrac = 1.0 - txl
@@ -569,11 +570,13 @@ def apply_surface_generic_post(
             )
         }
     )
+    # The lowest-layer values become the carried t1, q1, u1 and v1 diagnostics: their own arrays, not strided views
+    # of Statein, which the layout normalization of every later region that takes the carry would copy again.
     f.update(
-        tgrs_1=statein.tgrs[:, 0],
-        qgrs_1=statein.qgrs[:, 0, 0],
-        ugrs_1=statein.ugrs[:, 0],
-        vgrs_1=statein.vgrs[:, 0],
+        tgrs_1=statein.tgrs[:, 0].contiguous(),
+        qgrs_1=statein.qgrs[:, 0, 0].contiguous(),
+        ugrs_1=statein.ugrs[:, 0].contiguous(),
+        vgrs_1=statein.vgrs[:, 0].contiguous(),
     )
     out = surface_generic_post(f, delt, control)
     return replace(
@@ -609,14 +612,18 @@ def run_surface_sequence(
     post_control: SurfacePostControl,
     huge: float,
     water_budgets=None,
+    charnock_scale=None,
+    noahmp_scales=None,
 ):
     """Exactly two live passes, followed by the four selected R4 post calls.
 
     The surface layer, NSST and sea ice compile (``scheme``) as regions that return only the fields
-    they write (``surface_layer_writes``, ``nsst_writes``, ``sea_ice_writes``).
+    they write (``surface_layer_writes``, ``nsst_writes``, ``sea_ice_writes``). ``charnock_scale``: the
+    trainable Charnock scale (0-d tensor; None: no op) of both surface-layer passes. ``noahmp_scales``:
+    the trainable Noah-MP scales of the first pass (``land.noahmp_parameter_scales``; None: no op).
     """
     for iteration in (1, 2):
-        prefix = apply_surface_layer(statein, grid, prefix, surface_config)
+        prefix = apply_surface_layer(statein, grid, prefix, surface_config, charnock_scale)
         prefix = apply_nsst(
             statein, grid, prefix, solhr, table, nsst_control, iteration=iteration
         )
@@ -624,7 +631,7 @@ def run_surface_sequence(
         if iteration == 1:
             prefix = scheme(apply_noahmp)(
                 statein, grid, prefix, hpbl, noahmp_case_with_plan(noah_case, device=statein.pgr.device),
-                julian=julian, yearlen=yearlen, water_budget=budget,
+                julian=julian, yearlen=yearlen, water_budget=budget, parameter_scales=noahmp_scales,
             )
         else:
             prefix = skip_inactive_noahmp_pass(statein, prefix, water_budget=budget)

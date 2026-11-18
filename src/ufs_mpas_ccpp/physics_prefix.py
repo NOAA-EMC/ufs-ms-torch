@@ -10,10 +10,12 @@ from dataclasses import dataclass, replace
 from typing import Mapping
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from gfs_surface_layer_torch.cases import SurfaceCaseConfig
 from gfs_surface_layer_torch.driver import GRAV, RVRDM1, sfc_diff_run
 from sa_sas_deep_convection_torch.samf_interstitials import mpas_tempo_layout
 
+from . import parameters
 from .clock import _nint_nonnegative
 from .containers import Statein, Stateout, static_tensor
 from .grid import Grid
@@ -64,7 +66,7 @@ class PhysicsPrefixControl:
             if isinstance(v, torch.Tensor):
                 if v.shape != () or v.dtype not in WORKING_DTYPES:
                     raise ValueError("invalid source area scaling tensor")
-                torch._assert_async(torch.isfinite(v), "nonfinite source area scaling tensor")
+                torch_compat.assert_async(torch.isfinite(v), "nonfinite source area scaling tensor")
             elif type(v) not in (float, int) or not math.isfinite(v):
                 raise ValueError("invalid source area scaling constants")
         if (
@@ -239,13 +241,15 @@ def allocate_physics_prefix_scratch(
     scratch["del_gz"] = zeros(ncol, nlev + 1)
     for name in ("dudt", "dvdt", "dtdt"):
         scratch[name] = zeros(ncol, nlev)
-    scratch["dqdt"] = torch.zeros_like(statein.qgrs)
+    # The [ncol, nlev, ntrac] zero scratch is one stride-0 zero each (no 360 MB fill at 60 km; their readers
+    # write new tensors, round 8). Distinct tensor objects, as before.
+    scratch["dqdt"] = _zero_like(statein.qgrs)
     layout = mpas_tempo_layout()
     if statein.qgrs.shape != (ncol, nlev, layout.ntrac):
         raise ValueError("physics scratch requires the R4 ten-tracer layout")
     scratch["otsptflag"] = static_tensor(layout.otsptflag, dtype=torch.bool, device=device)
     for name in ("vdftra", "dvdftra", "ten_q"):
-        scratch[name] = torch.zeros_like(statein.qgrs)
+        scratch[name] = _zero_like(statein.qgrs)
     for name in ("ten_t", "ten_u", "ten_v", "ten_t_pbl", "ten_q_pbl"):
         scratch[name] = zeros(ncol, nlev)
     scratch["tkeh"] = zeros(ncol, nlev + 1)
@@ -254,6 +258,11 @@ def allocate_physics_prefix_scratch(
         scratch[name] = zeros(ncol)
     return scratch
 
+
+
+def _zero_like(like: torch.Tensor) -> torch.Tensor:
+    """Zeros shaped like ``like``: a stride-0 view of one zero, a distinct tensor object per call."""
+    return like.new_zeros(()).expand(like.shape)
 
 def _get_prs(
     state: Statein, scratch: Mapping[str, torch.Tensor]
@@ -275,8 +284,8 @@ def _interstitial_1(
     scratch: Mapping[str, torch.Tensor],
     control: PhysicsPrefixControl,
 ):
-    torch._assert_async((grid.area > 0.0).all(), "nonpositive physics cell area")
-    torch._assert_async((surface.slmsk >= 0).all(), "negative source surface mask")
+    torch_compat.assert_async((grid.area > 0.0).all(), "nonpositive physics cell area")
+    torch_compat.assert_async((surface.slmsk >= 0).all(), "negative source surface mask")
     work1 = torch.clamp(
         (torch.log(grid.area) - control.dxmin) * control.dxinv, 0.0, 1.0
     )
@@ -472,17 +481,23 @@ def prepare_physics_prefix(
 
 
 def apply_surface_layer(
-    statein: Statein, grid: Grid, prefix: PhysicsPrefixResult, config: SurfaceCaseConfig
+    statein: Statein, grid: Grid, prefix: PhysicsPrefixResult, config: SurfaceCaseConfig,
+    charnock_scale: torch.Tensor | None = None,
 ) -> PhysicsPrefixResult:
     """Bind one existing sfc_diff call; NSST/land/ice must precede another pass.
 
     The compiled region (``scheme``) is ``surface_layer_writes``: it returns only the fields it writes.
+    ``charnock_scale``: the trainable Charnock scale (0-d tensor; None: no op), a tensor argument of the region:
+    a 1-element view on the numerical device (as ``parameters.region_views``), which the region reshapes back.
     """
-    return merge_prefix_writes(prefix, scheme(surface_layer_writes)(statein, grid, prefix, config))
+    if charnock_scale is not None:
+        charnock_scale = parameters.region_view(charnock_scale, statein.tgrs)
+    return merge_prefix_writes(prefix, scheme(surface_layer_writes)(statein, grid, prefix, config, charnock_scale))
 
 
 def surface_layer_writes(
-    statein: Statein, grid: Grid, prefix: PhysicsPrefixResult, config: SurfaceCaseConfig
+    statein: Statein, grid: Grid, prefix: PhysicsPrefixResult, config: SurfaceCaseConfig,
+    charnock_scale: torch.Tensor | None = None,
 ) -> tuple[dict, dict]:
     """The sfcprop and interstitial fields one sfc_diff call writes (``apply_surface_layer``)."""
     surface, work = prefix.sfcprop, prefix.interstitial
@@ -541,8 +556,10 @@ def surface_layer_writes(
             ("ztmax", "ztmax"),
         ):
             fields[field + "_" + short] = work[member + "_" + long]
+    if charnock_scale is not None:
+        fields["charnock_scale"] = charnock_scale.reshape(())
     out = sfc_diff_run(fields, config)
-    torch._assert_async(out["errflg"] == 0, "source surface-layer configuration failed")
+    torch_compat.assert_async(out["errflg"] == 0, "source surface-layer configuration failed")
     surface = dict(zorlw=out["z0rl_wat"], zorll=out["z0rl_lnd"], zorli=out["z0rl_ice"])
     work = {"zvfun": out["zvfun"]}
     for short, long in (("wat", "water"), ("lnd", "land"), ("ice", "ice")):

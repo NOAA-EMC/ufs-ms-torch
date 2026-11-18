@@ -14,29 +14,16 @@ from sa_tke_edmf_torch.constants import (
     ELOCP,
     EPS,
     EPSM1,
-    F32_0P001,
-    F32_0P01,
-    F32_0P49,
-    F32_1E_M4,
-    F32_1E_M6,
-    F32_1E_M10,
     FV,
     GRAV,
     HFUS,
     HVAP,
-    IM,
-    KM,
-    NTRAC,
     NTQV,
-    QLMIN,
-    QMIN,
     source_real,
 )
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
 from sa_tke_edmf_torch.thermo import fpvs
 from sa_tke_edmf_torch.tracers import satmedmf_hydrometeor_indices
-
-CHECKPOINT_FIELDS = ("zl", "zi", "theta", "qlx", "thvx")
 
 
 def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
@@ -63,7 +50,9 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
 
     zi = phii * (1.0 / GRAV)
     zl = phil * (1.0 / GRAV)
-    zm = zi[:, 1:]
+    # zi[:, 1:] formed as its own array (the same product per element): the view (row stride KM + 1, offset 1)
+    # was copied at the entry of each plume island that reads it (round 8 wave 4).
+    zm = phii[:, 1:] * (1.0 / GRAV)
     pix = psk[:, None] / prslk
     plyr = F32_0P01 * prsl
     theta = t1 * pix
@@ -134,5 +123,3 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     )
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

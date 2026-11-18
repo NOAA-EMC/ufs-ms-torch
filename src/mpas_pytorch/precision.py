@@ -9,22 +9,28 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from mpas_pytorch.constants import DTYPE
 from mpas_pytorch.exceptions import MpasConfigError, MpasUnsupportedCapabilityError
 
 
 def working_power(base: torch.Tensor, exponent: float) -> torch.Tensor:
-    """Keep CPU FP32 scalar/SIMD power rounding independent of spatial batch size.
+    """``base ** exponent`` with an FP32 rounding that does not depend on batch size or device.
 
-    CPU uses an FP64 power with a working-dtype exponent and rounds once.
-    CUDA/MPS retain native FP32 powers. FP64 retains the qualified operation.
+    - FP32 on CPU and CUDA: the power is formed in FP64 (``torch.float_power`` with the exponent
+      as an FP32 tensor) and rounded once to FP32. The native FP32 power differs between the
+      scalar and SIMD paths of a CPU kernel, so its last bit would depend on the batch size.
+      On CUDA the FP64 power costs more than an FP32 one: FP64 throughput is a fraction of FP32
+      throughput on most GPUs.
+    - FP32 on MPS: MPS has no FP64, so the native FP32 ``torch.pow`` is used.
+    - FP64: ``torch.pow`` with the Python exponent.
     """
     if base.dtype == torch.float32:
         power = torch.scalar_tensor(exponent, dtype=base.dtype, device=base.device)
-        if base.device.type == "cpu":
-            return torch.float_power(base, power).to(base.dtype)
-        return torch.pow(base, power)
+        if base.device.type == "mps":
+            return torch.pow(base, power)
+        return torch.float_power(base, power).to(base.dtype)
     return torch.pow(base, exponent)
 
 
@@ -38,7 +44,7 @@ def assert_async(predicate: torch.Tensor, message: str) -> None:
         if not bool(predicate):
             raise RuntimeError(message)
         return
-    torch._assert_async(predicate, message)
+    torch_compat.assert_async(predicate, message)
 
 def resolve_dtype(dtype: torch.dtype | str = DTYPE) -> torch.dtype:
     if dtype in (torch.float32, "float32"):

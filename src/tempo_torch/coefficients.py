@@ -6,6 +6,7 @@
 Only immutable constants and prepared coefficient buffers cross into the runtime.
 No live model state enters this module.
 """
+
 from __future__ import annotations
 
 import cmath
@@ -31,9 +32,12 @@ _STATIC_SNOW_CSG = _STATIC_SNOW_CSG.copy()
 _STATIC_SNOW_CSG[3] = 3.51325214469320013
 _STATIC_SNOW_CSG[9] = 7.61279965268895031
 _SCALAR_CIE = tuple(float(value) for value in _parameters.CIE)
-_SCALAR_CIG = tuple(float(value) for value in _parameters.CIG)
+# Frozen TEMPO REAL64 initialization (mu_i=0, bm_i=3, bv_i=1). Host math.gamma differs at Gamma(3.5), which
+# affects small number tendencies; the rain number fall speed (CRG[6]) uses the same frozen value.
+_SCALAR_CIG = (1.0, 6.0, 24.0, 1.0, 1.0, 3.32335097044784256, 1.32934038817913702)
 _SCALAR_CRE = tuple(float(value) for value in _parameters.CRE)
-_SCALAR_CRG = tuple(float(value) for value in _parameters.CRG)
+_SCALAR_CRG = tuple(float(value) for value in _parameters.CRG[:6]) + (3.32335097044784256,) + tuple(
+    float(value) for value in _parameters.CRG[7:])
 _SCALAR_CSE = tuple(float(value) for value in _parameters.CSE)
 _SCALAR_CSG = tuple(float(value) for value in _parameters.CSG)
 _SNOW_MOMENT_COMPILE_FIELDS = _parameters.SNOW_MOMENT_FIELDS
@@ -60,23 +64,36 @@ _STATIC_GRAUPEL_RHO_G = np.asarray(_parameters.RHO_G, dtype=np.float64)
 _STATIC_GRAUPEL_AV_G = np.asarray(_parameters.AV_G, dtype=np.float64)
 _STATIC_GRAUPEL_BV_G = np.asarray(_parameters.BV_G, dtype=np.float64)
 _STATIC_GRAUPEL_AM_G = np.asarray(_parameters.AM_G, dtype=np.float64)
-_SCALAR_GRAUPEL_CGE = tuple(tuple(float(value) for value in row) for row in _parameters.CGE)
-_SCALAR_GRAUPEL_CGG = tuple(tuple(float(value) for value in row) for row in _STATIC_GRAUPEL_CGG)
+_SCALAR_GRAUPEL_CGE = tuple(
+    tuple(float(value) for value in row) for row in _parameters.CGE
+)
+_SCALAR_GRAUPEL_CGG = tuple(
+    tuple(float(value) for value in row) for row in _STATIC_GRAUPEL_CGG
+)
 _SCALAR_GRAUPEL_RHO_G = tuple(float(value) for value in _parameters.RHO_G)
 _SCALAR_GRAUPEL_AV_G = tuple(float(value) for value in _parameters.AV_G)
 _SCALAR_GRAUPEL_BV_G = tuple(float(value) for value in _parameters.BV_G)
 _SCALAR_GRAUPEL_AM_G = tuple(float(value) for value in _parameters.AM_G)
 _SCALAR_GRAUPEL_SINGLE_MOMENT_LAMG_SCALE = float(
-    (_SCALAR_GRAUPEL_CGG[2][0] * _parameters.OGG2 * _parameters.OGG1) ** _parameters.OBMG
+    (_SCALAR_GRAUPEL_CGG[2][0] * _parameters.OGG2 * _parameters.OGG1)
+    ** _parameters.OBMG
 )
-_STATIC_RAIN_DIAMETER_BINS = np.asarray(_parameters._rain_diameter_bins(), dtype=np.float64)
-_STATIC_WARM_RAIN_EFFICIENCY = np.asarray(_parameters._warm_rain_efficiency(), dtype=np.float64)
+_STATIC_RAIN_DIAMETER_BINS = np.asarray(
+    _parameters._rain_diameter_bins(), dtype=np.float64
+)
+_STATIC_WARM_RAIN_EFFICIENCY = np.asarray(
+    _parameters._warm_rain_efficiency(), dtype=np.float64
+)
 _SCALAR_RAIN_WATER_THRESHOLDS = tuple(float(value) for value in _parameters.R_R)
 _SCALAR_SNOW_WATER_THRESHOLDS = tuple(float(value) for value in _parameters.R_S)
 _SCALAR_GRAUPEL_WATER_THRESHOLDS = tuple(float(value) for value in _parameters.R_G)
-_STATIC_CLOUD_NUMBER_BINS = np.asarray(_parameters._cloud_number_bins(), dtype=np.float64)
+_STATIC_CLOUD_NUMBER_BINS = np.asarray(
+    _parameters._cloud_number_bins(), dtype=np.float64
+)
 _SCALAR_CLOUD_WATER_THRESHOLDS = tuple(float(value) for value in _parameters.R_C)
-_STATIC_DROP_EVAP_NUMBER_TABLE = np.asarray(_parameters._drop_evap_number_table(), dtype=np.float64)
+_STATIC_DROP_EVAP_NUMBER_TABLE = np.asarray(
+    _parameters._drop_evap_number_table(), dtype=np.float64
+)
 _STATIC_CLOUD_ACTIVATION_NA_AXIS = np.asarray(_parameters.TA_NA, dtype=np.float64)
 _STATIC_CLOUD_ACTIVATION_W_AXIS = np.asarray(_parameters.TA_WW, dtype=np.float64)
 _STATIC_CLOUD_ACTIVATION_T_AXIS = np.asarray(_parameters.TA_TK, dtype=np.float64)
@@ -85,24 +102,33 @@ _STATIC_ICE_AUTOCONVERSION_TABLES = tuple(
     np.asarray(array, dtype=np.float64)
     for array in _parameters._ice_autoconversion_tables()
 )
-_STATIC_SNOW_CLOUD_WATER_EFFICIENCY = np.asarray(_parameters._snow_cloud_water_efficiency(), dtype=np.float64)
-_STATIC_SNOW_DIAMETER_BINS = np.asarray(_parameters._snow_diameter_bins(), dtype=np.float64)
+_STATIC_SNOW_CLOUD_WATER_EFFICIENCY = np.asarray(
+    _parameters._snow_cloud_water_efficiency(), dtype=np.float64
+)
+_STATIC_SNOW_DIAMETER_BINS = np.asarray(
+    _parameters._snow_diameter_bins(), dtype=np.float64
+)
 _STATIC_HAIL_BINS = tuple(
-    np.asarray(array, dtype=np.float64)
-    for array in _parameters._hail_bins()
+    np.asarray(array, dtype=np.float64) for array in _parameters._hail_bins()
 )
 _STATIC_RADAR_BINS = {
     (_parameters.RADAR_BINS, 100.0e-6, 0.05): tuple(
         np.asarray(array, dtype=np.float64)
-        for array in _parameters._create_bins_with_widths(_parameters.RADAR_BINS, 100.0e-6, 0.05)
+        for array in _parameters._create_bins_with_widths(
+            _parameters.RADAR_BINS, 100.0e-6, 0.05
+        )
     ),
     (_parameters.RADAR_BINS, 100.0e-6, 0.02): tuple(
         np.asarray(array, dtype=np.float64)
-        for array in _parameters._create_bins_with_widths(_parameters.RADAR_BINS, 100.0e-6, 0.02)
+        for array in _parameters._create_bins_with_widths(
+            _parameters.RADAR_BINS, 100.0e-6, 0.02
+        )
     ),
 }
 _STATIC_SIMPSON_WEIGHTS = {
-    _parameters.RADAR_BINS: np.asarray(_parameters._simpson_weights(_parameters.RADAR_BINS), dtype=np.float64),
+    _parameters.RADAR_BINS: np.asarray(
+        _parameters._simpson_weights(_parameters.RADAR_BINS), dtype=np.float64
+    ),
 }
 
 _STATIC_NDARRAY_IDS = frozenset(
@@ -139,38 +165,53 @@ _STATIC_NDARRAY_IDS = frozenset(
 )
 
 
-def _radar_scalar_bin_weights(numbins: int, lowbin: float, highbin: float) -> tuple[tuple[float, ...], tuple[float, ...]]:
+def _radar_scalar_bin_weights(
+    numbins: int, lowbin: float, highbin: float
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
     key = (int(numbins), float(lowbin), float(highbin))
     bins, widths = _STATIC_RADAR_BINS[key]
     simpson = _STATIC_SIMPSON_WEIGHTS[int(numbins)]
     return (
         tuple(float(value) for value in bins),
-        tuple(float(weight) for weight in np.asarray(simpson, dtype=np.float64) * np.asarray(widths, dtype=np.float64)),
+        tuple(
+            float(weight)
+            for weight in np.asarray(simpson, dtype=np.float64)
+            * np.asarray(widths, dtype=np.float64)
+        ),
     )
 
 
-_SCALAR_RADAR_GRAUPEL_BINS, _SCALAR_RADAR_GRAUPEL_QUADRATURE_WEIGHTS = _radar_scalar_bin_weights(
-    _parameters.RADAR_BINS,
-    100.0e-6,
-    0.05,
+_SCALAR_RADAR_GRAUPEL_BINS, _SCALAR_RADAR_GRAUPEL_QUADRATURE_WEIGHTS = (
+    _radar_scalar_bin_weights(
+        _parameters.RADAR_BINS,
+        100.0e-6,
+        0.05,
+    )
 )
-_SCALAR_RADAR_SNOW_BINS, _SCALAR_RADAR_SNOW_QUADRATURE_WEIGHTS = _radar_scalar_bin_weights(
-    _parameters.RADAR_BINS,
-    100.0e-6,
-    0.02,
+_SCALAR_RADAR_SNOW_BINS, _SCALAR_RADAR_SNOW_QUADRATURE_WEIGHTS = (
+    _radar_scalar_bin_weights(
+        _parameters.RADAR_BINS,
+        100.0e-6,
+        0.02,
+    )
 )
-_RADAR_COMPLEX_WATER_0 = complex(_parameters.complex_water_ray(_parameters.LAMBDA_RADAR, 0.0))
-_RADAR_COMPLEX_ICE_0 = complex(_parameters.complex_ice_maetzler(_parameters.LAMBDA_RADAR, 0.0))
+_RADAR_COMPLEX_WATER_0 = complex(
+    _parameters.complex_water_ray(_parameters.LAMBDA_RADAR, 0.0)
+)
+_RADAR_COMPLEX_ICE_0 = complex(
+    _parameters.complex_ice_maetzler(_parameters.LAMBDA_RADAR, 0.0)
+)
 _HOMOGENEOUS_FREEZING_TEMPERATURE = float(_parameters.segment_i_hgfrz())
 _RADAR_COMPLEX_WATER_SQ = _RADAR_COMPLEX_WATER_0 * _RADAR_COMPLEX_WATER_0
 _RADAR_COMPLEX_ICE_SQ = _RADAR_COMPLEX_ICE_0 * _RADAR_COMPLEX_ICE_0
-_RADAR_BETA_WATER_ICE = _complex_beta_constant_python(_RADAR_COMPLEX_WATER_SQ, _RADAR_COMPLEX_ICE_SQ)
+_RADAR_BETA_WATER_ICE = _complex_beta_constant_python(
+    _RADAR_COMPLEX_WATER_SQ, _RADAR_COMPLEX_ICE_SQ
+)
 _RADAR_K_W = abs((_RADAR_COMPLEX_WATER_SQ - 1.0) / (_RADAR_COMPLEX_WATER_SQ + 2.0))
 _RADAR_K_W = _RADAR_K_W * _RADAR_K_W
 _RADAR_REFLECTIVITY_FACTOR = float(
     _parameters.LAMBDA_RADAR**4 / (_parameters.PI**5 * _RADAR_K_W)
 )
-
 
 
 def _literal(value):
@@ -184,4 +225,10 @@ def _literal(value):
 
 
 # The runtime reads plain Python values: no NumPy scalars enter the tensor programs.
-constants = SimpleNamespace(**{name: _literal(value) for name, value in vars(_parameters).items() if name.isupper()})
+constants = SimpleNamespace(
+    **{
+        name: _literal(value)
+        for name, value in vars(_parameters).items()
+        if name.isupper()
+    }
+)

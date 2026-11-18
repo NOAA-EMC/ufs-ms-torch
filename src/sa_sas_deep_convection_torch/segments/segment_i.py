@@ -8,13 +8,10 @@ from __future__ import annotations
 import torch
 
 from sa_sas_deep_convection_torch import recurrence_chunks as chunks
-from sa_sas_deep_convection_torch.compile import masked_sum_chunk_size, run_compile_island, run_recurrence_chunk, recurrence_chunk_size, ordered_chunks_enabled
-from sa_sas_deep_convection_torch.constants import FV, GRAV, KM
-from sa_sas_deep_convection_torch.ops import sqrt_zero_grad
+from sa_sas_deep_convection_torch.compile import run_compile_island, run_recurrence_chunk, recurrence_chunk_size, ordered_chunks_enabled
+from sa_sas_deep_convection_torch.constants import GRAV
 from sa_sas_deep_convection_torch.segments.segment_d import _gather_column
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
-
-CHECKPOINT_FIELDS = ("pwo", "pwdo", "qrcko", "aa1", "aa2", "cldwrk", "cnvflg", "return_stage")
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -276,7 +273,7 @@ def _updraft_precip_cloud_work_block(
 
     aa1 = torch.where(cnvflg != 0.0, torch.zeros_like(aa1_input), aa1_input)
     work_rows = chunks.pack_profiles(zo, buo)
-    size = masked_sum_chunk_size()
+    size = recurrence_chunk_size()
     for start in range(1, KM - 1, size):
         stop = min(start + size, KM - 1)
         aa1 = run_recurrence_chunk("i_ordered_chunks", "updraft_work", chunks.updraft_work,
@@ -286,10 +283,6 @@ def _updraft_precip_cloud_work_block(
     dbyo1 = torch.where(work_mask, hcko - heso, dbyo1)
     cnvflg = torch.where((cnvflg != 0.0) & (aa1 <= 0.0), torch.zeros_like(cnvflg), cnvflg)
     return hmin, lmin, jmin, xmbmax, qcko, qrcko, pwo, pwdo, buo, dellal, pwavo, cnvwt, zdqca, drag, wush, aa1, dbyo1, cnvflg
-
-
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}
 
 
 def _recurrence_coordinator(category, name, fn, *args):

@@ -8,12 +8,10 @@ from __future__ import annotations
 import torch
 
 from sa_sas_deep_convection_torch.compile import run_compile_island
-from sa_sas_deep_convection_torch.constants import EPS, EPSM1, FV, GRAV, KM, NN, NTR
+from sa_sas_deep_convection_torch.constants import EPS, EPSM1, FV, GRAV
 from sa_sas_deep_convection_torch.segments.segment_d import _fpvs_from_table
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
 from sa_sas_deep_convection_torch.thermo import _fpvs_table_for_device
-
-CHECKPOINT_FIELDS = ("qeso", "heo", "heso", "dbyo", "zo", "kmax", "kbm", "kbmax", "cnvflg")
 
 
 def _masked_fill_field(base: torch.Tensor, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -112,8 +110,10 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
         q1,
         u1,
         v1,
-        # samf transports qtr(:,:,3:ntr+2); slots above ntr+2 (layout nn > ntr+2) pass through.
-        qtr[:, :, : NTR + 2],
+        # samf transports qtr(:,:,3:ntr+2); slots above ntr+2 (layout nn > ntr+2) pass through. The island reads
+        # its slots from the whole qtr: the slice qtr[:, :, :ntr+2] was a strided view that the region entry
+        # copied (0.29 ms per 60 km step on the RTX PRO 6000, round 8 wave 4).
+        qtr,
         cnvflg,
         sfcpbl,
         state.require("xlamue"),
@@ -122,6 +122,7 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
         state.require("hvap"),
         _fpvs_table_for_device(str(ps.device), ps.dtype),
         hwrf_samfdeep,
+        NTR,
     )
     (
         cxlame,
@@ -229,9 +230,10 @@ def _geometry_thermo_seed_block(
     hvap: torch.Tensor,
     fpvs_table: torch.Tensor,
     hwrf_samfdeep: bool,
+    ntr: int,
 ) -> tuple[torch.Tensor, ...]:
     KM = q1.shape[1]
-    NTR = qtr.shape[2] - 2
+    NTR = ntr
     ncol = ps.shape[0]
     one_col = torch.ones((ncol,), dtype=ps.dtype, device=ps.device)
     kmax = torch.full_like(one_col, float(KM))
@@ -392,5 +394,3 @@ def _geometry_thermo_seed_block(
     )
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

@@ -11,7 +11,7 @@ from copy import deepcopy
 from typing import Any
 
 import torch
-from torch.autograd import forward_ad
+from mpas_pytorch import _torch_compat as torch_compat
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from torch.utils.checkpoint import set_checkpoint_early_stop
 
@@ -20,10 +20,7 @@ from . import differentiable_mode, is_grad_mode
 
 def _forward_ad_active() -> bool:
     """Return True only while inside an active forward-ad dual_level context."""
-    level = getattr(forward_ad, "_current_level", -1)
-    if isinstance(level, int):
-        return level != -1
-    return False
+    return torch_compat.forward_ad_active()
 
 
 def _non_tensor_equal(lhs: Any, rhs: Any) -> bool:

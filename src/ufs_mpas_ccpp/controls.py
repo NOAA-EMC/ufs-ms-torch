@@ -19,7 +19,7 @@ replacement may be a new tensor, a leaf that requires grad, a dual tensor or a p
   comes from the commit's own operation order, not from ``f``), and derivatives are those of ``f``.
 - ``rw`` is a control of its own: the split-explicit solver carries it beside ``w``, and at a cycle
   boundary it departs from the coupled-diagnostic relation (relative 1.5e-3 at x1.10242, cycle 3),
-  while every anchored diagnostic agrees with its relation to rounding (``anchored_residuals``).
+  while every anchored diagnostic agrees with its relation to rounding.
 - On a partition (``config["_halo_exchanger"]``) the owned rows are the controls: the halo rows of the
   native controls are taken from their owners (the dycore's ``ufs_controls`` halo group), with their
   tangents and cotangents, so a replaced control's own halo rows have no effect. The anchored wind
@@ -49,8 +49,6 @@ from .step_graphs import flatten_state, restamp, stamp_names, unflatten_state
 
 NATIVE_CONTROLS = tuple(f"/native_state/{name}" for name in ("u", "w", "rw", "theta_m", "rho_zz", "scalars"))
 _COUPLED = ("ru", "rho_p", "rtheta_p", "exner", "pressure_p")
-_REFRESHED = ("theta", "uReconstructZonal", "uReconstructMeridional", "uReconstructX",
-              "uReconstructY", "uReconstructZ", "rho", "pressure", "surface_pressure")
 
 
 def control_paths(state: CoupledCycleState) -> tuple[str, ...]:
@@ -91,16 +89,6 @@ def _native_diagnostics(native: Mapping, mesh: Mapping, config: Mapping) -> dict
                rho=refreshed.diagnostics.rho, pressure=refreshed.diagnostics.pressure,
                surface_pressure=atmosphere.surface_pressure)
     return out
-
-
-def anchored_residuals(state: CoupledCycleState, *, mesh: Mapping, config: Mapping) -> dict[str, float]:
-    """max |d0 - f(x0)| / max |d0| per anchored diagnostic: how far the carried value is from ``f``.
-
-    Rounding-level values confirm that ``f`` is the relation the model maintains."""
-    native = state.native_state
-    f0 = _native_diagnostics(native, mesh, config)
-    return {key: float((native[key] - f0[key]).abs().max() / native[key].abs().max().clamp_min(1e-300))
-            for key in f0}
 
 
 def with_controls(state: CoupledCycleState, values: Mapping[str, torch.Tensor], *,

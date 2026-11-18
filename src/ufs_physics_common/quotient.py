@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 
 class _Quotient(torch.autograd.Function):
@@ -55,6 +56,6 @@ class _DualQuotient(_Quotient):
 
 def quotient(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
     """``numerator / denominator`` (same forward bits) with range-safe reverse and forward derivatives."""
-    if torch.autograd.forward_ad._current_level >= 0:
+    if torch_compat.forward_ad_active():
         return _DualQuotient.apply(numerator, denominator)
     return _Quotient.apply(numerator, denominator)

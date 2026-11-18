@@ -7,10 +7,7 @@ from __future__ import annotations
 
 import torch
 
-from sa_tke_edmf_torch.constants import IM, KM, NTRAC
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
-
-CHECKPOINT_FIELDS = ("xmfd", "xlamde", "tcdo", "qcdo", "buod")
 
 
 def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
@@ -35,5 +32,3 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     )
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

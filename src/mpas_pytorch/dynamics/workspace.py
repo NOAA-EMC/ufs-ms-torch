@@ -162,21 +162,6 @@ class DycoreWorkspace:
         """Total bytes allocated across all workspace kernels."""
         return sum(self.bytes_by_kernel().values())
 
-    def memory_report(self) -> dict[str, float]:
-        """
-        Memory usage report in MiB.
-
-        Returns:
-            Dict with `total_mib` and per-kernel `*_mib` entries.
-        """
-        by_kernel = self.bytes_by_kernel()
-        report: dict[str, float] = {
-            "total_mib": float(self.total_bytes()) / (1024.0 * 1024.0),
-        }
-        for name, bytes_used in by_kernel.items():
-            report[f"{name}_mib"] = float(bytes_used) / (1024.0 * 1024.0)
-        return report
-
 
 def workspace_dims_from_state(state_dict: dict) -> WorkspaceDims:
     """Build workspace dimensions from runtime state dictionary."""

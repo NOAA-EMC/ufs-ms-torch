@@ -107,6 +107,9 @@ def tracer_layout(state: SaSasDeepConvectionState):
 
     layout = layout_from_config(state.config.get("tracer_layout"))
     if layout is not None:
+        # One source for the TKE slot: a config ntk must agree with the declared layout.
+        if "ntk" in state.config and int(state.config["ntk"]) != layout.ntk:
+            raise ValueError(f"deep config ntk={state.config['ntk']} disagrees with the tracer layout ntk={layout.ntk}")
         return layout
     nn = state.require("qtr").shape[2]
     return legacy_layout(

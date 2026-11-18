@@ -12,15 +12,18 @@ branches instead of broadening the target claim silently.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
-from typing import Any, Mapping, NamedTuple, Sequence
+from typing import Any, Mapping
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
+from ufs_physics_common.ordered_sum import level_prefix
 from ufs_physics_common.precision import working_power
 from .thermo import static_tensor
 
-from .compile import compile_categories_enabled, run_compile_island
 from .land_energy import (
     DZSOIL_4L,
+    LandEnergyTables,
+    ThermopropResult,
     NOAHMP_SB as LAND_ENERGY_SB,
     bare_flux_opt_sfc3,
     btran_opt_btr1_source_corridor,
@@ -31,9 +34,7 @@ from .land_energy import (
     soilwater_opt_run1_inf1_source_corridor,
     thermoprop_source_corridor,
     _state_cached_tensor,
-    _tsnosoi_source_corridor_flat_impl,
     tsnosoi_source_corridor,
-    vege_flux_opt_sfc3,
     _positive_soil_ice,
 )
 from .tables import GFS_V17_PROFILE_SCM_TABLE_VARIANT, NoahMpTableBundle
@@ -48,7 +49,6 @@ CON_RV = 461.50
 CON_EPS = CON_RD / CON_RV
 CON_EPSM1 = CON_EPS - 1.0
 CON_HFUS = 3.3358e5
-NOAHMP_RAIR = 287.04
 NOAHMP_CPAIR = 1004.64
 NOAHMP_TFRZ = 273.16
 NOAHMP_HVAP = 2.5104e06
@@ -61,10 +61,6 @@ NOAHMP_DENICE = 917.0
 NOAHMP_GRAV = 9.80616
 NOAHMP_SB = 5.67e-08
 NOAHMP_VKC = 0.40
-
-
-def _pow2(value: torch.Tensor) -> torch.Tensor:
-    return value * value
 
 
 def _pow3(value: torch.Tensor) -> torch.Tensor:
@@ -92,23 +88,6 @@ LAND_BODY_SUPPORTED_OPTIONS = {
     "iopt_tbot": 2,
     "iopt_trs": 2,
 }
-
-H_SCALAR_FIELDS = (
-    "fsa",
-    "fsr",
-    "fira",
-    "fsh",
-    "fcev",
-    "fgev",
-    "fctr",
-    "ssoil",
-    "trad",
-    "psn",
-    "apar",
-    "ponding",
-)
-I_SCALAR_FIELDS = ("qvap", "qdew", "edir", "ecan", "etran", "runsrf", "runsub", "qsnbot", "esnow")
-J_SCALAR_FIELDS = ("gpp", "npp", "nee", "errwat", "fveg", "albedo", "snowh", "sneqv", "qsfc")
 
 
 @dataclass(frozen=True)
@@ -228,6 +207,11 @@ class LandBodyState:
     albdry_by_column: torch.Tensor | None = None
     albsat_soilcol_by_column: torch.Tensor | None = None
     albdry_soilcol_by_column: torch.Tensor | None = None
+    # Trainable parameter scales (driver option "parameter_scales"), each a 1-element view of its 0-d scale
+    # (a 0-d CPU float64 tensor would cross the compiled Noah-MP regions as a float symbol): czil multiplies
+    # czil = 10**(-0.4*hvt), rsurf the dry soil-surface resistance of iopt_rsf 4. None: no scale.
+    czil_scale: torch.Tensor | None = None
+    rsurf_scale: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -238,29 +222,6 @@ class LandBodyHIJ:
     i: Mapping[str, torch.Tensor]
     j: Mapping[str, torch.Tensor]
     tail: Mapping[str, torch.Tensor]
-
-
-class LandBodyTailOutput(NamedTuple):
-    """Flat K-O tail state needed by the production final-O surface."""
-
-    temperature_radiative: torch.Tensor
-    surface_temperature: torch.Tensor
-    sensible_heat_total: torch.Tensor
-    latent_heat_total: torch.Tensor
-    ground_heat_total: torch.Tensor
-    z0_total: torch.Tensor
-    z0h_total: torch.Tensor
-    exchange_heat_total: torch.Tensor
-    soil_moisture_vol: torch.Tensor
-    temperature_snow_soil: torch.Tensor
-    spec_humidity_surface: torch.Tensor
-    sw_absorbed_total: torch.Tensor
-    emissivity_total: torch.Tensor
-    runoff_surface: torch.Tensor
-    vegetation_fraction: torch.Tensor
-
-
-LAND_BODY_TAIL_OUTPUT_FIELDS = LandBodyTailOutput._fields
 
 
 def _tensor(values: Any, *, device: torch.device, dtype: torch.dtype = torch.float64) -> torch.Tensor:
@@ -382,10 +343,6 @@ def _fortran_nint(x: torch.Tensor) -> torch.Tensor:
     return torch.where(x >= 0.0, torch.floor(x + 0.5), torch.ceil(x - 0.5)).to(torch.int64)
 
 
-def _replace_column_tuple(columns: tuple[torch.Tensor, ...], index: int, values: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    return tuple(values if pos == int(index) else column for pos, column in enumerate(columns))
-
-
 def _columns_to_matrix(columns: tuple[torch.Tensor, ...]) -> torch.Tensor:
     return torch.stack(columns, dim=1)
 
@@ -428,19 +385,12 @@ def _g_boundary_matrix(g_outputs: Mapping[str, torch.Tensor], field: str, indice
     label_tensor = torch.tensor(labels, dtype=indices.dtype, device=indices.device)
     positions = torch.searchsorted(label_tensor, indices + 1)
     found = (positions < len(labels)) & (label_tensor.index_select(0, positions.clamp(max=len(labels) - 1)) == indices + 1)
-    torch._assert_async(torch.all(found), f"Missing {field} checkpoint columns")
+    torch_compat.assert_async(torch.all(found), f"Missing {field} checkpoint columns")
     return rows.index_select(0, positions)
 
 
 def _g_boundary_vector(g_outputs: Mapping[str, torch.Tensor], field: str, indices: torch.Tensor) -> torch.Tensor:
     return _g_boundary_matrix(g_outputs, field, indices)
-
-
-def _g_private_tensor(g_outputs: Mapping[str, torch.Tensor], field: str, indices: torch.Tensor) -> torch.Tensor | None:
-    values = g_outputs.get(f"_{field}")
-    if values is None:
-        return None
-    return values[indices]
 
 
 def _select_active_columns(values: torch.Tensor, indices: torch.Tensor, *, indices_cover_all: bool) -> torch.Tensor:
@@ -651,8 +601,6 @@ def _ground_precip_after_interception(
             torch.clamp(pahb, min=-20.0, max=20.0))
 
 
-
-
 def _require_real(name: str, value: torch.Tensor) -> None:
     if value.dtype not in (torch.float32, torch.float64):
         raise ValueError(f"{name} must be torch.float64 (checkpoint parity) or torch.float32; got {value.dtype}")
@@ -730,14 +678,6 @@ def _active_land_selection(
         return None, False
     return (static_tensor(active_land_indices, device=device, dtype=torch.int64),
             _active_land_indices_cover_all_columns(case_data, tables))
-
-
-def _active_land_snowxy_round_below_minus2(case_data: Mapping[str, Any], active_land_indices: list[int]) -> bool:
-    metadata = case_data.get("_prepared_metadata")
-    if isinstance(metadata, Mapping) and metadata.get("active_land_snowxy_round_below_minus2") is not None:
-        return bool(metadata["active_land_snowxy_round_below_minus2"])
-    columns = list(case_data["columns"])
-    return any(round(float(columns[index].get("snowxy", 0.0))) < -2 for index in active_land_indices)
 
 
 def state_from_case_after_g(
@@ -897,7 +837,20 @@ def state_from_case_after_g(
             dtype=dtype,
         )
 
+    # Trainable parameter scales (0-d tensors): z0mvt and rsmin scale the gathered per-column values, never the
+    # cached tables; czil and rsurf act where their formulas are (geometry, vege_flux and the canopy merge).
+    scales = case_data["driver_options"].get("parameter_scales") or {}
+    z0mvt_by_column = energy_tables.z0mvt[veg_idx]
+    if "z0mvt" in scales:
+        z0mvt_by_column = z0mvt_by_column * scales["z0mvt"]
+    rsmin_by_column = energy_tables.rsmin[veg_idx]
+    if "rsmin" in scales:
+        rsmin_by_column = rsmin_by_column * scales["rsmin"]
+    # A 1-element tensor must be on the numerical device (a 0-d CPU scale mixes with device tensors; this does not).
+    vector_scales = {f"{name}_scale": scales[name].reshape(1).to(device=dev, dtype=dtype)
+                     for name in ("czil", "rsurf") if name in scales}
     return LandBodyState(
+        **vector_scales,
         **{field: _select_active_columns(_column_tensor(case_data, arg, device=dev), indices, indices_cover_all=active_land_indices_cover_all)
            for field, arg in {"prslki": "prslki", "prslk1": "prslk1", "prsik1": "prsik1",
                               "temperature_leaf": "tvxy", "temperature_ground": "tgxy",
@@ -975,7 +928,7 @@ def state_from_case_after_g(
         soil_layer_idx=soil_layer_idx,
         mfsno_by_column=energy_tables.mfsno[veg_idx],
         scffac_by_column=energy_tables.scffac[veg_idx],
-        z0mvt_by_column=energy_tables.z0mvt[veg_idx],
+        z0mvt_by_column=z0mvt_by_column,
         hvt_by_column=energy_tables.hvt[veg_idx],
         cwpvt_by_column=energy_tables.cwpvt[veg_idx],
         ch2op_by_column=energy_tables.ch2op[veg_idx],
@@ -987,7 +940,7 @@ def state_from_case_after_g(
         taul_by_column=energy_tables.taul[veg_idx],
         taus_by_column=energy_tables.taus[veg_idx],
         rgl_by_column=energy_tables.rgl[veg_idx],
-        rsmin_by_column=energy_tables.rsmin[veg_idx],
+        rsmin_by_column=rsmin_by_column,
         rsmax_by_column=energy_tables.rsmax[veg_idx],
         topt_by_column=energy_tables.topt[veg_idx],
         hs_by_column=energy_tables.hs[veg_idx],
@@ -1080,13 +1033,6 @@ def _esat(t_celsius: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Te
     return esw, esi, desw, desi
 
 
-def _snow_cover_fraction(state: LandBodyState) -> torch.Tensor:
-    bdsno = torch.where(state.snow_depth > 0.0, state.snow_water_equiv / torch.clamp(state.snow_depth, min=1.0e-12), 0.0)
-    fmelt = _pow2(torch.clamp(bdsno / 100.0, min=1.0e-12))
-    fsno = torch.tanh(state.snow_depth / torch.clamp(0.020 * fmelt, min=1.0e-12))
-    return torch.where((state.snow_depth <= 1.0e-6) | (state.snow_water_equiv <= 1.0e-3), 0.0, fsno)
-
-
 def _radiation_source_corridor(
     state: LandBodyState,
     *,
@@ -1126,15 +1072,6 @@ def _radiation_source_corridor(
     psn = -999.99 * (radiation.laisun + radiation.laisha)
     psn = torch.where((state.elai + state.esai) > 0.0, psn, 0.0)
     return radiation.fsa, radiation.fsr, radiation.sav, radiation.sag, apar, psn, geometry.fsno, energy_tables, geometry, radiation
-
-
-def _soil_heat_update(state: LandBodyState, ssoil: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
-    dz = torch.clamp(torch.abs(state.dzsnso), min=1.0e-6)
-    hcp = state.temperature_snow_soil * 0.0 + 2.0e6
-    top = 3
-    top_update = state.temperature_snow_soil[:, top] + dt * ssoil / (hcp[:, top] * dz[:, top])
-    stc = state.temperature_snow_soil
-    return _columns_to_matrix((stc[:, 0], stc[:, 1], stc[:, 2], top_update, stc[:, 4], stc[:, 5], stc[:, 6]))
 
 
 def _surface_flux_source_corridor_flat_impl(
@@ -1211,28 +1148,7 @@ def _surface_flux_source_corridor(
     fsno: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     ground_temperature = state.tskin if state.temperature_ground is None else state.temperature_ground
-    return run_compile_island(
-        "land_surface_flux",
-        "surface_flux_source_corridor",
-        _surface_flux_source_corridor_flat_impl,
-        u1=state.u1,
-        v1=state.v1,
-        snow_depth=state.snow_depth,
-        zf=state.zf,
-        dzsnso=state.dzsnso,
-        tskin=ground_temperature,
-        cm=state.cm,
-        ch=state.ch,
-        prsl1=state.prsl1,
-        rhoair=state.rhoair,
-        temperature_forcing=state.temperature_forcing,
-        eair=state.eair,
-        dlwflx=state.dlwflx,
-        temperature_snow_soil=state.temperature_snow_soil,
-        pahb=state.pahb,
-        sag=sag,
-        fsno=fsno,
-    )
+    return _surface_flux_source_corridor_flat_impl(u1=state.u1, v1=state.v1, snow_depth=state.snow_depth, zf=state.zf, dzsnso=state.dzsnso, tskin=ground_temperature, cm=state.cm, ch=state.ch, prsl1=state.prsl1, rhoair=state.rhoair, temperature_forcing=state.temperature_forcing, eair=state.eair, dlwflx=state.dlwflx, temperature_snow_soil=state.temperature_snow_soil, pahb=state.pahb, sag=sag, fsno=fsno)
 
 
 def _canwater_source_corridor(
@@ -1248,22 +1164,7 @@ def _canwater_source_corridor(
     veg_idx = (state.vegtype if state.vegtype.dtype == torch.int64 else state.vegtype.to(torch.int64)) - 1
     ch2op = state.ch2op_by_column if state.ch2op_by_column is not None else energy_tables.ch2op[veg_idx]
     maxliq = ch2op * (state.elai + state.esai)
-    return run_compile_island(
-        "land_canwater",
-        "canwater_source_corridor",
-        _canwater_source_corridor_flat_impl,
-        canopy_liquid_initial=state.canopy_liquid_initial,
-        canopy_ice_initial=state.canopy_ice_initial,
-        bdfall=state.bdfall,
-        tskin=temperature_leaf,
-        elai=state.elai,
-        esai=state.esai,
-        maxliq=maxliq,
-        fcev=fcev,
-        fctr=fctr,
-        frozen_canopy=frozen_canopy,
-        dt=dt,
-    )
+    return _canwater_source_corridor_flat_impl(canopy_liquid_initial=state.canopy_liquid_initial, canopy_ice_initial=state.canopy_ice_initial, bdfall=state.bdfall, tskin=temperature_leaf, elai=state.elai, esai=state.esai, maxliq=maxliq, fcev=fcev, fctr=fctr, frozen_canopy=frozen_canopy, dt=dt)
 
 
 def _canwater_source_corridor_flat_impl(
@@ -1552,16 +1453,7 @@ def _divide_snow_source_corridor(
     snliq: torch.Tensor,
     stc: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return run_compile_island(
-        "land_snow_divide",
-        "divide_snow_source_corridor",
-        _divide_snow_source_corridor_impl,
-        isnow,
-        dzsnso,
-        snice,
-        snliq,
-        stc,
-    )
+    return _divide_snow_source_corridor_impl(isnow, dzsnso, snice, snliq, stc)
 
 
 def _snowwater_source_corridor_flat_impl(
@@ -1629,7 +1521,7 @@ def _snowwater_source_corridor_flat_impl(
     active3_predivide = active_snow[:, None] & (fidx3[None, :] >= (isnow + 1)[:, None])
     wx = snice_work + snliq_work
     wx_active = wx * active3_predivide
-    burden = torch.cumsum(wx_active, dim=1) - wx_active
+    burden = level_prefix(wx_active, 1) - wx_active
     dz_snow = dz_work[:, :3]
     stc_snow = stc_work[:, :3]
     # Float64 quotient rounded once (no-op in float64): float32 a/b**2 underflows at the 1e-30 floor in backward.
@@ -1820,7 +1712,7 @@ def _snowwater_source_corridor_flat_impl(
     )
     fidx7 = torch.arange(-2, 5, device=isnow.device, dtype=isnow.dtype)
     active7 = fidx7[None, :] >= (isnow + 1)[:, None]
-    zsnso_reset = torch.where(active7, torch.cumsum(dz_reset, dim=1), z_work)
+    zsnso_reset = torch.where(active7, level_prefix(dz_reset, 1), z_work)
     dzsnso_out = torch.where(active7, -dz_reset, dz_reset)
 
     smc_work = sh2o_work + sice_work
@@ -1880,32 +1772,7 @@ def _snowwater_source_corridor(
     dt: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
     snow_levels = state.snow_levels if state.snow_levels.dtype == torch.int64 else state.snow_levels.to(torch.int64)
-    snowwater = run_compile_island(
-        "land_snowwater",
-        "snowwater_source_corridor",
-        _snowwater_source_corridor_flat_impl,
-        snow_levels=snow_levels,
-        dzsnso=state.dzsnso,
-        interface_depth=state.interface_depth,
-        snow_depth_rate_ground=state.snow_depth_rate_ground,
-        temperature_forcing=state.temperature_forcing,
-        snow_ice_frac_old=state.snow_ice_frac_old,
-        ssi=energy_tables.ssi,
-        snow_ret_fac=energy_tables.snow_ret_fac,
-        imelt=imelt,
-        stc=stc,
-        snice=snice,
-        snliq=snliq,
-        smc=smc,
-        sh2o=sh2o,
-        sneqv=sneqv,
-        snowh=snowh,
-        qsnfro=qsnfro,
-        qsnsub=qsnsub,
-        qrain=qrain,
-        qsnow=qsnow,
-        dt=dt,
-    )
+    snowwater = _snowwater_source_corridor_flat_impl(snow_levels=snow_levels, dzsnso=state.dzsnso, interface_depth=state.interface_depth, snow_depth_rate_ground=state.snow_depth_rate_ground, temperature_forcing=state.temperature_forcing, snow_ice_frac_old=state.snow_ice_frac_old, ssi=energy_tables.ssi, snow_ret_fac=energy_tables.snow_ret_fac, imelt=imelt, stc=stc, snice=snice, snliq=snliq, smc=smc, sh2o=sh2o, sneqv=sneqv, snowh=snowh, qsnfro=qsnfro, qsnsub=qsnsub, qrain=qrain, qsnow=qsnow, dt=dt)
     return dict(zip(_SNOWWATER_RESULT_FIELDS, snowwater, strict=True))
 
 
@@ -1948,21 +1815,7 @@ def _water_source_corridor(
         esnow,
         zsnso,
         dzsnso,
-    ) = run_compile_island(
-        "land_water_merge",
-        "water_pre_snow",
-        _water_pre_snow_flat_impl,
-        fgev=fgev,
-        latheag=latheag,
-        frozen_canopy=frozen_canopy,
-        snow_water_equiv=phase_sneqv,
-        snow_levels=state.snow_levels,
-        dt=dt,
-        interface_depth=state.interface_depth,
-        dzsnso=state.dzsnso,
-        zsnso_no_snow_template=zsnso_no_snow,
-        dzsnso_no_snow_template=dzsnso_no_snow,
-    )
+    ) = _water_pre_snow_flat_impl(fgev=fgev, latheag=latheag, frozen_canopy=frozen_canopy, snow_water_equiv=phase_sneqv, snow_levels=state.snow_levels, dt=dt, interface_depth=state.interface_depth, dzsnso=state.dzsnso, zsnso_no_snow_template=zsnso_no_snow, dzsnso_no_snow_template=dzsnso_no_snow)
     canliq, canice, cmc, ecan, etran, _fwet, temperature_leaf = _canwater_source_corridor(state, energy_tables, fcev, fctr, latheav, frozen_canopy, dt, temperature_leaf)
     no_snow = state.snow_levels == 0
     snow_active = ~no_snow
@@ -1988,32 +1841,7 @@ def _water_source_corridor(
     snow_sice = snowwater["sice"]
     snow_zsnso = snowwater["zsnso"]
     snow_dzsnso = snowwater["dzsnso"]
-    smc, sh2o, sice, zsnso, dzsnso, qinsur, qseva_input = run_compile_island(
-        "land_water_merge",
-        "water_snow_to_soil",
-        _water_snow_to_soil_flat_impl,
-        phase_smc=phase_smc,
-        phase_sh2o=phase_sh2o,
-        zsnso=zsnso,
-        dzsnso=dzsnso,
-        snow_levels=state.snow_levels,
-        latheag=latheag,
-        qvap=qvap,
-        qsdew=qsdew,
-        qseva=qseva,
-        phase_ponding=phase_ponding,
-        qrain_ground=state.qrain_ground,
-        snowwater_smc=snow_smc,
-        snowwater_sh2o=snow_sh2o,
-        snowwater_sice=snow_sice,
-        snowwater_zsnso=snow_zsnso,
-        snowwater_dzsnso=snow_dzsnso,
-        snowwater_ponding1=snowwater["ponding1"],
-        snowwater_ponding2=snowwater["ponding2"],
-        snowwater_qsnbot=snowwater["qsnbot"],
-        snowwater_snow_levels=snowwater["snow_levels"],
-        dt=dt,
-    )
+    smc, sh2o, sice, zsnso, dzsnso, qinsur, qseva_input = _water_snow_to_soil_flat_impl(phase_smc=phase_smc, phase_sh2o=phase_sh2o, zsnso=zsnso, dzsnso=dzsnso, snow_levels=state.snow_levels, latheag=latheag, qvap=qvap, qsdew=qsdew, qseva=qseva, phase_ponding=phase_ponding, qrain_ground=state.qrain_ground, snowwater_smc=snow_smc, snowwater_sh2o=snow_sh2o, snowwater_sice=snow_sice, snowwater_zsnso=snow_zsnso, snowwater_dzsnso=snow_dzsnso, snowwater_ponding1=snowwater["ponding1"], snowwater_ponding2=snowwater["ponding2"], snowwater_qsnbot=snowwater["qsnbot"], snowwater_snow_levels=snowwater["snow_levels"], dt=dt)
     etrani = etran[:, None] * btrani * 0.001
     water = soilwater_opt_run1_inf1_source_corridor(
         state,
@@ -2032,40 +1860,7 @@ def _water_source_corridor(
         wt_initial=500.0 if state.saturated_water is None else state.saturated_water,
     )
     active_source_water = bare_only | active_canopy_source
-    i_values = run_compile_island(
-        "land_water_merge",
-        "water_final_merge",
-        _water_final_merge_flat_impl,
-        active_source_water=active_source_water,
-        snow_active=snow_active,
-        qvap=qvap,
-        qdew=qdew,
-        edir=edir,
-        ecan=ecan,
-        etran=etran,
-        esnow=esnow,
-        smc_before_soilwater=smc,
-        sh2o_before_soilwater=sh2o,
-        zsnso=zsnso,
-        dzsnso=dzsnso,
-        phase_stc=phase_stc,
-        phase_snowh=phase_snowh,
-        phase_sneqv=phase_sneqv,
-        snow_levels=state.snow_levels,
-        snowwater_qsnbot=snowwater["qsnbot"],
-        snowwater_stc=snowwater["stc"],
-        snowwater_snowh=snowwater["snowh"],
-        snowwater_sneqv=snowwater["sneqv"],
-        snowwater_snow_levels=snowwater["snow_levels"],
-        soilwater_smc=water.smc,
-        soilwater_sh2o=water.sh2o,
-        soilwater_runsrf=water.runsrf,
-        soilwater_runsub=water.runsub,
-        soilwater_wa=water.wa,
-        canliq=canliq,
-        canice=canice,
-        cmc=cmc,
-    )
+    i_values = _water_final_merge_flat_impl(active_source_water=active_source_water, snow_active=snow_active, qvap=qvap, qdew=qdew, edir=edir, ecan=ecan, etran=etran, esnow=esnow, smc_before_soilwater=smc, sh2o_before_soilwater=sh2o, zsnso=zsnso, dzsnso=dzsnso, phase_stc=phase_stc, phase_snowh=phase_snowh, phase_sneqv=phase_sneqv, snow_levels=state.snow_levels, snowwater_qsnbot=snowwater["qsnbot"], snowwater_stc=snowwater["stc"], snowwater_snowh=snowwater["snowh"], snowwater_sneqv=snowwater["sneqv"], snowwater_snow_levels=snowwater["snow_levels"], soilwater_smc=water.smc, soilwater_sh2o=water.sh2o, soilwater_runsrf=water.runsrf, soilwater_runsub=water.runsub, soilwater_wa=water.wa, canliq=canliq, canice=canice, cmc=cmc)
     i = dict(zip(_I_RESULT_FIELDS, i_values, strict=True))
     i.update(snice=snowwater["snice"], snliq=snowwater["snliq"],
              wt=water.wt, zwt=water.zwt, fwet=_fwet, tv=temperature_leaf)
@@ -2101,7 +1896,6 @@ def _phasechange_source_corridor_flat_impl(
     snowh = snow_depth
     dt_col = dt[:, None] if dt.ndim > 0 else dt
     zero7 = stc * 0.0
-    zero4 = smc * 0.0
     fidx = torch.arange(-2, 5, device=stc.device, dtype=snow_levels.dtype)
     active = fidx[None, :] >= (snow_levels + 1)[:, None]
 
@@ -2161,7 +1955,6 @@ def _phasechange_source_corridor_flat_impl(
     imelt = melt_mask.to(stc.dtype) + 2.0 * freeze_mask.to(stc.dtype)
 
     wice0 = mice
-    wliq0 = mliq
     wmass0 = mice + mliq
 
     changing = active & (imelt > 0.0)
@@ -2282,24 +2075,7 @@ def tsnosoi_source_corridor(
     ssoil: torch.Tensor,
     dt: torch.Tensor | float,
 ) -> torch.Tensor:
-    if "land_tsnosoi" not in compile_categories_enabled():
-        return _tsnosoi_source_corridor_impl(state, tables, thermo, ssoil=ssoil, dt=dt)
-    return run_compile_island(
-        "land_tsnosoi",
-        "tsnosoi_source_corridor",
-        _tsnosoi_source_corridor_flat_impl,
-        temperature_snow_soil=state.temperature_snow_soil,
-        interface_depth=state.interface_depth,
-        df=thermo.df,
-        hcpct=thermo.hcpct,
-        temperature_forcing=state.temperature_forcing,
-        snow_levels=state.snow_levels,
-        tg3=state.tg3,
-        snow_depth=state.snow_depth,
-        zbot=tables.zbot,
-        ssoil=ssoil,
-        dt=dt,
-    )
+    return _tsnosoi_source_corridor_impl(state, tables, thermo, ssoil=ssoil, dt=dt)
 
 
 def _phasechange_source_corridor(
@@ -2315,27 +2091,8 @@ def _phasechange_source_corridor(
     dt: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     soiltyp = state.soiltyp if state.soiltyp.dtype == torch.int64 else state.soiltyp.to(torch.int64)
-    return run_compile_island(
-        "land_phasechange",
-        "phasechange_source_corridor",
-        _phasechange_source_corridor_flat_impl,
-        snow_water_equiv=state.snow_water_equiv,
-        snow_depth=state.snow_depth,
-        dzsnso=state.dzsnso,
-        soiltyp=soiltyp,
-        snow_levels=state.snow_levels,
-        psisat=energy_tables.psisat,
-        smcmax_by_column=_state_cached_tensor(state, "smcmax_surface_by_column",
-                                              lambda: soil_parameter_by_column(energy_tables, "smcmax", soiltyp - 1, state.vegtype)),
-        bexp_table=energy_tables.bexp,
-        fact_matrix=thermo.fact,
-        stc=stc,
-        snice=snice,
-        snliq=snliq,
-        smc=smc,
-        sh2o=sh2o,
-        dt=dt,
-    )
+    return _phasechange_source_corridor_flat_impl(snow_water_equiv=state.snow_water_equiv, snow_depth=state.snow_depth, dzsnso=state.dzsnso, soiltyp=soiltyp, snow_levels=state.snow_levels, psisat=energy_tables.psisat, smcmax_by_column=_state_cached_tensor(state, "smcmax_surface_by_column",
+                                              lambda: soil_parameter_by_column(energy_tables, "smcmax", soiltyp - 1, state.vegtype)), bexp_table=energy_tables.bexp, fact_matrix=thermo.fact, stc=stc, snice=snice, snliq=snliq, smc=smc, sh2o=sh2o, dt=dt)
 
 
 def _bare_flux_merge_flat_impl(
@@ -2427,6 +2184,7 @@ def _canopy_flux_merge_flat_impl(
     z0h_total: torch.Tensor,
     selected_gfs_v17: bool = False,
     friction_velocity: torch.Tensor | None = None,
+    czil_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     fira_canopy = fveg * veg_irg + (1.0 - fveg) * bare_irb + veg_irc
     fsh_canopy = fveg * veg_shg + (1.0 - fveg) * bare_shb + veg_shc
@@ -2450,6 +2208,8 @@ def _canopy_flux_merge_flat_impl(
     z0m_composite = fveg * geometry_z0m + (1.0 - fveg) * geometry_z0mg
     composite_ustarx = torch.full_like(z0m_composite, 0.1) if friction_velocity is None else friction_velocity
     czil_composite = torch.pow(torch.full_like(z0m_composite, 10.0), -0.4 * hvt_by_column)
+    if czil_scale is not None:
+        czil_composite = czil_composite * czil_scale
     reyn_composite = composite_ustarx * z0m_composite / 1.5e-5
     kb_sigma_f0_composite = torch.where(
         reyn_composite > 2.0,
@@ -2572,8 +2332,6 @@ def _water_snow_to_soil_flat_impl(
     snowwater_snow_levels: torch.Tensor,
     dt: torch.Tensor,
 ) -> tuple[torch.Tensor, ...]:
-    no_snow = snow_levels == 0
-    snow_active = ~no_snow
     frozen_ground = latheag == NOAHMP_HSUB
     top_soil_dz = torch.clamp(snowwater_dzsnso[:, 3], min=1.0e-30)
     sice_fg0 = snowwater_sice[:, 0] + (qsdew - qseva) * dt / (top_soil_dz * 1000.0)
@@ -2711,35 +2469,14 @@ def _water_balance_error(
 
 
 def _numerical_water_loss(errwat: torch.Tensor) -> torch.Tensor:
-    """Keep numerical storage loss in the audit ledger, not physical runoff."""
+    """The water the land step loses without a physical flux (a negative storage residual), as a nonnegative depth.
+
+    It enters the water-budget diagnostic only, as its own named sink; it is not added to surface runoff. The
+    soil-water solve can lose a small water depth in its iterations; added to runoff, that round-off sized loss
+    would become a physical flux whose derivative is dominated by round-off. GFS v17 has no such term; the Fortran
+    reference carries the same diagnostic (fortran_patches/noahmp_physical_runoff_20261104.patch), so runoff
+    equals the noahmp_sflx output in both."""
     return torch.where(errwat < 0.0, -errwat, errwat * 0.0)
-
-
-def compute_land_body_hij(
-    state: LandBodyState,
-    tables: NoahMpTableBundle,
-    opts: Mapping[str, Any],
-    *,
-    include_checkpoint_diagnostics: bool = True,
-) -> LandBodyHIJ:
-    """Compute H/I/J source-smoke land-body fields without reading oracles."""
-    hij = land_body_hij_before_canopy(state, tables, opts)
-    veg_flux = None
-    if hij["has_canopy"]:
-        veg_flux = vege_flux_opt_sfc3(
-            hij["state"],
-            hij["energy_tables"],
-            hij["geometry"],
-            hij["thermo"],
-            hij["_radiation"],
-            dt=hij["dt"],
-            canliq=hij["canliq"],
-            canice=hij["canice"],
-            fwet=hij["fwet"],
-            btran=hij["btran"].btran,
-            surface_exchange_option=int(opts.get("iopt_sfc", 3)),
-        )
-    return land_body_hij_after_canopy(hij, veg_flux, include_checkpoint_diagnostics=include_checkpoint_diagnostics)
 
 
 def land_body_hij_before_canopy(state: LandBodyState, tables: NoahMpTableBundle, opts: Mapping[str, Any]) -> dict[str, Any]:
@@ -2789,31 +2526,7 @@ def land_body_hij_before_canopy(state: LandBodyState, tables: NoahMpTableBundle,
         emissivity_total,
         z0_total,
         z0h_total,
-    ) = run_compile_island(
-        "land_flux_merge",
-        "bare_flux_merge",
-        _bare_flux_merge_flat_impl,
-        fira=fira,
-        fsh=fsh,
-        fgev=fgev,
-        ssoil=ssoil,
-        trad=trad,
-        qsfc=qsfc,
-        tv=tv,
-        latheag=latheag,
-        geometry_emg=geometry.emg,
-        geometry_latheag=geometry.latheag,
-        geometry_z0mg=geometry.z0mg,
-        bare_z0h=bare.z0h,
-        bare_irb=bare.irb,
-        bare_shb=bare.shb,
-        bare_evb=bare.evb,
-        bare_ghb=bare.ghb,
-        bare_qsfc=bare.qsfc,
-        bare_tgb=bare.tgb,
-        dlwflx=state.dlwflx,
-        bare_only=bare_only,
-    )
+    ) = _bare_flux_merge_flat_impl(fira=fira, fsh=fsh, fgev=fgev, ssoil=ssoil, trad=trad, qsfc=qsfc, tv=tv, latheag=latheag, geometry_emg=geometry.emg, geometry_latheag=geometry.latheag, geometry_z0mg=geometry.z0mg, bare_z0h=bare.z0h, bare_irb=bare.irb, bare_shb=bare.shb, bare_evb=bare.evb, bare_ghb=bare.ghb, bare_qsfc=bare.qsfc, bare_tgb=bare.tgb, dlwflx=state.dlwflx, bare_only=bare_only)
     exchange_heat_total = bare.ch
     active_canopy = (state.elai + state.esai > 0.0) & (state.fveg > 0.0)
     no_snow = (state.snow_levels == 0) & (state.snow_depth <= 1.0e-6) & (state.snow_water_equiv <= 1.0e-3)
@@ -2875,57 +2588,7 @@ def land_body_hij_after_canopy(
             z0_total,
             z0h_total,
             exchange_heat_total,
-        ) = run_compile_island(
-            "land_flux_merge",
-            "canopy_flux_merge",
-            _canopy_flux_merge_flat_impl,
-            active_canopy_source=active_canopy_source,
-            fveg=state.fveg,
-            prsl1=state.prsl1,
-            dlwflx=state.dlwflx,
-            geometry_emg=geometry.emg,
-            geometry_emv=geometry.emv,
-            geometry_z0m=geometry.z0m,
-            geometry_z0mg=geometry.z0mg,
-            hvt_by_column=state.hvt_by_column if state.hvt_by_column is not None else energy_tables.hvt[veg_idx],
-            laisun=_radiation.laisun,
-            laisha=_radiation.laisha,
-            bare_irb=bare.irb,
-            bare_shb=bare.shb,
-            bare_evb=bare.evb,
-            bare_ghb=bare.ghb,
-            bare_ch=bare.ch,
-            bare_tgb=bare.tgb,
-            bare_qsfc=bare.qsfc,
-            veg_irg=veg_flux.irg,
-            veg_irc=veg_flux.irc,
-            veg_shg=veg_flux.shg,
-            veg_shc=veg_flux.shc,
-            veg_evg=veg_flux.evg,
-            veg_evc=veg_flux.evc,
-            veg_tr=veg_flux.tr,
-            veg_gh=veg_flux.gh,
-            veg_ch=veg_flux.ch,
-            veg_tah=veg_flux.tah,
-            veg_eah=veg_flux.eah,
-            veg_psnsun=veg_flux.psnsun,
-            veg_psnsha=veg_flux.psnsha,
-            fira=fira,
-            fsh=fsh,
-            fgev=fgev,
-            ssoil=ssoil,
-            trad=trad,
-            qsfc=qsfc,
-            tv=tv,
-            fcev=fcev,
-            fctr=fctr,
-            psn=psn,
-            emissivity_total=emissivity_total,
-            z0_total=z0_total,
-            z0h_total=z0h_total,
-            selected_gfs_v17=tables.table_variant == GFS_V17_PROFILE_SCM_TABLE_VARIANT,
-            friction_velocity=state.friction_velocity,
-        )
+        ) = _canopy_flux_merge_flat_impl(active_canopy_source=active_canopy_source, fveg=state.fveg, prsl1=state.prsl1, dlwflx=state.dlwflx, geometry_emg=geometry.emg, geometry_emv=geometry.emv, geometry_z0m=geometry.z0m, geometry_z0mg=geometry.z0mg, hvt_by_column=state.hvt_by_column if state.hvt_by_column is not None else energy_tables.hvt[veg_idx], laisun=_radiation.laisun, laisha=_radiation.laisha, bare_irb=bare.irb, bare_shb=bare.shb, bare_evb=bare.evb, bare_ghb=bare.ghb, bare_ch=bare.ch, bare_tgb=bare.tgb, bare_qsfc=bare.qsfc, veg_irg=veg_flux.irg, veg_irc=veg_flux.irc, veg_shg=veg_flux.shg, veg_shc=veg_flux.shc, veg_evg=veg_flux.evg, veg_evc=veg_flux.evc, veg_tr=veg_flux.tr, veg_gh=veg_flux.gh, veg_ch=veg_flux.ch, veg_tah=veg_flux.tah, veg_eah=veg_flux.eah, veg_psnsun=veg_flux.psnsun, veg_psnsha=veg_flux.psnsha, fira=fira, fsh=fsh, fgev=fgev, ssoil=ssoil, trad=trad, qsfc=qsfc, tv=tv, fcev=fcev, fctr=fctr, psn=psn, emissivity_total=emissivity_total, z0_total=z0_total, z0h_total=z0h_total, selected_gfs_v17=tables.table_variant == GFS_V17_PROFILE_SCM_TABLE_VARIANT, friction_velocity=state.friction_velocity, **({} if state.czil_scale is None else {"czil_scale": state.czil_scale}))
     source_stc = tsnosoi_source_corridor(state, energy_tables, thermo, ssoil=ssoil, dt=dt)
     (
         phase_stc,
@@ -2949,23 +2612,7 @@ def land_body_hij_after_canopy(
         dt=dt,
     )
     source_temperature_columns = bare_only | active_canopy_source
-    stc, snice, snliq, imelt, ponding = run_compile_island(
-        "land_temperature_merge",
-        "temperature_phase_merge",
-        _temperature_merge_flat_impl,
-        source_temperature_columns=source_temperature_columns,
-        phase_stc=phase_stc,
-        phase_snice=phase_snice,
-        phase_snliq=phase_snliq,
-        phase_imelt=phase_imelt,
-        phase_ponding=phase_ponding,
-        temperature_snow_soil=state.temperature_snow_soil,
-        snow_level_ice=state.snow_level_ice,
-        snow_level_liquid=state.snow_level_liquid,
-        dzsnso=state.dzsnso,
-        ssoil=ssoil,
-        dt=dt,
-    )
+    stc, snice, snliq, imelt, ponding = _temperature_merge_flat_impl(source_temperature_columns=source_temperature_columns, phase_stc=phase_stc, phase_snice=phase_snice, phase_snliq=phase_snliq, phase_imelt=phase_imelt, phase_ponding=phase_ponding, temperature_snow_soil=state.temperature_snow_soil, snow_level_ice=state.snow_level_ice, snow_level_liquid=state.snow_level_liquid, dzsnso=state.dzsnso, ssoil=ssoil, dt=dt)
     h = {}
     if include_checkpoint_diagnostics:
         h = {
@@ -3050,6 +2697,7 @@ def land_body_hij_after_canopy(
         "surface_temperature": tv,
         "sensible_heat_total": fsh,
         "latent_heat_total": fcev + fgev + fctr,
+        "evaporation_total": qfx,
         "ground_heat_total": ssoil,
         "snow_cover_fraction": fsno,
         "vegetation_fraction": state.fveg,
@@ -3103,222 +2751,10 @@ def land_body_hij_after_canopy(
         conductance = 1.0 / (veg_flux.rssun + veg_flux.rb) * _radiation.laisun + 1.0 / (veg_flux.rssha + veg_flux.rb) * _radiation.laisha
         resistance = 1.0 / torch.where(valid_resistance, conductance, 1.0)
         idx = state.vegtype.to(torch.int64) - 1
-        tail["driver__rca"] = torch.where(valid_resistance, torch.maximum(resistance, energy_tables.rsmin[idx]), energy_tables.rsmax[idx])
+        # The floor is the column's rsmin (noahmpdrv.F90 floors with parameters%rsmin): rsmin_by_column, which carries
+        # the noahmp.rsmin scale (without it, the same table gather as energy_tables.rsmin[idx]).
+        rsmin = _state_cached_tensor(state, "rsmin_by_column", lambda: energy_tables.rsmin[idx])
+        tail["driver__rca"] = torch.where(valid_resistance, torch.maximum(resistance, rsmin), energy_tables.rsmax[idx])
     return LandBodyHIJ(h=h, i=i, j=j, tail=tail)
 
 
-
-
-
-
-def expand_land_body_tail_state(
-    case_data: Mapping[str, Any],
-    state: LandBodyState,
-    result: LandBodyHIJ,
-    *,
-    device: str | torch.device | None = None,
-) -> dict[str, torch.Tensor]:
-    """Expand active-column H/I/J internals into the post-merge K-O tail shape."""
-    dev = torch.device("cpu") if device is None else torch.device(device)
-    im = int(case_data["dimensions"]["im"])
-    dtype = state.temperature_forcing.dtype
-    indices = state.column_indices.to(device=dev, dtype=torch.int64)
-    mask = torch.zeros(im, device=dev, dtype=torch.bool).scatter(0, indices, torch.ones_like(indices, dtype=torch.bool))
-
-    def full_vector(values: torch.Tensor, *, fill: float = 0.0) -> torch.Tensor:
-        expanded = torch.full((im,), fill, device=dev, dtype=values.dtype)
-        return expanded.scatter(0, indices, values)
-
-    def full_matrix(values: torch.Tensor, base: torch.Tensor | None = None) -> torch.Tensor:
-        if base is None:
-            expanded = torch.zeros((im, values.shape[1]), device=dev, dtype=values.dtype)
-        else:
-            expanded = base
-        scatter_indices = indices[:, None].expand_as(values)
-        return expanded.scatter(0, scatter_indices, values)
-
-    tail = result.tail
-    return {
-        "mask": mask,
-        "indices": state.column_indices,
-        "temperature_radiative": full_vector(tail["temperature_radiative"]),
-        "surface_temperature": full_vector(tail["surface_temperature"]),
-        "sensible_heat_total": full_vector(tail["sensible_heat_total"]),
-        "latent_heat_total": full_vector(tail["latent_heat_total"]),
-        "ground_heat_total": full_vector(tail["ground_heat_total"]),
-        "snow_cover_fraction": full_vector(tail["snow_cover_fraction"]),
-        "vegetation_fraction": full_vector(tail["vegetation_fraction"]),
-        "z0_total": full_vector(tail["z0_total"]),
-        "z0h_total": full_vector(tail["z0h_total"]),
-        "exchange_heat_total": full_vector(tail["exchange_heat_total"]),
-        "soil_moisture_vol": full_matrix(tail["soil_moisture_vol"], _matrix_tensor(case_data, "smc", device=dev)),
-        "soil_liquid_vol": full_matrix(tail["soil_liquid_vol"], _matrix_tensor(case_data, "slc", device=dev)),
-        "temperature_snow_soil": full_matrix(tail["temperature_snow_soil"]),
-        "spec_humidity_surface": full_vector(tail["spec_humidity_surface"]),
-        "sw_absorbed_total": full_vector(tail["sw_absorbed_total"]),
-        "emissivity_total": full_vector(tail["emissivity_total"]),
-        "runoff_surface": full_vector(tail["runoff_surface"]),
-        "evaporation_soil": full_vector(tail["evaporation_soil"]),
-        "snow_levels": full_vector(tail["snow_levels"].to(dtype), fill=0.0).to(torch.int64),
-    }
-
-
-# (boundary, field, integer) of the H/I/J checkpoint fields, in emission order.
-_HIJ_EMISSION_FIELDS = (
-    *(("H", field, False) for field in (*H_SCALAR_FIELDS, "imelt", "stc", "snice", "snliq")),
-    *(("I", field, False) for field in (*I_SCALAR_FIELDS, "smc", "sh2o", "zsnso")),
-    ("J", "dveg_active", True),
-    ("J", "crop_active", True),
-    *(("J", field, False) for field in J_SCALAR_FIELDS),
-    ("J", "errflg", True),
-)
-
-
-def emit_land_body_hij(result: LandBodyHIJ, column_indices: Sequence[int]) -> dict[str, torch.Tensor]:
-    """Checkpoint-shaped per-column H/I/J fields: ``<B>__<field>__col<k>`` (1-based source column).
-
-    ``column_indices`` is the host list of the active columns (from the case), so naming the
-    fields reads no device value.
-    """
-    groups = {"H": result.h, "I": result.i, "J": result.j}
-    out: dict[str, torch.Tensor] = {}
-    for boundary, field, integer in _HIJ_EMISSION_FIELDS:
-        values = groups[boundary][field]
-        if values.ndim == 0 or values.shape[0] != len(column_indices):
-            raise ValueError(f"{boundary}.{field}: expected one row per active column")
-        values = values.to(torch.int64) if integer else values
-        out.update({f"{boundary}__{field}__col{int(col) + 1}": values[row] for row, col in enumerate(column_indices)})
-    return out
-
-
-def run_land_body_hij_with_tail_state(
-    case_data: Mapping[str, Any],
-    g_outputs: Mapping[str, torch.Tensor],
-    tables: NoahMpTableBundle,
-    *,
-    device: str | torch.device | None = None,
-    dtype: torch.dtype = torch.float64,
-    driver_options: Mapping[str, Any] | None = None,
-) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    """Return H/I/J checkpoint emissions plus the K-O post-merge state."""
-    state = state_from_case_after_g(case_data, g_outputs, tables, device=device, dtype=dtype)
-    opts = case_data["driver_options"] if driver_options is None else driver_options
-    result = compute_land_body_hij(state, tables, opts)
-    return emit_land_body_hij(result, _host_active_land_indices(case_data, tables)), expand_land_body_tail_state(
-        case_data,
-        state,
-        result,
-        device=device,
-    )
-
-
-def run_land_body_tail_state(
-    case_data: Mapping[str, Any],
-    g_outputs: Mapping[str, torch.Tensor],
-    tables: NoahMpTableBundle,
-    *,
-    device: str | torch.device | None = None,
-    dtype: torch.dtype = torch.float64,
-    expand: bool = True,
-    driver_options: Mapping[str, Any] | None = None,
-) -> dict[str, torch.Tensor]:
-    """Return only the K-O post-merge state for production/benchmark runs."""
-    state = state_from_case_after_g(case_data, g_outputs, tables, device=device, dtype=dtype)
-    opts = case_data["driver_options"] if driver_options is None else driver_options
-    if not expand and _active_land_indices_cover_all_columns(case_data, tables):
-        result = compute_land_body_hij(
-            state,
-            tables,
-            opts,
-            include_checkpoint_diagnostics=False,
-        )
-        return {
-            **result.tail,
-            "mask": torch.ones((int(case_data["dimensions"]["im"]),), device=state.column_indices.device, dtype=torch.bool),
-            "indices": state.column_indices,
-        }
-    result = compute_land_body_hij(state, tables, opts)
-    return expand_land_body_tail_state(case_data, state, result, device=device)
-
-
-def run_land_body_tail_output_from_state(
-    state: LandBodyState,
-    tables: NoahMpTableBundle,
-    opts: Mapping[str, Any],
-) -> LandBodyTailOutput:
-    """Run the production H-O land-body tail from an already prepared G state."""
-    result = compute_land_body_hij(
-        state,
-        tables,
-        opts,
-        include_checkpoint_diagnostics=False,
-    )
-    return _tail_output_from_mapping(result.tail)
-
-
-def _tail_output_from_mapping(tail: Mapping[str, torch.Tensor]) -> LandBodyTailOutput:
-    return LandBodyTailOutput(*(tail[field] for field in LAND_BODY_TAIL_OUTPUT_FIELDS))
-
-
-def run_land_body_tail_output(
-    case_data: Mapping[str, Any],
-    g_outputs: Mapping[str, torch.Tensor],
-    tables: NoahMpTableBundle,
-    *,
-    device: str | torch.device | None = None,
-    dtype: torch.dtype = torch.float64,
-    expand: bool = True,
-    driver_options: Mapping[str, Any] | None = None,
-) -> LandBodyTailOutput:
-    """Return only the K-O production tail as a flat tuple."""
-    state = state_from_case_after_g(case_data, g_outputs, tables, device=device, dtype=dtype)
-    opts = case_data["driver_options"] if driver_options is None else driver_options
-    if not expand and _active_land_indices_cover_all_columns(case_data, tables):
-        result = compute_land_body_hij(
-            state,
-            tables,
-            opts,
-            include_checkpoint_diagnostics=False,
-        )
-        return _tail_output_from_mapping(result.tail)
-    result = compute_land_body_hij(state, tables, opts)
-    return _tail_output_from_mapping(expand_land_body_tail_state(case_data, state, result, device=device))
-
-
-def run_land_body_hij(
-    case_data: Mapping[str, Any],
-    g_outputs: Mapping[str, torch.Tensor],
-    tables: NoahMpTableBundle,
-    *,
-    device: str | torch.device | None = None,
-    dtype: torch.dtype = torch.float64,
-) -> dict[str, torch.Tensor]:
-    """Convenience adapter for later driver integration after boundary G."""
-    emissions, _tail_state = run_land_body_hij_with_tail_state(
-        case_data,
-        g_outputs,
-        tables,
-        device=device,
-        dtype=dtype,
-    )
-    return emissions
-
-
-__all__ = [
-    "H_SCALAR_FIELDS",
-    "I_SCALAR_FIELDS",
-    "J_SCALAR_FIELDS",
-    "LAND_BODY_SUPPORTED_OPTIONS",
-    "LAND_BODY_TAIL_OUTPUT_FIELDS",
-    "LandBodyHIJ",
-    "LandBodyState",
-    "LandBodyTailOutput",
-    "compute_land_body_hij",
-    "expand_land_body_tail_state",
-    "run_land_body_hij",
-    "run_land_body_hij_with_tail_state",
-    "run_land_body_tail_output",
-    "run_land_body_tail_output_from_state",
-    "run_land_body_tail_state",
-    "state_from_case_after_g",
-]

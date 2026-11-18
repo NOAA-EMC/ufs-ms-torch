@@ -16,6 +16,15 @@
   returned as an ``errflg`` tensor.
 
 All tracer indices below are 1-based CCPP indices; 0 means "absent".
+
+Two terms used in the conservation helpers below:
+
+* Physics-group entry state: the temperature and specific humidity of each cell when the physics group that
+  contains convection starts (``phase_entry_temperature`` and ``q``). It stays fixed for the whole group, so the
+  dry-air mass of a cell and the heat of a phase change do not depend on what earlier schemes of the group did.
+* MPAS moist thermodynamics: MPAS carries water as mixing ratios per unit of dry-air mass and one kappa for moist
+  air; a phase change keeps the cell's water mass on its fixed dry-air mass and exchanges the latent heat of
+  ``ufs_physics_common.thermo.phase_latent_heat`` (vapour-liquid) or ``HFUS`` (liquid-ice).
 """
 
 from __future__ import annotations
@@ -25,6 +34,77 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from ufs_physics_common.thermo import phase_latent_heat
+
+from sa_sas_deep_convection_torch.constants import HFUS, HVAP
+
+
+def detrain_cloud_condensate(ice, liquid, temperature, vapor, entry_vapor, amount, active, cp):
+    """Add detrained condensate to the ice and liquid tracers, and heat the cell by the fusion heat of the ice part.
+
+    Deliberate change from GFS v17 (samfdeepcnv.F, samfshalcnv.F; Fortran patch samf_detrain_fusion_heat_20261116):
+    upstream adds the condensate without heating, so the newly frozen part gives no fusion heat. Here it warms the
+    cell by ``HFUS/cp`` per unit of ice on the physics-group entry gas mass, which conserves MPAS internal energy;
+    it warms cells where detrained condensate freezes.
+    """
+    fraction = torch.clamp((263.16 - temperature) * (1.0 / (263.16 - 233.16)), min=0., max=1.)
+    has_liquid = liquid > -999.
+    ice_amount = torch.where(has_liquid, amount * fraction, amount)
+    ice = torch.where(active, ice + ice_amount, ice)
+    liquid = torch.where(active & has_liquid, liquid + amount * (1. - fraction), liquid)
+    # Tracers use current gas mass; Cp heat uses frozen group-entry gas mass.
+    denominator = torch.where(active, 1. - vapor, 1.)
+    heat = (HFUS / cp) * (1. - entry_vapor) * ice_amount / denominator
+    temperature = torch.where(active, temperature + heat, temperature)
+    return ice, liquid, temperature
+
+
+def evaporate_convective_rain(vapor, temperature, amount, entry_vapor, entry_temperature, active, cp, rd, rv):
+    """Evaporate ``amount`` of convective rain into the cell's vapour and cool the cell by its latent heat.
+
+    Deliberate change from GFS v17 (samfdeepcnv.F, samfshalcnv.F; Fortran patch samf_rain_phase_transfer_20261116):
+    upstream adds ``amount`` to the specific humidity and cools by ``hvap/cp`` at any temperature. Here the vapour
+    increment adds exactly ``amount`` of water on the physics-group entry dry-air mass, the other tracers keep their
+    dry ratios (``rescale_convective_tracers``), and the cooling uses the latent heat at the entry temperature, so
+    the transfer conserves water and MPAS internal energy. It changes the evaporating cells' humidity and
+    temperature by a small fraction of the increment.
+    """
+    before_den = torch.where(active, 1. - vapor, 1.)
+    entry_den = torch.where(active, 1. - entry_vapor, 1.)
+    amount = torch.where(active, amount, 0.)
+    increment = amount * before_den * before_den / (entry_den + amount * before_den)
+    changed_vapor = torch.where(active, vapor + increment, vapor)
+    anchor = torch.where(active, entry_temperature, 273.16)
+    latent = phase_latent_heat(HVAP, anchor, cp, rd, rv)
+    cooling = (latent / cp) * amount
+    changed_temperature = torch.where(active, temperature - cooling, temperature)
+    return changed_vapor, changed_temperature, cooling
+
+
+def convective_rain_scale(before_vapor, after_vapor):
+    """Moist-to-moist ratio factor ``(1 - after)/(1 - before)`` of a vapour change; 1 where the vapour did not change
+    (the inactive denominator is replaced before the division, so its derivative stays finite)."""
+    changed = before_vapor != after_vapor
+    denominator = torch.where(changed, 1. - before_vapor, 1.)
+    return torch.where(changed, (1. - after_vapor) / denominator, 1.)
+
+
+def rescale_convective_tracers(tracers, before_vapor, after_vapor, tke_slot):
+    """Rescale the non-vapour tracers so their dry-air ratios stay fixed when rain evaporates into vapour (the TKE
+    slot and absent condensate slots are left as they are)."""
+    scale = convective_rain_scale(before_vapor, after_vapor)
+    slots = torch.arange(tracers.shape[2], device=tracers.device)
+    preserve = (slots == tke_slot) | ((slots < 2) & (tracers <= -999.))
+    return torch.where(preserve, tracers, tracers * scale[..., None])
+
+
+def rain_host_tracer_tendencies(host, scale, vapor_tendency, dt):
+    """Carry the known mass-basis transfer through untransported host species.
+
+    The post replaces cloud/transported slots with their full core tendencies.
+    """
+    other = (host[..., 1:] * scale[..., None] - host[..., 1:]) / dt
+    return torch.cat((vapor_tendency[..., None], other), dim=2)
 
 # CCPP GFS_typedefs.F90 microphysics codes.
 IMP_PHYSICS_CODES = {
@@ -281,11 +361,16 @@ def _container_water_levels(values: torch.Tensor, km: int, water_slots: tuple[in
     return total
 
 
-def _container_water(values: torch.Tensor, k: int, water_slots: tuple[int, ...]) -> torch.Tensor:
-    total = torch.zeros_like(values[:, k, 0])
+def _native_water_change_levels(before, after, water_slots, vapour_slot):
+    """Difference of native water ratios without subtracting nearly equal totals."""
+    q_before, q_after = before[:, :, vapour_slot], after[:, :, vapour_slot]
+    before_den = torch.where(q_before < 1.0, 1.0 - q_before, 1.0)
+    after_den = torch.where(q_after < 1.0, 1.0 - q_after, 1.0)
+    increment = torch.zeros_like(q_before)
     for slot in water_slots:
-        total = total + values[:, k, slot]
-    return total
+        increment = increment + (after[:, :, slot] - before[:, :, slot])
+    water_before = _container_water_levels(before, before.shape[1], water_slots)
+    return (increment * before_den + water_before * (q_after - q_before)) / (after_den * before_den)
 
 
 def samf_water_reconciliation(
@@ -302,12 +387,22 @@ def samf_water_reconciliation(
     layout: ConvectionTracerLayout,
     *,
     delt: torch.Tensor,
+    entry_qv: torch.Tensor,
+    entry_temperature: torch.Tensor,
+    con_rd: torch.Tensor,
+    con_rv: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Oracle MPAS SAMF water reconciliation; returns (gq0, gt0, errflg).
+    """MPAS SAMF water reconciliation; returns (gq0, gt0, errflg).
 
-    The column water residual (atmospheric container-water change plus requested
-    precipitation) is removed by rescaling vapour, ``gt0 -= (hvap/cp) * dqv`` keeps
-    ``cp*T + Lv*qv``. The Fortran error returns become ``errflg = 1`` (no host read).
+    The convective rain that leaves a column must equal the water the column lost. The reconciliation (an MPAS
+    coupling step in the GFS_DCNV/SCNV generic post, not in upstream GFS v17) moves the column's residual into its
+    vapour, as a fraction of the column vapour limited per step. Deliberate changes from its first form (Fortran
+    patches samf_native_mass_20261115 and samf_reconciliation_heat_20261116): the residual is measured and applied
+    as water mass on the physics-group entry dry-air mass, the other tracers keep their dry ratios, and the vapour
+    change exchanges the latent heat at the entry temperature (``phase_latent_heat``) in place of ``hvap/cp`` at
+    any temperature. This conserves the transfer's water and MPAS internal energy (not potential or kinetic energy,
+    nor convection's own budget); it changes the reconciled columns' humidity and temperature slightly.
+    The Fortran error returns become ``errflg = 1`` without a host read.
     """
 
     ncol, km, ntrac = gq0.shape
@@ -321,13 +416,22 @@ def samf_water_reconciliation(
     )
     zero = torch.zeros_like(rain1)
     positive_geometry = (area > 0.0) & (con_g > 0.0)
-    # Level terms for all levels at once; the column sums keep the source level order.
-    layer_mass = torch.where(positive_geometry[:, None], area[:, None] * torch.abs(prsi[:, :km] - prsi[:, 1:km + 1]) / con_g, 0.0)
+    if entry_qv.shape != gq0.shape[:2]:
+        raise ValueError("water reconciliation requires frozen group-entry humidity")
+    if entry_temperature.shape != gt0.shape:
+        raise ValueError("water reconciliation requires frozen group-entry temperature")
+    safe_g = torch.where(con_g > 0.0, con_g, 1.0)
+    layer_mass = torch.where(positive_geometry[:, None], area[:, None] * torch.abs(prsi[:, :km] - prsi[:, 1:km + 1]) / safe_g, 0.0)
+    layer_mass = layer_mass * (1.0 - entry_qv)
     requested = area * 1000.0 * frain * rain1
     qv_all = gq0[:, :km, qv - 1]
+    before_qv = save_q[:, :km, qv - 1]
+    valid_mass = (entry_qv >= 0.0) & (entry_qv < 1.0) & (qv_all < 1.0) & (before_qv < 1.0)
+    denominator = torch.where(qv_all < 1.0, 1.0 - qv_all, 1.0)
     # Column sums in level order, read level by level from the [ncol, km] terms (no level-major copy).
-    water_change = layer_mass * (_container_water_levels(gq0, km, water_slots) - _container_water_levels(save_q, km, water_slots))
-    vapour_mass = layer_mass * torch.clamp_min(qv_all, 0.0)
+    water_change = layer_mass * _native_water_change_levels(save_q, gq0, water_slots, qv - 1)
+    positive_qv = torch.clamp_min(qv_all, 0.0)
+    vapour_mass = layer_mass * positive_qv / denominator
     column_delta, column_qv_mass = requested, zero
     for k in range(km):
         column_delta = column_delta + water_change[:, k]
@@ -338,27 +442,37 @@ def samf_water_reconciliation(
     column_tol = torch.clamp_min(relative * (torch.abs(column_delta) + requested), 1.0)
     has_vapour = column_qv_mass > 0.0
     fraction = torch.where(has_vapour, -column_delta / torch.where(has_vapour, column_qv_mass, 1.0), zero)
-    error = (~has_vapour) & (torch.abs(column_delta) > column_tol)
+    error = ((~has_vapour) & (torch.abs(column_delta) > column_tol)
+             | ~valid_mass.all(dim=1) | ~positive_geometry | (con_cp <= con_rd) | (con_hvap <= 0.0)
+             | (con_rd <= 0.0) | (con_rv <= 0.0) | (entry_temperature <= 0.0).any(dim=1))
     # The residual of a call grows with the call: 1% of column vapour at dt 300 s, the same bound per second at any step.
-    error = error | (torch.abs(fraction) > 1.0e-2 * delt / 300.0) | (fraction < -1.0)
+    safe_fraction = (torch.abs(fraction) <= 1.0e-2 * delt / 300.0) & (fraction >= -1.0)
+    error = error | ~safe_fraction
+    fraction = torch.where(safe_fraction, fraction, 0.0)
 
     eps64 = torch.finfo(gq0.dtype).eps
-    latent_over_cp = con_hvap / con_cp
-    requested_k = fraction[:, None] * torch.clamp_min(qv_all, 0.0)
+    safe_rd = torch.where(con_rd > 0.0, con_rd, 1.0)
+    native_latent = phase_latent_heat(con_hvap, entry_temperature, con_cp, safe_rd, con_rv)
+    # Solve the moist/dry transformation exactly, without a no-op ratio round trip.
+    requested_dry = fraction[:, None] * positive_qv / denominator
+    requested_k = fraction[:, None] * positive_qv * (1.0 - qv_all) / (1.0 + fraction[:, None] * positive_qv)
     reconciled = qv_all + requested_k
     roundoff_tol = 64.0 * eps64 * torch.maximum(torch.maximum(torch.ones_like(qv_all), torch.abs(qv_all)), torch.abs(requested_k))
     error = error | (reconciled < -roundoff_tol).any(dim=1)
     floored = reconciled < 0.0
-    correction = torch.where(floored, -qv_all, requested_k)
     reconciled = torch.where(floored, 0.0, reconciled)
-    temperature_correction = -latent_over_cp * correction
+    new_denominator = torch.where(reconciled < 1.0, 1.0 - reconciled, 1.0)
+    dry_correction = (reconciled - qv_all) / (new_denominator * denominator)
+    native_phase_energy = native_latent * dry_correction
+    temperature_correction = -(1.0 - entry_qv) * native_phase_energy / torch.where(con_cp > 0.0, con_cp, 1.0)
+    error = error | (reconciled >= 1.0).any(dim=1)
     # The running minimum only feeds the fail-closed min_qv < 0 guard; min is exact in any order.
     min_qv = torch.minimum(torch.full_like(rain1, torch.finfo(gq0.dtype).max), reconciled.amin(dim=1))
     terms = (
-        layer_mass * correction,
-        torch.where(floored, layer_mass * (correction - requested_k), 0.0),
-        layer_mass * con_cp * temperature_correction,
-        layer_mass * con_hvap * correction,
+        layer_mass * dry_correction,
+        torch.where(floored, layer_mass * (dry_correction - requested_dry), 0.0),
+        layer_mass * con_cp * temperature_correction / (1.0 - entry_qv),
+        layer_mass * native_phase_energy,
     )
     sums = [zero] * len(terms)  # +0.0 starts, as the zero-filled sums before
     for k in range(km):
@@ -366,6 +480,15 @@ def samf_water_reconciliation(
     applied, floor_water, thermal, latent = sums
     qv_new = reconciled
     t_new = gt0[:, :km] + temperature_correction
+    slots = torch.arange(ntrac, device=gq0.device)
+    rescale = (1.0 - qv_new) / denominator
+    gq0 = torch.where(slots == qv - 1, qv_new[:, :, None],
+                     torch.where(slots == layout.index("ntke") - 1, gq0, gq0 * rescale[:, :, None]))
+    actual_change = layer_mass * _native_water_change_levels(save_q, gq0, water_slots, qv - 1)
+    actual_residual = requested
+    for k in range(km):
+        actual_residual = actual_residual + actual_change[:, k]
+    error = error | (torch.abs(actual_residual) > column_tol)
     # Aggregate fail-closed guards (column totals; reduction order is not Fortran's,
     # these only decide errflg and never change state).
     raw_total = column_delta.sum()
@@ -384,9 +507,6 @@ def samf_water_reconciliation(
         | (torch.abs(thermal_total + latent_total) > energy_tol)
         | (min_qv.min() < 0.0)
     )
-    # Only the vapour slot changes: one select instead of a full copy plus a slot write.
-    slots = torch.arange(ntrac, device=gq0.device)
-    gq0 = torch.where(slots == qv - 1, qv_new[:, :, None], gq0)
     gt0 = t_new
     errflg = (error.any() | aggregate_error).to(gq0.dtype)
     return gq0, gt0, errflg

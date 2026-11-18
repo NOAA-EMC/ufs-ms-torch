@@ -122,7 +122,7 @@ FORTRAN_DEFAULTS: dict[str, Any] = {
     # Strict mode - controls validation behavior throughout the codebase:
     # - True (default): Raise errors on missing checkpoint fields, invalid configs
     # - False: Use synthetic approximations with warnings (testing/debugging only)
-    # Affects: initialize_from_state, load_full_checkpoint, vertical-implicit-coefficients fallback, etc.
+    # Affects: initialize_from_state, vertical-implicit-coefficients fallback, etc.
     # CRITICAL: Production runs MUST use strict=True for machine precision.
     "strict": True,
     # DANGER: Setting strict_indexing=False disables indexing convention validation.
@@ -249,11 +249,8 @@ HONORED_OPTIONS: dict[str, OptionMeta] = {
         notes="Non-default use is outside the supported release configuration.",
     ),
     "config_apply_lbcs": _meta(
-        "mpas_pytorch/atmosphere_model.py",
-        "mpas_pytorch/distributed/restart.py",
-        "mpas_pytorch/dynamics/time_integration.py",
-        "mpas_pytorch/restart.py",
-        "mpas_pytorch/state.py",
+        "mpas_pytorch/config_defaults.py",
+        "mpas_pytorch/namelist_metadata.py",
         tested_at="unsupported",
         notes="Limited-area boundary conditions are not supported by the global release.",
     ),
@@ -704,53 +701,6 @@ def _resolve_default(key: str) -> Any | None:
     return None
 
 
-def get_config_value(
-    config: Mapping[str, Any], key: str, override_default: Any = None
-) -> Any:
-    """
-    Get config value with Fortran-compatible default.
-
-    Accepts both Fortran-style full names (config_apply_lbcs) and
-    Python-style short names (apply_lbcs). Full names take precedence
-    when both are present in the config dict.
-
-    Priority:
-    1. Value from config dict (exact key or alias)
-    2. override_default (if provided)
-    3. FORTRAN_DEFAULTS (exact key or alias)
-    4. Raises KeyError (if key unknown)
-
-    Args:
-        config: Configuration dictionary
-        key: Configuration key (short or full name)
-        override_default: Optional override for the default value
-
-    Returns:
-        Configuration value
-
-    Raises:
-        KeyError: If key not in config and not in FORTRAN_DEFAULTS
-    """
-    # Try config dict with alias resolution
-    value = _resolve_key(config, key)
-    if value is not None:
-        return value
-
-    # Try override_default
-    if override_default is not None:
-        return override_default
-
-    # Try FORTRAN_DEFAULTS with alias resolution
-    default_value = _resolve_default(key)
-    if default_value is not None:
-        return default_value
-
-    raise KeyError(
-        f"Unknown config key '{key}' with no default. "
-        f"Known keys: {list(FORTRAN_DEFAULTS.keys())}"
-    )
-
-
 def get_config_value_safe(config: Mapping[str, Any], key: str, fallback: Any) -> Any:
     """
     Get config value with explicit fallback (no exception).
@@ -793,6 +743,8 @@ PARAMETER_SCALE_KEYS = frozenset(
         "config_smagorinsky_coef",
         "config_del4u_div_factor",
         "config_smdiv",
+        "config_xnutr",
+        "config_coef_3rd_order",
     }
 )
 _SMAGORINSKY_PARAMETER_SCALE_KEYS = frozenset(
@@ -857,8 +809,15 @@ def validate_config(user_config: Mapping[str, Any] | None = None) -> dict[str, A
 
     unsupported = active_unsupported_namelist_keys(user_config)
     if unsupported:
+        # The dycore has no limited-area boundary kernels: this is the one place that refuses them.
+        lbcs = (
+            " config_apply_lbcs: limited-area lateral boundary conditions are not"
+            " implemented; the model runs global meshes only."
+            if "config_apply_lbcs" in unsupported
+            else ""
+        )
         raise MpasUnsupportedCapabilityError(
-            f"Unsupported active MPAS settings: {unsupported}; this preview is dycore-only.",
+            f"Unsupported active MPAS settings: {unsupported}; this preview is dycore-only.{lbcs}",
             capability="configuration",
             requested=tuple(unsupported),
         )

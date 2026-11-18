@@ -6,6 +6,7 @@
 from dataclasses import dataclass, replace
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 import torch.autograd.forward_ad as forward_ad
 
 from sa_sas_deep_convection_torch.driver import run_sa_sas_deep_convection_compacted
@@ -20,6 +21,7 @@ from sa_sas_shallow_convection_torch.state import SaSasShallowConvectionState
 
 from sa_tke_edmf_torch.diagnostics import add_diagnostic_
 from ufs_physics_common import compile_policy
+from . import parameters
 from .containers import static_tensor, assert_all_finite, _finite_flags
 from .photochemistry import photochemistry_post
 from .physics_prefix import PhysicsPrefixResult
@@ -37,7 +39,7 @@ _POST_CONTROLS = (
 _POST_FIELDS = (
     "gt0", "gu0", "gv0", "gq0", "ten_t", "ten_u", "ten_v", "ten_q",
     "dtdt", "dudt", "dvdt", "dqdt", "dclw", "dtidx", "dtend", "delt", "dtf",
-    "frain", "area", "prsi", "grav", "cp", "hvap", "clw", "rain1", "rainc",
+    "frain", "area", "prsi", "q", "grav", "cp", "hvap", "rd", "rv", "phase_entry_temperature", "clw", "rain1", "rainc",
     "cnvprcp", "cldwrk", "cld1d", "cnvw", "cnvc", "cnvw_phy_f3d", "cnvc_phy_f3d",
     "upd_mf", "dwn_mf", "det_mf", "ud_mf", "dd_mf", "dt_mf",
 )
@@ -92,7 +94,7 @@ def convection_core(fields, *, control, shallow=False):
             if not working_like(value, t):
                 raise TypeError(f"convection field {name} requires the working dtype {t.dtype}")
     assert_all_finite(f, "convection", exclude=("dtend",), compile_check=_regional_compile)
-    torch._assert_async((f["delp"] > 0.).all(), "convection requires positive pressure thickness")
+    torch_compat.assert_async((f["delp"] > 0.).all(), "convection requires positive pressure thickness")
     if f["tkeh"].shape != (t.shape[0], t.shape[1]+1):
         raise ValueError("source tkeh requires the complete interface axis")
     f["tkeh"] = f["tkeh"][:, :-1]
@@ -119,7 +121,7 @@ def convection_core(fields, *, control, shallow=False):
         core = f if control["ldiag3d"] else {k: v for k, v in f.items() if k != "dtend"}
         result = run_sa_sas_deep_convection_compacted(SaSasDeepConvectionState(core, config), through="U",
             outputs=(*names, "errflg"), fraction=deep_convection_fraction())
-    torch._assert_async(result.require("errflg") == 0., "SAMF core failed")
+    torch_compat.assert_async(result.require("errflg") == 0., "SAMF core failed")
     outputs = {name: result.require(name) for name in names}
     for name in ("kbot", "ktop", "kcnv"):
         outputs[name] = outputs[name].to(torch.int32)
@@ -166,8 +168,11 @@ def convection_post(fields, *, control, shallow=False):
             if not working_like(value, q):
                 raise TypeError(f"convection field {name} requires the working dtype {q.dtype}")
     if _regional_compile:
+        # Traced into a compiled orchestration region, the assertion below compiles to nothing (compile_policy
+        # module docstring), so the island then computes no flags.
+        checking = not torch.compiler.is_compiling()
         names = tuple(name for name, value in f.items()
-                      if value.is_floating_point() and value.numel() and name != "dtend")
+                      if checking and value.is_floating_point() and value.numel() and name != "dtend")
         values = (tuple(f[name] for name in names) if torch.compiler.is_compiling()
                   else tuple({id(f[name]): f[name] for name in names}.values()))
         with torch.no_grad():
@@ -177,18 +182,24 @@ def convection_post(fields, *, control, shallow=False):
             primals,
             control={name: control[name] for name in _POST_CONTROLS if name in control},
             shallow=shallow)
-        finite = torch.cat(finite).all()
-        message = f"nonfinite convection post (one of: {', '.join(names)})"
-        torch._assert_async(finite, message[:250] + "...)" if finite.is_cuda and len(message) >= 255 else message)
+        if names:
+            finite = torch.cat(finite).all()
+            message = f"nonfinite convection post (one of: {', '.join(names)})"
+            torch_compat.assert_async(finite, message[:250] + "...)" if finite.is_cuda and len(message) >= 255 else message)
         return result
     assert_all_finite(f, "convection post", exclude=("dtend",))
     return _convection_post_tensors(f, control=control, shallow=shallow)
 
 
 def _convection_post_checked(f, checked, *, control, shallow):
-    # Both consumers borrow their inputs. Keep their actual strides and one dispatch.
+    # Both consumers borrow their inputs. Keep their actual strides and one dispatch. Run eagerly, this assertion
+    # fires before the post's own checks (the SAMF water reconciliation would otherwise report a nonfinite input
+    # as its own failure); compiled, it compiles to nothing and the caller's assertion, with the field names, is
+    # the one that runs.
     with torch.no_grad():
         finite = _finite_flags(checked)
+    if finite:
+        torch_compat.assert_async(torch.cat(finite).all(), "nonfinite convection post")
     return _convection_post_tensors(f, control=control, shallow=shallow), finite
 
 
@@ -202,10 +213,16 @@ def _convection_post_tensors(f, *, control, shallow):
     out = photochemistry_post(f, dtp=f["delt"], mode=mode)
     out["ten_q"] = f["ten_q"]
     if reconcile:
+        # Physics change: official ccpp-physics has no SAMF water reconciliation. SAMF's column water does not
+        # close, so this step scales each column's vapour so that its water change plus the convective rain is zero,
+        # and pairs the vapour change with its MPAS latent heat on the frozen group-entry mass and temperature
+        # (samf_interstitials.samf_water_reconciliation; the Fortran reference carries the same step). It changes
+        # gq0 and gt0 by that correction only; a correction above 1 % of the column vapour x delt/300 stops the run.
         out["gq0"], out["gt0"], errflg = samf_water_reconciliation(
             out["gq0"], out["gt0"], q, f["rain1"], f["area"], f["prsi"],
-            f["frain"], f["grav"], f["cp"], f["hvap"], layout, delt=f["delt"])
-        torch._assert_async(errflg == 0., "SAMF water reconciliation failed")
+            f["frain"], f["grav"], f["cp"], f["hvap"], layout, delt=f["delt"], entry_qv=f["q"],
+            entry_temperature=f["phase_entry_temperature"], con_rd=f["rd"], con_rv=f["rv"])
+        torch_compat.assert_async(errflg == 0., "SAMF water reconciliation failed")
     out["clw"] = (f["clw"] if shallow else build_clw(out["gq0"], f["clw"], layout,
         imp_physics=88, transport=control["satmedmf"] or control["trans_trac"]))
     out["rainc"] = f["frain"] * f["rain1"]
@@ -253,7 +270,7 @@ def _convection_post_tensors(f, *, control, shallow):
             if type(index) is not int or not 1 <= index <= dtidx.shape[0]:
                 raise ValueError("invalid convection diagnostic variable index")
             slot = dtidx[index-1, process-1]
-            torch._assert_async(slot <= dtend.shape[2], "convection diagnostic slot exceeds allocation")
+            torch_compat.assert_async(slot <= dtend.shape[2], "convection diagnostic slot exceeds allocation")
             increment = (tendency * f["delt"]) * f["frain"]
             add_diagnostic_(out["dtend"], increment, slot)
         if not shallow and control["qdiag3d"]:
@@ -268,12 +285,40 @@ class ConvectionResult:
     ud_mf: torch.Tensor
 
 
+# SAMF coefficient scales, applied before the deep/shallow selection: registry key -> coefficient. evef has no
+# suffix: deep and shallow share it (shallow multiplies it by its own shevf = 2).
+_COEFFICIENT_SCALES = {"samf.clam_deep": "clam_deep", "samf.c0s_deep": "c0s_deep", "samf.pgcon_deep": "pgcon_deep",
+                       "samf.clam_shal": "clam_shal", "samf.evef": "evef"}
+# SAMF scales that enter one scheme as a 0-d field, read by the deep segments (state.require) and the shallow driver
+# (fields[...]): scheme suffix -> {registry key: field}.
+_FIELD_SCALES = {"deep": {"samf.tau_deep": "tau_scale", "samf.cinpcr_deep": "cinpcr_scale",
+                          "samf.rhcrt_deep": "rhcrt_scale"},
+                 "shal": {"samf.tau_shal": "tau_scale", "samf.cinpcr_shal": "cinpcr_scale",
+                          "samf.rhcrt_shal": "rhcrt_scale"}}
+# samf.tau_shal is tier 2 (registry note): the shallow dtconv reaches the outputs only
+# through advfac = min(cat_adj_shal*tauadv/dtconv, 1), capped at 1 (or dtconv at its clamp) on every stored shallow
+# column at s = 1, so it has no gradient there at s = 1 (s = 0.5 changes outputs on cycle 1).
+
+
+def _scaled_coefficients(coefficients, parameter_scales):
+    """``coefficients`` with each present coefficient scale applied; the same dict when none is present."""
+    scaled = {name: coefficients[name] * s for name, s in parameters.select(parameter_scales, _COEFFICIENT_SCALES).items()}
+    return {**coefficients, **scaled} if scaled else coefficients
+
+
+def _field_scales(parameter_scales, suffix, like):
+    """{field: s} for each present field scale of the ``suffix`` scheme, as 1-element views on ``like``'s device and
+    dtype (``parameters.region_views``; the SAMF regions reshape them back); empty when none is present."""
+    return parameters.select(parameter_scales, _FIELD_SCALES[suffix], like)
+
+
 def apply_convection(statein, grid, prefix, *, hpbl, ud_mf, prevsq, dtp, dtf,
-                     dtidx, coefficients, control, shallow=False):
+                     dtidx, coefficients, control, shallow=False, parameter_scales=None):
     """Bind one live SAMF core/post; return its persistent updraft mass flux.
 
     The deep result feeds shallow directly. hpbl, prevsq and ud_mf belong to
-    GFS_Tbd and survive the microphysics group reset.
+    GFS_Tbd and survive the microphysics group reset. ``parameter_scales`` holds
+    the 0-d tensor scales of ``ufs_mpas_ccpp.parameters`` (absent keys: no op).
     """
     if type(shallow) is not bool:
         raise TypeError("convection kind must be static")
@@ -291,9 +336,10 @@ def apply_convection(statein, grid, prefix, *, hpbl, ud_mf, prevsq, dtp, dtf,
     flags = work["otsptflag"]
     if flags.shape != (10,) or flags.dtype != torch.bool or flags.device != state.gt0.device:
         raise ValueError("invalid live convection tracer flags")
-    torch._assert_async((flags == static_tensor(mpas_tempo_layout().otsptflag, dtype=flags.dtype, device=flags.device)).all(),
+    torch_compat.assert_async((flags == static_tensor(mpas_tempo_layout().otsptflag, dtype=flags.dtype, device=flags.device)).all(),
                         "live convection tracer flags differ from R4")
     suffix = "shal" if shallow else "deep"
+    coefficients = _scaled_coefficients(coefficients, parameter_scales)
     f = {**coefficients,
         **{name: static_tensor(getattr(constants, name.upper()), dtype=state.gt0.dtype, device=state.gt0.device) for name in
            ("cliq", "cp", "cvap", "eps", "epsm1", "fv", "grav", "hvap", "rd", "rv", "t0c")},
@@ -301,7 +347,7 @@ def apply_convection(statein, grid, prefix, *, hpbl, ud_mf, prevsq, dtp, dtf,
         "delt": dtp, "dtf": dtf, "psp": statein.pgr, "prslp": statein.prsl,
         "prsi": statein.prsi, "phil": statein.phil, "dot": statein.vvl,
         "q": statein.qgrs[:, :, 0], "q1": state.gq0[:, :, 0],
-        "t1": state.gt0, "u1": state.gu0, "v1": state.gv0,
+        "t1": state.gt0, "phase_entry_temperature": statein.tgrs, "u1": state.gu0, "v1": state.gv0,
         "qtr": work["clw"], "dqtr": work["dclw"], "tmf": work["dvdftra"],
         "delp": work["del"], "tkeh": work["tkeh"], "islimsk": work["islmsk"],
         "hpbl": hpbl, "prevsq": prevsq, "ud_mf": ud_mf,
@@ -312,7 +358,8 @@ def apply_convection(statein, grid, prefix, *, hpbl, ud_mf, prevsq, dtp, dtf,
         **{name: getattr(state,name) for name in ("gt0", "gu0", "gv0", "gq0")},
         **{name: carry.intdiag[name] for name in ("dtend", "rainc", "cldwrk", "cnvprcp",
                                                 "upd_mf", "dwn_mf", "det_mf")},
-        "rainevap": carry.coupling["condition"], "clw": work["clw"]}
+        "rainevap": carry.coupling["condition"], "clw": work["clw"],
+        **_field_scales(parameter_scales, suffix, state.gt0)}
     f["cldwrk"] = work["cld1d"]
     for name, index in (("cnvw", control["ncnvw"]), ("cnvc", control["ncnvc"])):
         if type(index) is not int or index > carry.phy_f3d.shape[2]:
@@ -359,7 +406,8 @@ def _apply_convection_regions(*args, **kwargs):
     previous, _regional_compile = _regional_compile, True
     try:
         with deep_regions(), shallow_regions():
-            return apply_convection(*args, **kwargs)
+            # Forward: the scheme orchestration compiles around its islands (compile_policy, orchestration).
+            return compile_policy.compiled(apply_convection, orchestration=True)(*args, **kwargs)
     finally:
         _regional_compile = previous
 

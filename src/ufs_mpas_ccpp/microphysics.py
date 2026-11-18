@@ -7,11 +7,13 @@ from dataclasses import dataclass, replace
 import math
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from sa_tke_edmf_torch.diagnostics import add_diagnostic_
 from .containers import assert_all_finite
 
 from tempo_torch import mp_tempo, torch_native
+from . import parameters
 from .photochemistry import photochemistry_post
 from .convection import apply_convection
 from .convective_clouds import ConvectiveCloudHistory, prepare_convective_clouds
@@ -26,11 +28,27 @@ from .runtime_policy import (glue, column_chunk, scheme, scheme_column_chunk,
 from .precision import working_like
 
 
-def apply_tempo(statein,prefix,*,tables,min_layer_depth,control):
+# Registry key -> name in the TEMPO core's parameter scales (tempo_torch.torch_native.run_tempo_native).
+# tempo.nt_c_land scales the constant cloud number of every column: the
+# microphysics has no land input (Fortran single-moment option 'land', Nt_c_l everywhere); tempo.nt_c_ocean
+# acts only in the radiation's effective radius (radiation.RADIATION_PARAMETER_KEYS).
+TEMPO_PARAMETER_KEYS = {"tempo.nt_c_land": "nt_c", "tempo.demott_nuc_ssati": "demott_nuc_ssati",
+                        "tempo.av_s": "av_s", "tempo.av_g": "av_g"}
+
+
+def tempo_parameter_scales(parameter_scales):
+    """The registered TEMPO scales present in ``parameter_scales`` by core name; None when there are none."""
+    return parameters.select(parameter_scales, TEMPO_PARAMETER_KEYS) or None
+
+
+def apply_tempo(statein,prefix,*,tables,min_layer_depth,control,scales=None):
     """Run the existing TEMPO wrapper/core/limiter on live shallow-post state.
 
     The source's local initialized itimestep is one on its first call. It
     increments once per wrapper call, not per inner sedimentation step.
+    ``scales``: the TEMPO parameter scales by core name (``tempo_parameter_scales``; 1-element
+    views from ``parameters.region_views``, or 0-d tensors, beside ``control``, which takes static
+    values only); None: no op.
     """
     for name in ("imp_physics","ntrac","tempo_call_index"):
         if type(control[name]) is not int:
@@ -55,7 +73,7 @@ def apply_tempo(statein,prefix,*,tables,min_layer_depth,control):
     if q.shape != (*t.shape,10) or t.ndim != 2 or min(t.shape) < 1:
         raise ValueError("TEMPO requires ten column-first source tracers")
     work,diagnostics = prefix.interstitial,prefix.carry.intdiag
-    profiles = dict(spechum=q[:,:,0],qc=q[:,:,1],qr=q[:,:,2],qi=q[:,:,3],
+    profiles = dict(spechum=q[:,:,0],spechum_entry=statein.qgrs[:,:,0],tgrs_entry=statein.tgrs,qc=q[:,:,1],qr=q[:,:,2],qi=q[:,:,3],
         qs=q[:,:,4],qg=q[:,:,5],ni=q[:,:,6],nr=q[:,:,7],tgrs=t,
         prsl=statein.prsl,phii=statein.phii,omega=statein.vvl,
         refl_10cm=diagnostics["refl_10cm"],prslk=statein.prslk)
@@ -63,41 +81,47 @@ def apply_tempo(statein,prefix,*,tables,min_layer_depth,control):
         shape = (t.shape[0],t.shape[1]+1) if name == "phii" else t.shape
         if value.shape != shape or value.dtype != t.dtype or value.device != t.device:
             raise ValueError(f"invalid TEMPO {name} allocation")
-        torch._assert_async(torch.isfinite(value).all(),f"nonfinite TEMPO {name}")
+        torch_compat.assert_async(torch.isfinite(value).all(),f"nonfinite TEMPO {name}")
     for name,value in (("prcp",work["prcpmp"]),("rain",work["rainmp"]),
                        ("ice",work["icemp"]),("snow",work["snowmp"]),("graupel",work["graupelmp"])):
         if value.shape != t.shape[:1] or value.dtype != t.dtype or value.device != t.device:
             raise ValueError(f"invalid TEMPO {name} allocation")
-        torch._assert_async(torch.isfinite(value).all(),f"nonfinite TEMPO {name}")
+        torch_compat.assert_async(torch.isfinite(value).all(),f"nonfinite TEMPO {name}")
         profiles[name] = value
     dz = (statein.phii[:,1:]-statein.phii[:,:-1])/mp_tempo.CON_G
-    torch._assert_async((dz >= min_layer_depth).all(),"TEMPO live layer violates prepared depth bound")
-    torch._assert_async(((q[:,:,0] >= 0.) & (q[:,:,0] < 1.) & (t > 0.) & (statein.prsl > 0.)).all(),
+    torch_compat.assert_async((dz >= min_layer_depth).all(),"TEMPO live layer violates prepared depth bound")
+    torch_compat.assert_async(((q[:,:,0] >= 0.) & (q[:,:,0] < 1.) & (t > 0.) & (statein.prsl > 0.)
+                        & (statein.tgrs > 0.) & (statein.qgrs[:,:,0] >= 0.) & (statein.qgrs[:,:,0] < 1.)).all(),
                         "invalid TEMPO humidity/temperature/pressure")
     profiles.pop("prslk")
     # The static substep bounds follow fall-speed ceilings (runtime_policy "bound"); a column needing
     # more substeps sets region tempo.bound.<kind> and the interval driver reruns the step one ceiling
-    # up (raise_compaction). Not torch._assert_async: compiled code drops it.
+    # up (raise_compaction). Not torch._assert_async: compiled code drops it. "window" bounds the
+    # sources of a semi-Lagrangian destination the same way (region tempo.window), "lanes" the buffers of the
+    # masked FP64 lane groups (regions tempo.lanes.<group>).
     policy = tempo_sedimentation_compaction()
-    tiers = {kind: value for kind, value in policy.items() if kind != "bound"}
+    tiers = {kind: value for kind, value in policy.items() if kind not in ("bound", "window", "lanes")}
     ceilings = dict(policy["bound"]) if "bound" in policy else {}
     result = _tempo_core(profiles,dict(dtp=control["dtp"],dt_inner=control["dt_inner"],
         min_layer_depth=min_layer_depth,tables=tables,semi_sedi=control["semi_sedi"],
         convert_dry_rho=control["convert_dry_rho"],do_radar_ref=control["lradar"],
         itimestep=control["tempo_call_index"],sedimentation_compaction=tiers,
+        semi_lagrangian_window_sources=policy["window"] if "window" in policy else None,
+        lane_compaction=dict(policy["lanes"]) if "lanes" in policy else None,
         max_sedimentation_fall_speed=(ceilings["rain_graupel"] if "rain_graupel" in ceilings
                                       else torch_native.DEFAULT_MAX_SEDIMENTATION_FALL_SPEED),
         max_snow_sedimentation_fall_speed=(ceilings["snow"] if "snow" in ceilings
                                            else torch_native.DEFAULT_MAX_SEDIMENTATION_FALL_SPEED),
         return_tendencies=False,
         # Compiled, the semi-Lagrangian substeps are one region reused by every substep.
-        sedimentation_substep_region=scheme_compile_selected("apply_tempo")))
+        sedimentation_substep_region=scheme_compile_selected("apply_tempo"),
+        **({} if scales is None else {"parameter_scales": scales})))
     if torch_native.SEDIMENTATION_SUBSTEP_OVERFLOW not in result.diagnostics:
         raise RuntimeError("TEMPO omitted its required sedimentation overflow diagnostic")
     ten_t = mp_tempo.mp_tempo_post_run(result.ten_t,statein.prslk,control["ttendlim"])
     for name in ("ten_q","ten_t","ten_u","ten_v","prcp","rain","ice","snow","graupel","sr","refl_10cm"):
-        torch._assert_async(torch.isfinite(getattr(result,name)).all(),f"nonfinite TEMPO output {name}")
-    torch._assert_async(torch.isfinite(ten_t).all(),"nonfinite TEMPO limited temperature tendency")
+        torch_compat.assert_async(torch.isfinite(getattr(result,name)).all(),f"nonfinite TEMPO output {name}")
+    torch_compat.assert_async(torch.isfinite(ten_t).all(),"nonfinite TEMPO limited temperature tendency")
     updated = replace(prefix,interstitial={**work,"ten_t":ten_t,
         "ten_u":result.ten_u,"ten_v":result.ten_v,"ten_q":result.ten_q,
         "prcpmp":result.prcp,"rainmp":result.rain,"icemp":result.ice,
@@ -156,7 +180,7 @@ def microphysics_post(fields, *, control):
     assert_all_finite(f, "microphysics post", exclude=("dtend",))
     out = {**f, **photochemistry_post(f,dtp=f["dtp"],mode=control["tend_opt_mp"])}
     dtp,frain = f["dtp"],f["frain"]
-    torch._assert_async((f["con_g"] > 0.) & (dtp > 0.),"invalid microphysics post gravity/timestep")
+    torch_compat.assert_async((f["con_g"] > 0.) & (dtp > 0.),"invalid microphysics post gravity/timestep")
     onebg = 1./f["con_g"]
     out["rain"] = f["rainc"]+frain*f["rain1"]
 
@@ -170,10 +194,12 @@ def microphysics_post(fields, *, control):
         zo = f["phil"]*onebg
         levels = torch.arange(1,q.shape[1]+1,device=q.device)
         warm = torch.where(out["gt0"] >= f["con_t0c"],levels,0).amax(dim=1)
-        zfrz = zo.gather(1,(warm-1).clamp_min(0)[:,None]).squeeze(1)
+        # clamp before the decrement: the same index for every column, and no wrap below the int64 range
+        # (a fused CUDA kernel's masked tail lanes reduce to amax's identity, int64 min).
+        zfrz = zo.gather(1,(warm.clamp_min(1)-1)[:,None]).squeeze(1)
         htop = f["htop"].to(torch.int64)
-        torch._assert_async(((htop >= 0) & (htop <= q.shape[1])).all(),"invalid microphysics convective top")
-        ztop = zo.gather(1,(htop-1).clamp_min(0)[:,None]).squeeze(1)
+        torch_compat.assert_async(((htop >= 0) & (htop <= q.shape[1])).all(),"invalid microphysics convective top")
+        ztop = zo.gather(1,(htop.clamp_min(1)-1)[:,None]).squeeze(1)
         convective = (f["rainc"] > 0.) & (htop > 0)
         factor = torch.where(convective,-2./torch.clamp_min(ztop-zfrz,1000.),0.)
         delz = zo-zfrz[:,None]
@@ -223,7 +249,7 @@ def microphysics_post(fields, *, control):
                 terms.extend((101+n,f["ten_q"][:,:,n]) for n in range(q.shape[2]))
             for variable,tendency in terms:
                 slot = dtidx[variable-1,process-1]
-                torch._assert_async(slot <= dtend.shape[2],"microphysics diagnostic slot exceeds allocation")
+                torch_compat.assert_async(slot <= dtend.shape[2],"microphysics diagnostic slot exceeds allocation")
                 increment = tendency*dtp*frain
                 add_diagnostic_(dtend,increment,slot)
             out["dtend"] = dtend
@@ -294,7 +320,7 @@ class MicrophysicsSequenceResult:
 def run_microphysics_sequence(statein, grid, prefix, *, hpbl, ud_mf, prevsq,
     cloud_history, clstp, dtp, dtf, dtidx, coefficients, convection_control,
     cloud_control, tables, min_layer_depth, tempo_control, frain, post_control,
-    kdt, avg_max_length, is_photochem, tail_control):
+    kdt, avg_max_length, is_photochem, tail_control, parameter_scales=None):
     """Run the selected R4 cap after prepare_microphysics_prefix.
 
     The caller owns projection/ozone preparation and the final native commit.
@@ -303,20 +329,23 @@ def run_microphysics_sequence(statein, grid, prefix, *, hpbl, ud_mf, prevsq,
     """
     if type(tempo_control["dtp"]) not in (int, float):
         raise TypeError("microphysics sequence requires a static TEMPO timestep")
-    torch._assert_async(dtp == tempo_control["dtp"],
+    torch_compat.assert_async(dtp == tempo_control["dtp"],
         "microphysics sequence and TEMPO timesteps differ")
     deep = scheme(apply_convection)(statein, grid, prefix, hpbl=hpbl, ud_mf=ud_mf,
         prevsq=prevsq, dtp=dtp, dtf=dtf, dtidx=dtidx, coefficients=coefficients,
-        control=convection_control)
+        control=convection_control, parameter_scales=parameter_scales)
     shallow = scheme(apply_convection)(statein, grid, deep.prefix, hpbl=hpbl,
         ud_mf=deep.ud_mf, prevsq=prevsq, dtp=dtp, dtf=dtf, dtidx=dtidx,
-        coefficients=coefficients, control=convection_control, shallow=True)
+        coefficients=coefficients, control=convection_control, shallow=True,
+        parameter_scales=parameter_scales)
     clouds, history = prepare_convective_clouds(statein, shallow.prefix,
         cloud_history, clstp=clstp, dtidx=dtidx, control=cloud_control)
     # With column chunks the TEMPO core per chunk is the compiled region instead.
     tempo_entry = apply_tempo if column_chunk() is not None else scheme(apply_tempo)
+    tempo_scales = parameters.region_views(tempo_parameter_scales(parameter_scales), statein.tgrs)
     tempo, _ = tempo_entry(statein, clouds, tables=tables,
-        min_layer_depth=min_layer_depth, control=tempo_control)
+        min_layer_depth=min_layer_depth, control=tempo_control,
+        **({} if tempo_scales is None else {"scales": tempo_scales}))
     post = glue(apply_microphysics_post)(statein, grid, tempo, dtp=dtp, frain=frain,
         dtidx=dtidx, control=post_control)
     final = finish_microphysics(statein, post, dtp=dtp, kdt=kdt,

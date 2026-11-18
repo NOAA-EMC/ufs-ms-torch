@@ -45,7 +45,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import torch
-import torch.autograd.forward_ad as forward_ad
+from mpas_pytorch import _torch_compat as torch_compat
 from mpas_pytorch.cuda_graph_timestep import TimestepGraph, _copy_plan, boundary_changes
 from mpas_pytorch.atmosphere_model import (
     _finite_stamp_matches, _record_finite_stamp, _rebind_diagnostic_solve_receipt,
@@ -211,7 +211,7 @@ class _EmulatedGraph:
         output = self._step(dict(state))
         destinations, sources = _copy_plan(state, output)
         if destinations:
-            torch._foreach_copy_(list(destinations), list(sources))
+            torch_compat.foreach_copy_(list(destinations), list(sources))
         return dict(self._recorded)
 
 
@@ -267,7 +267,7 @@ class StepGraphRunner:
     The runner holds the recorded graphs, their receipt names, the steady step variants, the boundary
     and the window restore buffers. A call that receives the state the runner returned last (same
     tensors, receipts and step) continues on that boundary: no ordinary step, no recording and no
-    boundary copy. Any other state starts the runner afresh (as ``run_step_graphs``). The returned
+    boundary copy. Any other state starts the runner afresh. The returned
     state is the runner's boundary: the next call advances it in place, so a caller that keeps
     values across calls copies them first.
 
@@ -403,7 +403,7 @@ class StepGraphRunner:
         dt = arguments["config"]["config_dt"]
         if type(duration_seconds) is not int or duration_seconds <= 0 or duration_seconds % dt:
             raise ValueError("step graphs advance whole positive dycore timesteps")
-        if torch.is_grad_enabled() or forward_ad._current_level >= 0:
+        if torch.is_grad_enabled() or torch_compat.forward_ad_active():
             # Replays and their copy-back are invisible to autograd and forward AD.
             return run_coupled_interval(previous, duration_seconds=duration_seconds, on_overflow="rerun",
                                         **arguments).state
@@ -471,11 +471,15 @@ class StepGraphRunner:
                         self.graphs.clear()  # recorded graphs read the replaced tensors
                     destinations, sources = _copy_plan(self.boundary, output)
                     if destinations:
-                        torch._foreach_copy_(list(destinations), list(sources))
+                        torch_compat.foreach_copy_(list(destinations), list(sources))
                     self.stamps = restamp(self.boundary, out_named)
                 else:
                     self.boundary, self.stamps, self.template = output, out_stamps, result.state
                     self.graphs.clear()  # they read the previous boundary's tensors
+                    # A new boundary (other strides or sharing, e.g. the first compiled radiation step's outputs
+                    # after the eager cold step's) can give the step's compiled regions new guards. Each key
+                    # takes one ordinary step on it before it is recorded: a CUDA capture cannot compile.
+                    self.steady.clear()
                 _restamp_finite(self.boundary, finite)
                 self.live["stamps"] = self.stamps
                 # The step's intermediates and outputs (copied back) are not needed by a recording or a
@@ -515,15 +519,3 @@ class StepGraphRunner:
                 self._window_overflowed(device, exchanger)
         self._last = unflatten_state(self.template, {**self.boundary, **self.stamps}, self.step)
         return self._last
-
-
-def run_step_graphs(previous: CoupledCycleState, *, duration_seconds: int, graph: Callable | None = None,
-                    **arguments) -> CoupledCycleState:
-    """Advance ``duration_seconds`` with one recorded graph per step variant; returns the last state.
-
-    One call of a fresh ``StepGraphRunner``: every call runs an ordinary step and records a graph per
-    variant. A driver that advances one state over several calls keeps one runner instead.
-    ``graph`` builds a recorder with TimestepGraph's interface (default: TimestepGraph on CUDA, the
-    eager emulator elsewhere).
-    """
-    return StepGraphRunner(graph=graph, **arguments).advance(previous, duration_seconds=duration_seconds)

@@ -8,10 +8,7 @@ from __future__ import annotations
 import torch
 
 from sa_sas_deep_convection_torch.compile import run_compile_island
-from sa_sas_deep_convection_torch.constants import KM
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
-
-CHECKPOINT_FIELDS = ("qadv", "tmfq", "qmicro", "omega_u", "zeta", "sigmain", "sigmaout", "sigmab")
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -87,5 +84,3 @@ def _progsigma_inputs_block(
     return qadv, tmfq, sigmaout, sigmab
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

@@ -11,8 +11,6 @@ This is the outer loop of split-explicit time integration.
 Subroutine: atm_recover_large_step_variables_work
 """
 
-import math
-import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -34,22 +32,18 @@ from mpas_pytorch.dynamics.stencil_ops import (
     _accumulate_ordered_slot,
     _active_slot_count,
     _clone_for_grad,
+    _compile_active,
     _pinned_identity,
     _replace_row_slice,
     _replace_row_slice_cols,
     _static_connectivity_cache_allowed,
     _static_mask_all_true,
     _static_slot_all_true,
+    _stored_when_compiled,
     _tensor_version_cache_key,
     gather_rows,
 )
-from mpas_pytorch.mesh import MESHState
 from mpas_pytorch.utils.checks import require_consistent_device
-
-
-def _mpas_debug_enabled() -> bool:
-    """Return True when expensive runtime validations are enabled."""
-    return os.environ.get("MPAS_DEBUG", "0") == "1"
 
 
 def _large_step_recovery_static_all_true(
@@ -615,28 +609,6 @@ def _large_step_recovery_exner_pressure(
     return exner_cell, pressure_cell
 
 
-def _large_step_recovery_density_theta_recovery_region(
-    **arguments: Any,
-) -> tuple[torch.Tensor, ...]:
-    """Assemble the complete density/theta oracle from the shared expressions."""
-    prognostics = _large_step_recovery_density_theta_prognostic_region(**arguments)
-    rtheta_p_cell = prognostics[2]
-    if arguments["rk_step"] == 3:
-        exner_cell, pressure_cell = _large_step_recovery_exner_pressure(
-            arguments["zz_cells"],
-            rtheta_p_cell,
-            arguments["rtheta_base_cells"],
-            arguments["exner_base_cells"],
-            rgas=arguments["rgas"],
-            cp=arguments["cp"],
-            p0=arguments["p0"],
-        )
-    else:
-        exner_cell = torch.zeros_like(rtheta_p_cell)
-        pressure_cell = torch.zeros_like(rtheta_p_cell)
-    return (*prognostics, exner_cell, pressure_cell)
-
-
 def _large_step_recovery_density_theta_recovery_no_thermo_region(
     *,
     rho_p_save_cells: torch.Tensor,
@@ -772,6 +744,119 @@ def _native_vertical_velocity(
     return w_surface_final, w_interior_final
 
 
+def _native_vertical_velocity_all_levels(
+    *,
+    rw_mid: torch.Tensor,
+    ru_patch: torch.Tensor,
+    rho_zz_cell: torch.Tensor,
+    zz_cells: torch.Tensor,
+    safe_edge_local: torch.Tensor,
+    edge_in_edge_patch: torch.Tensor,
+    edge_in_edge_patch_all: bool,
+    valid: torch.Tensor,
+    edge_sign: torch.Tensor,
+    zb_cell_solve: torch.Tensor,
+    zb3_cell_solve: torch.Tensor,
+    fzm: torch.Tensor,
+    fzp: torch.Tensor,
+    cf1: float | torch.Tensor,
+    cf2: float | torch.Tensor,
+    cf3: float | torch.Tensor,
+    nVertLevels: int,
+    active_mask: torch.Tensor,
+    active_mask_all: bool,
+    valid_all_by_slot: tuple[bool, ...] | None,
+    signed_valid_edge_weight: torch.Tensor | None,
+) -> torch.Tensor:
+    """``_native_vertical_velocity`` on every w level at once (column k is level k, level nVertLevels
+    zero, as the no-grad public w holds it); more than 2 levels.
+
+    Compiled inference only (``_use_large_step_recovery_all_level_w``). Separately, the surface sums
+    (one value per cell, six slots of gathers) form a narrow kernel and the interior sums and the
+    public w others. Here each level selects its expression: the surface's flux and density
+    weights (cf1, cf2, cf3 on levels 0-2) at level 0, the interior's (fzm, fzp on levels k, k-1)
+    elsewhere, with the operands padded to all levels; the slot terms, their order and the start
+    values (+0.0 at the surface, w_mid inside) are those of ``_sum_w_recovery_compact_slots``. The
+    selects and the padding move values only.
+
+    The result has one row more than the cells, the pad row of the public w, which is +0.0 (as the
+    zero-row packing gives): every per-cell operand gets a zero (index 0, invalid) row, whose
+    discarded value the last select replaces. The kernel then writes the public w itself instead
+    of storing the cell rows and copying them below a pad row.
+
+    A forward-only form: the pad row's update divides zero by zero (zero-padded flux and density
+    weights), a NaN that the last select discards in the forward but that a VJP or JVP through it
+    would carry into the derivatives, so only calls without grad take it.
+    """
+    row_pad = lambda x: None if x is None else F.pad(x, (0, 0) * (x.ndim - 1) + (0, 1))  # noqa: E731
+    cells = safe_edge_local.shape[0]
+    rw_mid, rho_zz_cell, zz_cells = row_pad(rw_mid), row_pad(rho_zz_cell), row_pad(zz_cells)
+    safe_edge_local, edge_in_edge_patch = row_pad(safe_edge_local), row_pad(edge_in_edge_patch)
+    valid, edge_sign = row_pad(valid), row_pad(edge_sign)
+    zb_cell_solve, zb3_cell_solve = row_pad(zb_cell_solve), row_pad(zb3_cell_solve)
+    active_mask, signed_valid_edge_weight = row_pad(active_mask), row_pad(signed_valid_edge_weight)
+    n = nVertLevels
+    at_k = lambda x: F.pad(x, (0, 1))  # noqa: E731  level k of a level field (k < n)
+    at_km1 = lambda x: F.pad(x, (1, 0))  # noqa: E731  level k - 1 (k >= 1)
+    level = torch.arange(n + 1, device=ru_patch.device)[None, :]
+    surface = level == 0
+    fzm_k, fzp_k = at_k(fzm)[None, :], at_k(fzp)[None, :]
+    zz_interp = fzm_k * at_k(zz_cells) + fzp_k * at_km1(zz_cells)
+    w_mid = F.pad(rw_mid, (1, 1)) / zz_interp
+    total = torch.where(surface, 0.0, w_mid)
+    n_cells, n_slots = safe_edge_local.shape
+    for slot in range(n_slots):
+        ru_slot = _large_step_recovery_gather_compact_patch(
+            ru_patch,
+            safe_edge_local[:, slot],
+            edge_in_edge_patch[:, slot],
+            all_in_patch=edge_in_edge_patch_all,
+        )
+        valid_all = valid_all_by_slot is not None and valid_all_by_slot[slot]
+        flux_surface = cf1 * ru_slot[:, 0] + cf2 * ru_slot[:, 1] + cf3 * ru_slot[:, 2]
+        flux = torch.where(
+            surface, flux_surface[:, None], fzm_k * at_k(ru_slot) + fzp_k * at_km1(ru_slot)
+        )
+        coef = zb_cell_solve[:, slot, :] + fct_sign_pm(flux) * zb3_cell_solve[:, slot, :]
+        if signed_valid_edge_weight is not None:
+            contrib = signed_valid_edge_weight[:, slot].unsqueeze(1) * coef * flux
+        else:
+            contrib = edge_sign[:, slot].unsqueeze(1) * coef * flux
+            if not valid_all:
+                contrib = contrib * valid[:, slot].view(n_cells, 1).to(dtype=ru_patch.dtype)
+        total = (
+            total + contrib
+            if valid_all
+            else torch.where(valid[:, slot].view(n_cells, 1), total + contrib, total)
+        )
+    denom = torch.where(
+        surface,
+        (cf1 * rho_zz_cell[:, 0] + cf2 * rho_zz_cell[:, 1] + cf3 * rho_zz_cell[:, 2])[:, None],
+        fzm_k * at_k(rho_zz_cell) + fzp_k * at_km1(rho_zz_cell),
+    )
+    w_norm = total / denom
+    if not active_mask_all:
+        w_norm = torch.where(active_mask[:, None], w_norm, torch.where(surface, 0.0, w_mid))
+    row = torch.arange(cells + 1, device=ru_patch.device)[:, None]
+    return torch.where((level < n) & (row < cells), w_norm, 0.0)
+
+
+def _use_large_step_recovery_all_level_w(
+    nVertLevels: int, cell_start: int, cell_end: int, cell_rows: int, zb_cell_solve: torch.Tensor
+) -> bool:
+    """Whether the recovery pack forms w on all levels (``_native_vertical_velocity_all_levels``):
+    compiled inference, more than 2 levels, the owned cells all rows but the pad row."""
+    return (
+        nVertLevels > 2
+        and _compile_active()
+        and not torch.is_grad_enabled()
+        and cell_start == 0
+        and cell_end + 1 == cell_rows
+        and zb_cell_solve.ndim == 3
+        and zb_cell_solve.shape[2] == nVertLevels + 1
+    )
+
+
 def _large_step_recovery_prognostic_numeric(
     *,
     nVertLevels: int,
@@ -820,8 +905,12 @@ def _large_step_recovery_prognostic_numeric(
     ru_p_edges: torch.Tensor,
     zb_cell_solve: torch.Tensor,
     zb3_cell_solve: torch.Tensor,
+    all_level_w: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    """Recover compact prognostic patches in one tensor-only region."""
+    """Recover compact prognostic patches in one tensor-only region.
+
+    ``all_level_w``: w comes as one [cells, nVertLevels + 1] tensor in the w slot of the surface
+    values (``_native_vertical_velocity_all_levels``), with None for the interior."""
     if rk_step == 3:
         (
             rho_p_cell,
@@ -883,6 +972,10 @@ def _large_step_recovery_prognostic_numeric(
             rho_zz_cell2=rho_zz_cell2,
         )
     )
+    # Compiled, ru_patch is stored once: the w recovery gathers it from every edge slot of each
+    # cell, and inlined each slot's gather of ru_save + ru_p was stored as its own [cells, levels]
+    # buffer (six at 60 km) and read back by the surface and interior sums.
+    ru_patch = _stored_when_compiled(ru_patch)
 
     if nVertLevels > 1:
         ww_avg_mid = rw_save_cells[:, 1:nVertLevels] + (
@@ -893,7 +986,7 @@ def _large_step_recovery_prognostic_numeric(
         ww_avg_mid = rw_save_cells[:, 1:1]
         rw_mid = rw_save_cells[:, 1:1]
 
-    w_surface_final, w_interior_final = _native_vertical_velocity(
+    vertical_velocity_arguments: dict[str, Any] = dict(
         rw_mid=rw_mid,
         ru_patch=ru_patch,
         rho_zz_cell=rho_zz_cell,
@@ -916,6 +1009,15 @@ def _large_step_recovery_prognostic_numeric(
         valid_all_by_slot=valid_all_by_slot,
         signed_valid_edge_weight=signed_valid_edge_weight,
     )
+    w_surface_final: torch.Tensor
+    w_interior_final: torch.Tensor | None
+    if all_level_w:
+        w_surface_final = _native_vertical_velocity_all_levels(**vertical_velocity_arguments)
+        w_interior_final = None
+    else:
+        w_surface_final, w_interior_final = _native_vertical_velocity(
+            **vertical_velocity_arguments
+        )
 
     return (
         rho_p_cell,
@@ -953,6 +1055,7 @@ def decode_native_fields(
     rgas: float = PhysicalConstants.RD,
     cp: float = PhysicalConstants.CP,
     p0: float = PhysicalConstants.P0,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Decode an integrated global boundary without inverting rounded physical fields.
 
@@ -980,7 +1083,9 @@ def decode_native_fields(
         valid=connectivity["valid"],
         edge_sign=connectivity["edge_sign"],
         zb_cell_solve=zb_cell[:nc],
-        zb3_cell_solve=zb3_cell[:nc],
+        zb3_cell_solve=(
+            zb3_cell[:nc] if coef_3rd_scale is None else zb3_cell[:nc] * coef_3rd_scale
+        ),
         fzm=fzm,
         fzp=fzp,
         cf1=cf1,
@@ -1004,27 +1109,6 @@ def decode_native_fields(
         "exner": F.pad(exner, (0, 0, 0, 1)),
         "pressure_p": F.pad(pressure, (0, 0, 0, 1)),
     }
-
-
-def _large_step_recovery_recovery_numeric(
-    **arguments: Any,
-) -> tuple[torch.Tensor, ...]:
-    """Complete compact recovery oracle; thermodynamics share the runtime helper."""
-    prognostics = _large_step_recovery_prognostic_numeric(**arguments)
-    if arguments["rk_step"] == 3:
-        exner_cell, pressure_cell = _large_step_recovery_exner_pressure(
-            arguments["zz_cells"],
-            prognostics[2],
-            arguments["rtheta_base_cells"],
-            arguments["exner_base_cells"],
-            rgas=arguments["rgas"],
-            cp=arguments["cp"],
-            p0=arguments["p0"],
-        )
-    else:
-        exner_cell = prognostics[2]
-        pressure_cell = prognostics[2]
-    return (*prognostics[:4], exner_cell, pressure_cell, *prognostics[4:])
 
 
 def _large_step_recovery_plan_tensor_fingerprint(
@@ -1342,7 +1426,7 @@ def _large_step_recovery_pack_recovery_region(
     wwAvg_mid: torch.Tensor,
     rw_mid: torch.Tensor,
     w_surface_final: torch.Tensor,
-    w_interior_final: torch.Tensor,
+    w_interior_final: torch.Tensor | None,
     ru_avg_patch: torch.Tensor,
     ru_patch: torch.Tensor,
     u_patch: torch.Tensor,
@@ -1354,6 +1438,7 @@ def _large_step_recovery_pack_recovery_region(
     nVertLevels: int,
     rk_step: int,
     _include_thermodynamics: bool = True,
+    w_all_levels: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1368,7 +1453,10 @@ def _large_step_recovery_pack_recovery_region(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Pack active large-step-recovery patches back into padded MPAS-shaped tensors."""
+    """Pack active large-step-recovery patches back into padded MPAS-shaped tensors.
+
+    ``w_all_levels`` (with ``w`` None): w on every level and every row, the pad row included
+    (``_native_vertical_velocity_all_levels``; the owned cells are all rows but the pad row)."""
     rho_p = _large_step_recovery_pack_zero_rows(
         rho_p, rho_p_cell, cell_start, cell_end, nCells + 1
     )
@@ -1420,7 +1508,9 @@ def _large_step_recovery_pack_recovery_region(
     elif nVertLevels > 1:
         rw = _replace_row_slice_cols(rw, cell_start, cell_end, 1, nVertLevels, rw_mid)
 
-    if w is None:
+    if w is None and w_all_levels is not None:
+        w = w_all_levels
+    elif w is None:
         if not torch.is_grad_enabled():
             w = w_surface_final.new_zeros((nCells + 1, nVertLevels + 1))
             w[cell_start:cell_end, 0] = w_surface_final
@@ -1481,6 +1571,33 @@ def _large_step_recovery_pack_recovery_region(
     )
 
 
+def _recovery_arguments_through_pad_row(
+    ru_avg_base: torch.Tensor, recovery_arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Recovery arguments with the edge fields and the edge-cell relation extended by the pad row.
+
+    Compiled inference keeps this form because the recovery kernels then write ru, u and ruAvg in
+    their public rows directly, without a stored edge patch copied below the pad row.
+
+    The pad row is invalid (``edge_valid`` False), so the edge recovery selects +0.0 for ru and u
+    and the base row for ruAvg, the values the pad-row packing gives. Its cell gathers read
+    cell 0 (local index 0, in the patch), so its discarded velocity is finite. Rows [0, nEdges)
+    see the same values and expressions; with all edges valid the selects keep the computed row.
+    """
+    pad = F.pad
+    padded = dict(recovery_arguments)
+    padded["ru_avg_edges"] = ru_avg_base
+    for name in ("ru_save_edges", "ru_p_edges"):
+        padded[name] = pad(recovery_arguments[name], (0, 0, 0, 1))
+    for name in ("c1_local", "c2_local"):
+        padded[name] = pad(recovery_arguments[name], (0, 1))
+    for name in ("c1_in_cell_patch", "c2_in_cell_patch"):
+        padded[name] = pad(recovery_arguments[name], (0, 1), value=True)
+    padded["edge_valid"] = pad(recovery_arguments["edge_valid"], (0, 1), value=False)
+    padded["edge_valid_all"] = False
+    return padded
+
+
 def _large_step_recovery_recovery_pack_numeric(
     *,
     cell_start: int,
@@ -1499,7 +1616,29 @@ def _large_step_recovery_recovery_pack_numeric(
     Returns rho_p, rho_zz, rtheta_p, theta_m, rw, w, ru, u, wwAvg and ruAvg;
     at RK stage 3 also the base of the Exner power (cell rows), whose power the
     caller evaluates eagerly.
+    ``ru_avg_edges`` holds the rows [edge_start, edge_end) of ``ru_avg_base``.
     """
+    if (
+        _compile_active()
+        and not torch.is_grad_enabled()
+        and edge_start == 0
+        and edge_end + 1 == ru_avg_base.shape[0]
+    ):
+        # Inference only. All edges plus the pad row: the edge recovery iterates the output rows
+        # (the pad row invalid, so ru and u are +0.0 there and ruAvg keeps its base row), so
+        # Inductor writes ru, u and ruAvg in the kernels that compute them. With nEdges rows it
+        # stores the gathered rho_zz sum per edge and reads it back to pad u.
+        recovery_arguments = _recovery_arguments_through_pad_row(ru_avg_base, recovery_arguments)
+        edge_end += 1
+    all_level_w = _use_large_step_recovery_all_level_w(
+        int(recovery_arguments["nVertLevels"]),
+        cell_start,
+        cell_end,
+        ww_avg_base.shape[0],
+        recovery_arguments["zb_cell_solve"],
+    )
+    if all_level_w:
+        recovery_arguments = {**recovery_arguments, "all_level_w": True}
     (
         rho_p_cell,
         rho_zz_cell,
@@ -1548,6 +1687,7 @@ def _large_step_recovery_recovery_pack_numeric(
         nVertLevels=int(recovery_arguments["nVertLevels"]),
         rk_step=rk_step,
         _include_thermodynamics=False,
+        w_all_levels=w_surface_final if all_level_w else None,
     )
     if rk_step == 3:
         return (
@@ -1637,6 +1777,7 @@ def atm_recover_large_step_variables_work(
     rgas: float = PhysicalConstants.RD,
     cp: float = PhysicalConstants.CP,
     p0: float = PhysicalConstants.P0,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> dict:
     """
     Recover full state variables from perturbation variables after acoustic substeps.
@@ -1743,21 +1884,6 @@ def atm_recover_large_step_variables_work(
         zb3,
         scalars,
     )
-
-    def _require_finite_nonzero(value, label: str) -> None:
-        if not _mpas_debug_enabled():
-            return
-        if isinstance(value, torch.Tensor):
-            if not torch.isfinite(value).all():
-                raise ValueError(f"{label} is not finite")
-            if torch.any(value == 0.0):
-                raise ValueError(f"{label} is zero (division by zero risk)")
-            return
-        value_f = float(value)
-        if not math.isfinite(value_f):
-            raise ValueError(f"{label} is not finite")
-        if value_f == 0.0:
-            raise ValueError(f"{label} is zero (division by zero risk)")
 
     # Convert Fortran 1-based bounds to Python 0-based
     cell_start = cellStart - 1
@@ -1920,6 +2046,10 @@ def atm_recover_large_step_variables_work(
 
     exner_argument = None
     if _recovery_plan is not None:
+        # zb3_cell carries config_coef_3rd_order; its scale (0-d tensor or None) multiplies the slice here.
+        zb3_cell_solve = zb3_cell[cell_start:cell_end, : int(conn["active_slot_count"]), :]
+        if coef_3rd_scale is not None:
+            zb3_cell_solve = zb3_cell_solve * coef_3rd_scale
         numeric_arguments = {
             "rho_p_save_cells": rho_p_save[cell_slice, :],
             "rho_pp_cells": rho_pp[cell_slice, :],
@@ -1939,9 +2069,7 @@ def atm_recover_large_step_variables_work(
             "zb_cell_solve": zb_cell[
                 cell_start:cell_end, : int(conn["active_slot_count"]), :
             ],
-            "zb3_cell_solve": zb3_cell[
-                cell_start:cell_end, : int(conn["active_slot_count"]), :
-            ],
+            "zb3_cell_solve": zb3_cell_solve,
         }
         dynamic_values = _recovery_plan.dynamic_values(numeric_arguments)
         if (
@@ -2087,35 +2215,3 @@ def atm_recover_large_step_variables_work(
         return result
 
 
-def recover_large_step(
-    state: dict,
-    state_old: dict,
-    mesh: MESHState,
-    dt: torch.Tensor,
-) -> dict:
-    """
-    High-level wrapper for atm_recover_large_step_variables_work - INTENTIONALLY NOT IMPLEMENTED.
-
-    This wrapper is a placeholder for a potential future API simplification.
-    The low-level atm_recover_large_step_variables_work() function is used directly
-    in execute_rk_step() to maintain explicit control over all parameters and
-    avoid the complexity of automatic parameter extraction from state dicts.
-
-    Design Decision:
-        The explicit parameter passing pattern in atm_recover_large_step_variables_work()
-        provides better type safety, clearer documentation, and easier debugging
-        compared to a wrapper that would need to extract ~30+ parameters from
-        nested dictionaries. This is intentional, not a TODO.
-
-    Usage:
-        Use atm_recover_large_step_variables_work() directly with explicit parameters.
-        See time_integration.py execute_rk_step() for the expected call pattern.
-
-    Raises:
-        NotImplementedError: Always - use atm_recover_large_step_variables_work() instead.
-    """
-    raise NotImplementedError(
-        "recover_large_step() wrapper is intentionally not implemented. "
-        "Use atm_recover_large_step_variables_work() directly with explicit parameters. "
-        "See execute_rk_step() for the expected call pattern."
-    )

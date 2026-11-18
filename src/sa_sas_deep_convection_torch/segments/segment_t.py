@@ -8,13 +8,12 @@ from __future__ import annotations
 import torch
 
 from sa_sas_deep_convection_torch import recurrence_chunks as chunks
-from sa_sas_deep_convection_torch.compile import masked_sum_chunk_size, run_compile_island, run_recurrence_chunk, recurrence_chunk_size, ordered_chunks_enabled
-from sa_sas_deep_convection_torch.constants import EPS, EPSM1, KM
+from sa_sas_deep_convection_torch.compile import run_compile_island, run_recurrence_chunk, recurrence_chunk_size, ordered_chunks_enabled
+from sa_sas_deep_convection_torch.constants import EPS, EPSM1
 from sa_sas_deep_convection_torch.segments.segment_d import _fpvs_from_table
-from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
+from sa_sas_deep_convection_torch.samf_interstitials import convective_rain_scale, rescale_convective_tracers
+from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real, tracer_layout
 from sa_sas_deep_convection_torch.thermo import _fpvs_table_for_device
-
-CHECKPOINT_FIELDS = ("wet_dep", "chem_c", "chem_pw", "qevap", "delqev", "rainevap", "rn")
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -33,16 +32,18 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
     pwdo = state.require("pwdo")
     edto = state.require("edto")
     xmb = state.require("xmb")
-    qeso = state.require("qeso").clone()
-    new_t1 = state.require("new_t1").clone()
-    new_q1 = state.require("new_q1").clone()
-    rn = state.require("rn").clone()
-    delqbar = state.require("delqbar").clone()
-    deltbar = state.require("deltbar").clone()
-    ktop = state.require("ktop").clone()
-    kbot = state.require("kbot").clone()
-    kcnv = state.require("kcnv").clone()
-    cldwrk = state.require("cldwrk").clone()
+    # The islands below write no input (they copy before any indexed store), so the state's tensors enter them as
+    # they are: copies here cost one full pass each on the compacted buffer (round 8 wave 4).
+    qeso = state.require("qeso")
+    new_t1 = state.require("new_t1")
+    new_q1 = state.require("new_q1")
+    rn = state.require("rn")
+    delqbar = state.require("delqbar")
+    deltbar = state.require("deltbar")
+    ktop = state.require("ktop")
+    kbot = state.require("kbot")
+    kcnv = state.require("kcnv")
+    cldwrk = state.require("cldwrk")
     ncol = cnvflg.shape[0]
     for name, tensor in {
         "cnvflg": cnvflg,
@@ -65,8 +66,8 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
     for name, tensor in {"del": del_, "pfld": pfld, "pwo": pwo, "pwdo": pwdo, "qeso": qeso, "new_t1": new_t1, "new_q1": new_q1}.items():
         require_real(name, tensor, (ncol, KM))
 
-    qcond = state.require("qcond").clone()
-    rainevap = state.require("rainevap").clone()
+    qcond = state.require("qcond")
+    rainevap = state.require("rainevap")
     (
         qeso,
         new_t1,
@@ -117,7 +118,11 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
         state.require("evef"),
         state.require("el2orc"),
         state.require("grav"),
-        state.require("elocp"),
+        state.require("q"),
+        state.require("phase_entry_temperature"),
+        state.require("cp"),
+        state.require("rd"),
+        state.require("rv"),
         bool(state.config.get("do_ca", False)),
     )
 
@@ -126,6 +131,9 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
             "qeso": qeso,
             "new_t1": new_t1,
             "new_q1": new_q1,
+            "rain_evaporation_scale": convective_rain_scale(state.require("new_q1"), new_q1),
+            "new_qtr": rescale_convective_tracers(state.require("new_qtr"), state.require("new_q1"),
+                new_q1, tracer_layout(state).ntk - 1),
             "rn": rn,
             "rntot": rntot,
             "qevap": qevap,
@@ -173,7 +181,11 @@ def _evaporation_wetdep_block(
     evef: torch.Tensor,
     el2orc: torch.Tensor,
     grav: torch.Tensor,
-    elocp: torch.Tensor,
+    entry_q: torch.Tensor,
+    entry_temperature: torch.Tensor,
+    cp: torch.Tensor,
+    rd: torch.Tensor,
+    rv: torch.Tensor,
     do_ca: bool,
 ) -> tuple[torch.Tensor, ...]:
     KM = qeso.shape[1]
@@ -190,7 +202,7 @@ def _evaporation_wetdep_block(
     flg = active.clone()
     levels = level_values.reshape(KM)
     size = recurrence_chunk_size()
-    sum_size = masked_sum_chunk_size()
+    sum_size = recurrence_chunk_size()
     rain_rows = chunks.pack_profiles(pwo, pwdo)
     for stop in range(KM, 0, -sum_size):
         start = max(0, stop - sum_size)
@@ -201,14 +213,14 @@ def _evaporation_wetdep_block(
 
     qevap = torch.zeros_like(cnvflg)
     q1_pieces, t1_pieces = [], []
-    inputs = chunks.pack_profiles(del_, new_q1, new_t1, qeso, pwo, pwdo)
+    inputs = chunks.pack_profiles(del_, new_q1, new_t1, qeso, pwo, pwdo, entry_q, entry_temperature)
     carry = (rn, qevap, delqev, delq2, qcond, delqbar, deltbar, flg)
     for stop in range(KM, 0, -size):
         start = max(0, stop - size)
         result, carry = run_recurrence_chunk("t_ordered_chunks", "evaporation", chunks.evaporation,
             active, kmax, ktcon, kb, jmin, levels[start],
             inputs[start:stop], carry, rntot,
-            edto, xmb, delt, evef, el2orc, grav, elocp)
+            edto, xmb, delt, evef, el2orc, grav, cp, rd, rv)
         q1_pieces.append(result[0])
         t1_pieces.append(result[1])
     rn, qevap, delqev, delq2, qcond, delqbar, deltbar, flg = carry
@@ -227,10 +239,6 @@ def _evaporation_wetdep_block(
     kcnv = torch.where(raining, torch.ones_like(kcnv), kcnv)
     cldwrk = torch.where(raining, aa1, cldwrk)
     return qeso, new_t1, new_q1, rn, rntot, qevap, delqev, delqbar, deltbar, qcond, rainevap, ktop, kbot, kcnv, cldwrk
-
-
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}
 
 
 def _recurrence_coordinator(category, name, fn, *args):

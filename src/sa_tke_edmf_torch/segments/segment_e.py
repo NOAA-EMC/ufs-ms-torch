@@ -10,10 +10,8 @@ from ufs_physics_common.precision import working_power
 
 from sa_tke_edmf_torch.autodiff import safe_positive_denominator, safe_sqrt_nonnegative
 from sa_tke_edmf_torch.compile import run_compile_island
-from sa_tke_edmf_torch.constants import F32_0P01, F32_0P1, F32_0P4, F32_ONE_THIRD, FV, GRAV, IM, KM, QMIN, source_real
+from sa_tke_edmf_torch.constants import FV, GRAV, source_real
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
-
-CHECKPOINT_FIELDS = ("tkemean", "zol", "phims", "phihs", "scuflg")
 
 
 def _mean_tke(tke: torch.Tensor, zi: torch.Tensor, kpbl: torch.Tensor) -> torch.Tensor:
@@ -215,7 +213,6 @@ def _surface_similarity_block(
         1.0 + 5.0 * zol,
     )
     phims = torch.where(sfcflg, safe_sqrt_nonnegative(phihs), phihs)
-    sfcfrac_hpbl = F32_0P1 * hpbl
     zol1 = zol * F32_0P1 * hpbl / safe_positive_denominator(zl[:, 0])
     phih = torch.where(
         sfcflg,
@@ -352,5 +349,3 @@ def _interpolated_hpbl(
     return torch.where(kpblx > 1, z_lower + rbint * (z_upper - z_lower), zi[:, 0])
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

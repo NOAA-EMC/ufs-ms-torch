@@ -8,20 +8,7 @@ from __future__ import annotations
 import torch
 
 from sa_sas_deep_convection_torch.compile import run_compile_island
-from sa_sas_deep_convection_torch.constants import KM, NN, NTR
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real, tracer_layout
-
-CHECKPOINT_FIELDS = (
-    "ten_t",
-    "ten_u",
-    "ten_v",
-    "ten_q",
-    "dqtr",
-    "new_t1",
-    "new_q1",
-    "new_qtr",
-    "errflg",
-)
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -29,7 +16,10 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
     _, KM, NN, NTR, NTC = runtime_dimensions(state)
 
     qtr = state.require("qtr")
-    q1 = state.require("q1")
+    # The host binds q1 to the vapour slot of gq0 (a stride-ntrac view). Stored once as its own array for every
+    # later reader: the islands of A and C each copied the view at entry (0.41 ms per 60 km step on the RTX PRO
+    # 6000, round 8 wave 4). Values unchanged.
+    q1 = state.require("q1").contiguous()
     t1 = state.require("t1")
     u1 = state.require("u1")
     v1 = state.require("v1")
@@ -46,11 +36,6 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
         ten_v,
         ten_q,
         dqtr,
-        new_t1,
-        new_u1,
-        new_v1,
-        new_q1,
-        new_qtr,
         errmsg_code,
         errflg,
         gravinv,
@@ -79,9 +64,12 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
     )
     # samfdeepcnv's ten_q spans the host tracer array (ntrac), not the convective
     # transport array; only its vapour slot is ever set by the scheme.
-    ten_q = torch.zeros((ncol, KM, tracer_layout(state).ntrac), dtype=q1.dtype, device=q1.device)
+    ten_q = q1.new_zeros(()).expand(ncol, KM, tracer_layout(state).ntrac)
+    # The updated state starts as copies of the state, with or without gradients (one form).
+    new_t1, new_u1, new_v1, new_q1, new_qtr = (x.clone() for x in (t1, u1, v1, q1, qtr))
     return state.with_updates(
         {
+            "q1": q1,
             "ten_t": ten_t,
             "ten_u": ten_u,
             "ten_v": ten_v,
@@ -122,11 +110,13 @@ def _entry_initialization_block(
     KM = q1.shape[1]
     NTR = qtr.shape[2] - 2
     ncol = q1.shape[0]
-    ten_t = torch.zeros_like(t1)
-    ten_u = torch.zeros_like(u1)
-    ten_v = torch.zeros_like(v1)
-    ten_q = torch.zeros((ncol, KM, NTR), dtype=q1.dtype, device=q1.device)
-    dqtr = torch.zeros_like(qtr)
+    # The tendencies are zero until segment U forms them: stride-0 zeros (no fills; compaction takes their rows as
+    # views, round 8), a distinct tensor object each.
+    ten_t = t1.new_zeros(()).expand(t1.shape)
+    ten_u = u1.new_zeros(()).expand(u1.shape)
+    ten_v = v1.new_zeros(()).expand(v1.shape)
+    ten_q = q1.new_zeros(()).expand(ncol, KM, NTR)
+    dqtr = qtr.new_zeros(()).expand(qtr.shape)
     scalar = torch.zeros((), dtype=q1.dtype, device=q1.device)
     return (
         ten_t,
@@ -134,11 +124,6 @@ def _entry_initialization_block(
         ten_v,
         ten_q,
         dqtr,
-        t1.clone(),
-        u1.clone(),
-        v1.clone(),
-        q1.clone(),
-        qtr.clone(),
         scalar.clone(),
         scalar.clone(),
         1.0 / grav,
@@ -150,5 +135,3 @@ def _entry_initialization_block(
     )
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

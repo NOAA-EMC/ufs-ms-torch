@@ -29,6 +29,7 @@ from typing import Sequence
 
 import numpy as np
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from .aerosol import WVNLW1, WVNLW2, WVNSW1, WVNSW2, _read_float_block, _set_spectrum
 
@@ -341,7 +342,7 @@ def merra2_time_weights(climatology: Merra2Climatology, date: torch.Tensor):
     tx2 = 1.0 - tx1
     slot1 = climatology.slot_of_month.index_select(0, n1.reshape(1))[0]
     slot2 = climatology.slot_of_month.index_select(0, n2.reshape(1))[0]
-    torch._assert_async((slot1 >= 0) & (slot2 >= 0), "MERRA-2 month not prepared for this date")
+    torch_compat.assert_async((slot1 >= 0) & (slot2 >= 0), "MERRA-2 month not prepared for this date")
     return slot1, slot2, tx1, tx2
 
 
@@ -408,11 +409,13 @@ def _aerosol_preparation(optics, aer_nm, p_lev, p_lay, tv_lay, relhum):
             *_rh_interpolation(optics, relhum))
 
 
-def _rh_table(table: torch.Tensor, ih1, ih2, rdrh):
-    """``t(ih1) + rdrh*(t(ih2) - t(ih1))`` for a table ``[KRHLEV, nband]`` -> ``[nband, nlay, ncol]``."""
-    a = table[ih1].permute(2, 0, 1)
-    b = table[ih2].permute(2, 0, 1)
-    return a + rdrh.unsqueeze(0) * (b - a)
+def _rh_table(table: torch.Tensor, ih1, ih2, rdrh, band_axis=0):
+    """``t(ih1) + rdrh*(t(ih2) - t(ih1))`` for a table ``[KRHLEV, nband]`` -> ``[nband, nlay, ncol]`` (``band_axis``
+    1: ``[nlay, nband, ncol]``)."""
+    order = (2, 0, 1) if band_axis == 0 else (0, 2, 1)
+    a = table[ih1].permute(order)
+    b = table[ih2].permute(order)
+    return a + rdrh.unsqueeze(band_axis) * (b - a)
 
 
 def _band_view(table, bands):
@@ -433,58 +436,74 @@ def _band_view(table, bands):
 
 
 def merra2_band_optics(optics: Merra2Optics, aer_nm, p_lev, p_lay, tv_lay, relhum, bands: Sequence[int],
-                      *, preparation=None):
-    """``aeropt`` for the listed aerosol bands (0-based, 0-13 SW, 14-29 LW): tau, ssa, g ``[nband, nlay, ncol]``."""
+                      *, preparation=None, tau_only=False, band_axis=0):
+    """``aeropt`` for the listed aerosol bands (0-based, 0-13 SW, 14-29 LW): tau, ssa, g ``[nband, nlay, ncol]``
+    (``band_axis`` 1: ``[nlay, nband, ncol]``, the same elements, for a compiled consumer that stores them
+    level-major: computed in that order, each layer's species planes are read once for all bands).
+
+    Each species' relative-humidity tables are built when its turn comes and released after it, so
+    at most one species' tables are live. ``tau_only`` (for a caller that reads only the optical depth: the
+    radiation group's LW 1scl increment) skips the scattering sums and returns ``(tau, None, None)``; tau is the
+    same sum.
+    """
     device = p_lay.device
     if preparation is None:
         preparation = _aerosol_preparation(optics, aer_nm, p_lev, p_lay, tv_lay, relhum)
     cm, ih1, ih2, rdrh = preparation
-    shape = (len(bands),) + p_lay.shape
+    shape = list(p_lay.shape)
+    shape.insert(band_axis, len(bands))
+    by_band = (-1, 1, 1) if band_axis == 0 else (1, -1, 1)
     zero = torch.zeros(shape, dtype=p_lay.dtype, device=device)
     sum_tau = sum_ssa = sum_asy = zero
     ssa = asy = zero
-    independent = tuple(_band_view(getattr(optics, name), bands)
-                        for name in ("ext_i", "sca_i", "ssa_i", "asy_i"))
-    dependent = tuple(_band_view(getattr(optics, name), bands)
-                      for name in ("ext_d", "sca_d", "ssa_d", "asy_d"))
-    groups = [[(m,) + tuple(table[m].reshape(-1, 1, 1) for table in independent)
-               for m in range(KCM1)]]
-    for ntrc in range(1, len(GRIDCOMP)):
-        group = []
-        for nbin in range(NUM_RADIUS[ntrc]):
-            m1 = RADIUS_LOWER[ntrc] + nbin - 1   # 0-based species
-            m = m1 - KCM1
-            group.append((m1,) + tuple(_rh_table(table[:, m], ih1, ih2, rdrh) for table in dependent))
-        groups.append(group)
-    for group in groups:
+    names = ("ext",) if tau_only else ("ext", "sca", "ssa", "asy")
+    independent = tuple(_band_view(getattr(optics, f"{name}_i"), bands) for name in names)
+    dependent = tuple(_band_view(getattr(optics, f"{name}_d"), bands) for name in names)
+
+    for ntrc in range(len(GRIDCOMP)):
         ext1 = sca1 = ssa1 = asy1 = zero
-        for m1, ext, sca, ssa_t, asy_t in group:
-            c = cm[m1].unsqueeze(0)
-            ext1 = ext1 + c * ext
-            sca1 = sca1 + c * sca
-            ssa1 = ssa1 + c * ext * ssa_t
-            asy1 = asy1 + c * sca * asy_t
+        bins = range(KCM1) if ntrc == 0 else range(NUM_RADIUS[ntrc])
+        for nbin in bins:
+            if ntrc == 0:
+                m1 = nbin
+                tables = [table[m1].reshape(by_band) for table in independent]
+            else:
+                m1 = RADIUS_LOWER[ntrc] + nbin - 1   # 0-based species
+                tables = [_rh_table(table[:, m1 - KCM1], ih1, ih2, rdrh, band_axis) for table in dependent]
+            c = cm[m1].unsqueeze(band_axis)
+            ext1 = ext1 + c * tables[0]
+            if not tau_only:
+                ext, sca, ssa_t, asy_t = tables
+                sca1 = sca1 + c * sca
+                ssa1 = ssa1 + c * ext * ssa_t
+                asy1 = asy1 + c * sca * asy_t
+            del tables
         tau = ext1
+        sum_tau = sum_tau + tau
+        if tau_only:
+            continue
         # ssa and asy keep the previous species' values where this species has no extinction
         ssa = torch.where(ext1 > 0.0, torch.clamp_max(ssa1 / torch.where(ext1 > 0.0, ext1, 1.0), 1.0), ssa)
         asy = torch.where(sca1 > 0.0, torch.clamp_max(asy1 / torch.where(sca1 > 0.0, sca1, 1.0), 1.0), asy)
-        sum_tau = sum_tau + tau
         sum_ssa = sum_ssa + tau * ssa
         sum_asy = sum_asy + tau * ssa * asy
+    if tau_only:
+        return sum_tau, None, None
     ssa_out = torch.where(sum_tau > 0.0, sum_ssa / torch.where(sum_tau > 0.0, sum_tau, 1.0), torch.ones_like(sum_tau))
     asy_out = torch.where(sum_ssa > 0.0, sum_asy / torch.where(sum_ssa > 0.0, sum_ssa, 1.0), zero)
     return sum_tau, ssa_out, asy_out
 
 
-def merra2_sw_optics(optics, aer_nm, p_lev, p_lay, tv_lay, relhum):
+def merra2_sw_optics(optics, aer_nm, p_lev, p_lay, tv_lay, relhum, *, band_axis=0):
     """SW optics in the RRTMGP band order (``rrtmgp_aerosol_optics``: last aerosol band first)."""
     return merra2_band_optics(optics, aer_nm, p_lev, p_lay, tv_lay, relhum,
-                              (NBDSW - 1,) + tuple(range(NBDSW - 1)))
+                              (NBDSW - 1,) + tuple(range(NBDSW - 1)), tau_only=False, band_axis=band_axis)
 
 
-def merra2_lw_optics(optics, aer_nm, p_lev, p_lay, tv_lay, relhum, *, preparation=None):
+def merra2_lw_optics(optics, aer_nm, p_lev, p_lay, tv_lay, relhum, *, preparation=None, band_axis=0):
+    """LW aerosol optics by band, ``(tau, ssa, g)`` (``aeropt`` for the LW bands)."""
     return merra2_band_optics(optics, aer_nm, p_lev, p_lay, tv_lay, relhum, tuple(range(NBDSW, NBDSW + NBDLW)),
-                              preparation=preparation)
+                              preparation=preparation, band_axis=band_axis)
 
 
 def merra2_aod550(optics: Merra2Optics, aer_nm, p_lev, p_lay, tv_lay, relhum, *, preparation=None):

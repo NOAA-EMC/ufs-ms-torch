@@ -19,6 +19,7 @@ from sa_tke_edmf_torch.segments import (
     segment_s, segment_t,
 )
 
+from . import parameters
 from .physics_prefix import PhysicsPrefixResult
 from .containers import Statein
 from .grid import Grid
@@ -72,25 +73,41 @@ class PBLMixingResult:
 def run_pbl_sequence(
     statein: Statein, grid: Grid, prefix: PhysicsPrefixResult, *,
     dtp: torch.Tensor, dtf: torch.Tensor, dtidx: torch.Tensor,
-    control: Mapping[str, object],
+    control: Mapping[str, object], parameter_scales: Mapping[str, torch.Tensor] | None = None,
 ) -> PBLMixingResult:
     """Run the selected cap's pre, mixing, canopy and post exactly once.
 
     Surface processing must finish before this call. The returned hpbl and
     prefix feed GWD; the native commit owns the later tendency finalizer.
+    ``parameter_scales`` holds the 0-d tensor scales of ``ufs_mpas_ccpp.parameters``;
+    the present PBL scales enter the SA-TKE-EDMF fields (absent keys: no op).
     """
     mixed = apply_pbl_mixing(statein, grid, apply_pbl_pre(prefix),
-        delt=dtp, control=control, dtidx=dtidx)
+        delt=dtp, control=control, dtidx=dtidx, scales=_pbl_scales(parameter_scales, statein.tgrs))
     canopy = apply_pbl_canopy(mixed.prefix, control=control)
     post = apply_pbl_post(canopy, dtp=dtp, dtf=dtf, dtidx=dtidx, control=control)
     return replace(mixed, prefix=post)
+
+
+# PBL scales: registry key -> SA-TKE-EDMF field, read by the segments (segment_g: bl_upfr, ce0_updraft;
+# segment_k: xkzm_m, xkzm_h, rlmx, elmx) and passed to their compiled islands as tensor arguments: 1-element views on
+# the numerical device (parameters.region_views), which the segments reshape back to 0-d.
+_PBL_SCALES = {"pbl.xkzm_m": "xkzm_m_scale", "pbl.xkzm_h": "xkzm_h_scale", "pbl.bl_upfr": "bl_upfr_scale",
+               "pbl.ce0_updraft": "ce0_updraft_scale", "pbl.rlmx": "rlmx_scale", "pbl.elmx": "elmx_scale"}
+
+
+def _pbl_scales(parameter_scales, like):
+    """{field: s} for each present PBL scale, as 1-element views on ``like``'s device and dtype; empty when none is
+    present."""
+    return parameters.select(parameter_scales, _PBL_SCALES, like)
 
 
 def _run_pbl_regions(*args, **kwargs):
     from sa_tke_edmf_torch.compile import regional_compile
 
     with regional_compile():
-        return run_pbl_sequence(*args, **kwargs)
+        # Forward: the scheme orchestration compiles around its islands (compile_policy, orchestration).
+        return compile_policy.compiled(run_pbl_sequence, orchestration=True)(*args, **kwargs)
 
 
 # The same numerical driver, with reusable exact-policy tensor regions. Carried
@@ -105,6 +122,7 @@ compile_policy._compiled[run_pbl_sequence] = _run_pbl_regions
 def apply_pbl_mixing(
     statein: Statein, grid: Grid, prefix: PhysicsPrefixResult, *,
     delt: torch.Tensor, control: Mapping[str, object], dtidx: torch.Tensor,
+    scales: Mapping[str, torch.Tensor] | None = None,
 ) -> PBLMixingResult:
     """Bind source-owned R4 core outputs without applying the PBL post-step.
 
@@ -142,6 +160,7 @@ def apply_pbl_mixing(
             "def_1", "def_2", "def_3", "prsi", "prsl", "prslk", "phii", "phil",
         )},
         **{n: work[n] for n in ("ten_t", "ten_u", "ten_v")},
+        **(scales or {}),
     }
     current = SaTkeEdmfState(fields, config)
     for segment in (
@@ -175,10 +194,14 @@ def apply_pbl_canopy(prefix: PhysicsPrefixResult, *, control: Mapping[str, objec
 
 def _pbl_post_tensors(fields, config):
     current = segment_t.run(segment_s.run(SaTkeEdmfState(fields, config)))
-    return {name: current.require(name) for name in (
+    out = {name: current.require(name) for name in (
         "gt0", "gu0", "gv0", "gq0", "dtend", "ten_q", "ten_t_pbl", "ten_q_pbl",
         "dtdt", "dudt", "dvdt", "dqdt",
     )}
+    # ten_q_pbl is the vapor slot of ten_q. It rides in the interstitial through three regions whose layout
+    # normalization would each copy the strided slot (a read of the whole tracer array); stored once here instead.
+    out["ten_q_pbl"] = out["ten_q_pbl"].contiguous()
+    return out
 
 
 def apply_pbl_post(

@@ -12,26 +12,17 @@ from sa_tke_edmf_torch.constants import (
     F32_0P001,
     F32_0P1,
     F32_0P15,
-    F32_0P16,
     F32_0P2,
     F32_0P3,
     F32_0P4,
-    F32_0P55,
-    F32_1E_M4,
     F32_2P7,
     F32_3P7,
     FV,
     GRAV,
-    IM,
-    KM,
-    NTRAC,
     NTQV,
-    QMIN,
     source_real,
 )
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
-
-CHECKPOINT_FIELDS = ("prn", "elm", "ele", "ckz", "chz")
 
 
 def _tc_mass_flux_policy(
@@ -72,6 +63,8 @@ def _mixing_length_background(
     background_cap=F32_0P15,
     zvfun=None,
     surface_cap=F32_0P3,
+    xkzm_h_scale=None,
+    xkzm_m_scale=None,
 ):
     KM = zi.shape[1] - 1
     km1 = KM - 1
@@ -82,6 +75,11 @@ def _mixing_length_background(
     ratio = gdx / 1000.0
     xkzm_hx = torch.where(gdx >= 1000.0, torch.full_like(gdx, xkzm_h), xkzm_h * ratio)
     xkzm_mx = torch.where(gdx >= 1000.0, torch.full_like(gdx, xkzm_m), xkzm_m * ratio)
+    # Trainable scales (1-element region views, used as 0-d; None: no op) before the inversion and surface caps.
+    if xkzm_h_scale is not None:
+        xkzm_hx = xkzm_hx * xkzm_h_scale.reshape(())
+    if xkzm_m_scale is not None:
+        xkzm_mx = xkzm_mx * xkzm_m_scale.reshape(())
     ptem = prsi[:, 1:KM] * tx1[:, None]
     tem1 = 1.0 - ptem
     tem2 = torch.minimum(torch.ones_like(ptem), torch.exp(-(tem1 * tem1 * 2.5)))
@@ -225,6 +223,8 @@ def _parcel_prepare(zl, thvx, tke, gotvx, shr2, starts, minimum_energy):
 def _mixing_length_parcel_chunk(
     zi, zl, thvx, tke, gotvx, shr2, tsea, stress, qv, phims, rlmnz, starts,
     real_coefficients=(F32_0P001, F32_0P4),
+    rlmx_scale=None,
+    elmx_scale=None,
 ):
     F32_0P001, F32_0P4 = real_coefficients
     KM = zl.shape[1]
@@ -256,11 +256,12 @@ def _mixing_length_parcel_chunk(
     return run_compile_island(
         "k_mixing_length", "parcel_finish", _parcel_finish,
         zi, zl, gotvx, tsea, stress, qv, phims, rlmnz, indices, thvx_start,
-        energy, zlup, zldn, active_dn, start_dn[0], zero, F32_0P4)
+        energy, zlup, zldn, active_dn, start_dn[0], zero, F32_0P4, rlmx_scale, elmx_scale)
 
 
 def _parcel_finish(zi, zl, gotvx, tsea, stress, qv, phims, rlmnz, indices,
-                   thvx_start, energy, zlup, zldn, active_dn, surface_mask, zero, coefficient):
+                   thvx_start, energy, zlup, zldn, active_dn, surface_mask, zero, coefficient,
+                   rlmx_scale=None, elmx_scale=None):
     F32_0P4 = coefficient
     if zl.shape[1] > 1:
         active = active_dn & surface_mask
@@ -282,23 +283,39 @@ def _parcel_finish(zi, zl, gotvx, tsea, stress, qv, phims, rlmnz, indices,
     tem = 0.5 * (zi.index_select(1, indices + 1) - zi.index_select(1, indices))
     tem1 = torch.minimum(tem, rlmnz.index_select(1, indices))
     ptem2 = torch.minimum(zlup, zldn)
-    rlam = torch.minimum(torch.maximum(ptem2, tem1), torch.full_like(ptem2, 300.0))
+    # rlmx and elmx (300 m) are caps; a trainable scale (a 1-element region view, used as 0-d; None: no op)
+    # multiplies the cap.
+    rlmx = torch.full_like(ptem2, 300.0)
+    if rlmx_scale is not None:
+        rlmx = rlmx * rlmx_scale.reshape(())
+    rlam = torch.minimum(torch.maximum(ptem2, tem1), rlmx)
     ptem2 = safe_sqrt_nonnegative(zlup * zldn)
-    ele = torch.minimum(torch.maximum(ptem2, tem1), torch.full_like(ptem2, 300.0))
-    elmh = torch.minimum(1.5 * ele, torch.full_like(ptem2, 1000.0))
+    elmx = torch.full_like(ptem2, 300.0)
+    if elmx_scale is not None:
+        elmx = elmx * elmx_scale.reshape(())
+    # As satmedmfvdifq.F: elmh = elmhfac * ele is formed before ele is capped at elmx, then capped at elmhmx.
+    ele_uncapped = torch.maximum(ptem2, tem1)
+    elmh = torch.minimum(1.5 * ele_uncapped, torch.full_like(ptem2, 1000.0))
+    ele = torch.minimum(ele_uncapped, elmx)
     return (rlam, ele, elmh)
 
 
+def _unstable_root(zol, exponent):
+    """(1 - 100 zol)**0.2 of unstable columns (1 elsewhere), once per column: inside ``_mixing_length_caps``
+    Inductor evaluated this FP64 power again for each level of the broadcast."""
+    unstable_base = torch.where(zol < 0.0, 1.0 - 100.0 * zol, torch.ones_like(zol))
+    return working_power(unstable_base, exponent)
+
+
 def _mixing_length_caps(
-    zi, zl, zol, hpbl, gdx, rbsoil, rlam, ele_seed, elmh_seed, tc_pbl, sfc_rlm,
+    zi, zl, zol, unstable_root, hpbl, gdx, rbsoil, rlam, ele_seed, elmh_seed, tc_pbl, sfc_rlm,
     real_coefficients=(F32_0P4, F32_0P2, F32_3P7, F32_2P7),
 ):
     F32_0P4, F32_0P2, F32_3P7, F32_2P7 = real_coefficients
     KM = zl.shape[1]
     tem = F32_0P4 * zl[:, : KM - 1]
-    unstable_base = torch.where(zol < 0.0, 1.0 - 100.0 * zol, torch.ones_like(zol))
     zk_unstable = (
-        tem * working_power(unstable_base, F32_0P2)[:, None]
+        tem * unstable_root[:, None]
     )
     zk_stable = tem / F32_3P7
     zk_neutral = tem / (1.0 + F32_2P7 * zol)[:, None]
@@ -367,6 +384,10 @@ def _mixing_length_seed_block(
     surface_cap=F32_0P3,
     parcel_coefficients=(F32_0P001, F32_0P4),
     caps_coefficients=(F32_0P4, F32_0P2, F32_3P7, F32_2P7),
+    xkzm_h_scale=None,
+    xkzm_m_scale=None,
+    rlmx_scale=None,
+    elmx_scale=None,
 ) -> tuple[torch.Tensor, ...]:
     KM = zl.shape[1]
     km1 = KM - 1
@@ -397,6 +418,8 @@ def _mixing_length_seed_block(
         background_cap,
         zvfun,
         surface_cap,
+        xkzm_h_scale,
+        xkzm_m_scale,
     )
     # Each (column, start level) parcel is independent, so all starts run in one
     # call; the per-element arithmetic and level order are unchanged.
@@ -418,6 +441,8 @@ def _mixing_length_seed_block(
         rlmnz,
         starts,
         parcel_coefficients,
+        rlmx_scale,
+        elmx_scale,
     )
     elm, ele, elmh = run_compile_island(
         "k_mixing_length",
@@ -426,6 +451,7 @@ def _mixing_length_seed_block(
         zi,
         zl,
         zol,
+        run_compile_island("k_mixing_length", "unstable_root", _unstable_root, zol, caps_coefficients[1]),
         hpbl,
         gdx,
         rbsoil,
@@ -474,8 +500,6 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     require_float64("tke", tke, (IM, KM))
     dtype = q1.dtype
     device = q1.device
-    km1 = KM - 1
-    kmpbl = KM // 2
     qmin = torch.full((), source_real(1e-8, state.config), dtype=dtype, device=device)
     tte_edmf = bool(state.config.get("tte_edmf", False))
     tc_pbl = bool(state.config.get("tc_pbl", False))
@@ -541,6 +565,7 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
         source_real(0.3, state.config),
         tuple(source_real(v, state.config) for v in (0.001, 0.4)),
         tuple(source_real(v, state.config) for v in (0.4, 0.2, 3.7, 2.7)),
+        *(state.fields.get(n) for n in ("xkzm_h_scale", "xkzm_m_scale", "rlmx_scale", "elmx_scale")),
     )
     return state.with_updates(
         {
@@ -562,5 +587,3 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     )
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

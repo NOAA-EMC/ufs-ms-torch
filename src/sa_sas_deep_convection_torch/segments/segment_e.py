@@ -8,21 +8,9 @@ from __future__ import annotations
 import torch
 
 from sa_sas_deep_convection_torch.compile import run_compile_island
-from sa_sas_deep_convection_torch.constants import KM
 from sa_sas_deep_convection_torch.segments.segment_d import _gather_column
 from ufs_physics_common.ordered_sum import masked_sum
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
-
-CHECKPOINT_FIELDS = (
-    "pdot",
-    "cina",
-    "rhbar",
-    "kbcon",
-    "kbcon1",
-    "cnvflg",
-    "return_stage",
-    "boundary_reached",
-)
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -88,6 +76,8 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
         bool(state.config.get("do_ca", False)),
         bool(state.config.get("ca_trigger", False)),
         float(state.config.get("nthresh", 0.0)),
+        state.require("cinpcr_scale") if "cinpcr_scale" in state.fields else None,
+        state.require("rhcrt_scale") if "rhcrt_scale" in state.fields else None,
     )
 
     return state.with_updates(
@@ -131,6 +121,8 @@ def _trigger_filters_block(
     do_ca: bool,
     ca_trigger: bool,
     nthresh: float,
+    cinpcr_scale: torch.Tensor | None = None,
+    rhcrt_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     KM = zo.shape[1]
     active = cnvflg != 0.0
@@ -148,7 +140,12 @@ def _trigger_filters_block(
     tem = torch.where(pdot <= w4, tem_low, torch.where(pdot >= -w4, tem_high, torch.zeros_like(pdot)))
     tem = torch.clamp(tem, -1.0, 1.0)
     ptem = 1.0 - tem
-    cinpcr = 180.0 - ptem * (0.5 * (180.0 - 120.0))
+    # samf.cinpcr_deep scales cinpcrmx and cinpcrmn together; the source expression order is kept. The scales enter
+    # this region as 1-element views (ufs_mpas_ccpp.parameters.region_views) and act as 0-d tensors.
+    if cinpcr_scale is not None:
+        cinpcr_scale = cinpcr_scale.reshape(())
+    cinpcrmx, cinpcrmn = (180.0, 120.0) if cinpcr_scale is None else (180.0 * cinpcr_scale, 120.0 * cinpcr_scale)
+    cinpcr = cinpcrmx - ptem * (0.5 * (cinpcrmx - cinpcrmn))
     tem1 = _gather_column(pfld, kb) - _gather_column(pfld, kbcon)
     cin_reject = active & (tem1 > cinpcr) & (_gather_column(zi, kbcon) > hpbl)
     cnvflg = torch.where(cin_reject, torch.zeros_like(cnvflg), cnvflg)
@@ -197,7 +194,8 @@ def _trigger_filters_block(
     rhbar = masked_sum(rhbar, lfc_layer, rh_terms)
     sumx = masked_sum(sumx, lfc_layer, dz_all)
     rhbar = torch.where(active, rhbar / torch.where(active, sumx, torch.ones_like(sumx)), rhbar)
-    cnvflg = torch.where(active & (rhbar < 0.75), torch.zeros_like(cnvflg), cnvflg)
+    rhcrt = 0.75 if rhcrt_scale is None else 0.75 * rhcrt_scale.reshape(())  # samf.rhcrt_deep
+    cnvflg = torch.where(active & (rhbar < rhcrt), torch.zeros_like(cnvflg), cnvflg)
 
     if do_ca and ca_trigger:
         cnvflg = torch.where(batch_continues & (ca_deep > nthresh), torch.ones_like(cnvflg), cnvflg)
@@ -205,5 +203,3 @@ def _trigger_filters_block(
     return pdot, cnvflg, kb, hmax, kbcon, rhbar, sumx
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

@@ -11,7 +11,6 @@ This is the innermost loop of split-explicit time integration.
 Subroutine: atm_advance_acoustic_step_work
 """
 
-import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -19,13 +18,9 @@ from typing import Any, cast
 
 import torch
 
-from mpas_pytorch.autodiff.tridiagonal_scan import (
-    canonical_tridiag_scan_shape_keys,
-    normalize_tridiag_scan_policy,
-    tridiag_scan_policy,
-)
 from mpas_pytorch.autodiff.tridiagonal_solve import tridiagonal_solve
 from mpas_pytorch.constants import DTYPE, GRAVITY  # noqa: F401
+from mpas_pytorch.dynamics.divergence_damping import _divergence_damping_region
 from mpas_pytorch.dynamics.static_payloads import (
     StaticPairRelation,
     StaticRange,
@@ -53,7 +48,6 @@ from mpas_pytorch.dynamics.stencil_ops import (
 )
 from mpas_pytorch.utils.checks import require_consistent_device
 
-_MPAS_NO_INPLACE = os.environ.get("MPAS_NO_INPLACE", "0") == "1"
 
 _ACOUSTIC_STEP_REGION_COMPILE_TARGETS = frozenset(
     {
@@ -576,24 +570,6 @@ def _sum_acoustic_cell_flux_slots(
     )
 
 
-def _sum_acoustic_cell_flux_region(
-    *,
-    dts: float,
-    ru_p: torch.Tensor,
-    theta_m: torch.Tensor,
-    cell_edge_relation: StaticSlotRelation,
-    edge_cell_relation: StaticPairRelation,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Accumulate with one ordered implementation for eager, compile, and AD."""
-    return _sum_acoustic_cell_flux_slots(
-        dts=dts,
-        ru_p=ru_p,
-        theta_m=theta_m,
-        cell_edge_relation=cell_edge_relation,
-        edge_cell_relation=edge_cell_relation,
-    )
-
-
 def _acoustic_step_horizontal_momentum_update(
     *,
     small_step: int,
@@ -613,8 +589,36 @@ def _acoustic_step_horizontal_momentum_update(
     c2: float,
     gravity: float,
     spec_zone_mask_edge_all_zero: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute the acoustic-step pressure-gradient ru_p/ruAvg edge patch in one region."""
+    pending_damping: Mapping[str, Any] | None = None,
+    damping_rows: int | None = None,
+    ru_avg_deferred: bool = False,
+    ru_avg_from_first_step: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Compute the acoustic-step pressure-gradient ru_p/ruAvg edge patch in one region.
+
+    Runner schedule forms outside autograd (see ``atm_advance_acoustic_step_work``):
+
+    ``pending_damping`` holds the previous substep's divergence-damping arguments
+    (``divergence_damping._divergence_damping_region`` without ``ru_p_edges`` and ``rtheta_pp``,
+    which are this update's ``ru_p_edge`` and ``rtheta_pp``). The sum ``ru_p_edge + damp`` that the
+    damping would have stored into ``ru_p`` is formed here, before the update reads ``ru_p_edge``:
+    the same expressions on the same values, without a separate pass over ``ru_p``. With
+    ``damping_rows`` the rows from ``damping_rows`` on (the pad row), which the damping never
+    writes, keep ``ru_p_edge``.
+
+    ``ru_avg_deferred`` (small_step 1): ruAvg is not formed (None is returned for it). The next
+    substep passes ``ru_avg_from_first_step``: ``ru_avg_edge`` is then the small_step 1 base, and
+    the small_step 1 rows ``where(valid, dts * tend_ru, base)`` are formed again from the
+    ``tend_ru_edge`` the update reads anyway, instead of being written and read back.
+    """
+    if pending_damping is not None:
+        damped = _divergence_damping_region(
+            ru_p_edges=ru_p_edge, rtheta_pp=rtheta_pp, **pending_damping
+        )
+        if damping_rows is not None:
+            row = torch.arange(ru_p_edge.shape[0], device=ru_p_edge.device)[:, None]
+            damped = torch.where(row < damping_rows, damped, ru_p_edge)
+        ru_p_edge = damped
     edge_valid_2d = edge_cell_relation.valid_2d
     if edge_valid_2d is None:
         edge_valid = edge_cell_relation.valid
@@ -660,8 +664,13 @@ def _acoustic_step_horizontal_momentum_update(
         else:
             ru_p_patch = torch.where(edge_valid_2d, ru_p_init, ru_p_edge)
             ru_avg_patch = torch.where(edge_valid_2d, ru_p_patch, ru_avg_edge)
-        return ru_p_patch, ru_avg_patch
+        return ru_p_patch, None if ru_avg_deferred else ru_avg_patch
 
+    if ru_avg_from_first_step:
+        ru_avg_init = dts * tend_ru_edge
+        if not edge_valid_all:
+            ru_avg_init = torch.where(edge_valid_2d, ru_avg_init, ru_avg_edge)
+        ru_avg_edge = ru_avg_init
     ru_avg_updated = ru_avg_edge + ru_p_patch
     if edge_valid_all:
         ru_avg_patch = ru_avg_updated
@@ -686,14 +695,51 @@ def _acoustic_step_replace_interior_rows(
     return _replace_all_rows_cols(out, 1, n_vert_levels, values)
 
 
-def _acoustic_step_zero_row_patch_like(
-    field: torch.Tensor, row_start: int, row_end: int
+def _use_acoustic_step_full_width_levels(
+    nVertLevels: int, level_fields: tuple[torch.Tensor, ...]
+) -> bool:
+    """Whether the column solve forms its interior w levels over all nVertLevels + 1 levels.
+
+    Compiled inference only. The interior values computed on nVertLevels - 1 levels and
+    concatenated with the two boundary levels are stored and copied by Inductor (the producer and
+    the concatenation iterate different level counts); computed over every w level, with the
+    boundary levels selected from the rows, the producer writes the rows directly.
+    """
+    return (
+        nVertLevels > 1
+        and _compile_active()
+        and not torch.is_grad_enabled()
+        and all(x.ndim == 2 and x.shape[1] in (nVertLevels, nVertLevels + 1) for x in level_fields)
+    )
+
+
+def _acoustic_step_level_operands(
+    nVertLevels: int, full_width: bool
+) -> tuple[Callable[[torch.Tensor], torch.Tensor], Callable[[torch.Tensor], torch.Tensor]]:
+    """Operands of a level-indexed field (column k is level k) at the interior w levels
+    k = 1..nVertLevels-1: (level k, level k-1). Each is a slice of nVertLevels - 1 levels, or
+    (``full_width``) a field of nVertLevels + 1 levels whose boundary levels hold the field's
+    own values or zero padding, which ``_acoustic_step_select_interior_levels`` discards.
+    Interior elements are the same values."""
+    n = nVertLevels
+    if full_width:
+        pad = torch.nn.functional.pad
+        return (
+            lambda x: x if x.shape[-1] == n + 1 else pad(x[..., :n], (0, 1)),
+            lambda x: pad(x[..., :n], (1, 0)),
+        )
+    return (lambda x: x[..., 1:n], lambda x: x[..., : n - 1])
+
+
+def _acoustic_step_select_interior_levels(
+    values: torch.Tensor, rows: torch.Tensor, nVertLevels: int
 ) -> torch.Tensor:
-    """Allocate a zero row patch without reading the source rows."""
-    return field.new_zeros((row_end - row_start, *field.shape[1:]))
+    """``rows`` with its interior w levels 1..nVertLevels-1 taken from full-width ``values``."""
+    level = torch.arange(rows.shape[1], device=rows.device)
+    return torch.where(((level >= 1) & (level < nVertLevels))[None, :], values, rows)
 
 
-def _acoustic_step_assemble_active_system(
+def _acoustic_step_assemble_active_system_interior(
     *,
     nVertLevels: int,
     dts: float,
@@ -716,8 +762,13 @@ def _acoustic_step_assemble_active_system(
     cofwt_active: torch.Tensor,
     zz_active: torch.Tensor,
     full_solve_compile_path: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Assemble the active acoustic-step factorized-system RHS without solving it."""
+    full_width_levels: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Assemble the active acoustic-step factorized-system RHS without solving it: rs, ts, the rw
+    rows with their interior levels replaced, and ww's interior levels as computed (None with one
+    level), not written into ww rows: the solve adds its post-solve term to them and writes the ww
+    rows once. With ``full_width_levels``
+    (``_use_acoustic_step_full_width_levels``) ww's interior values come over all w levels."""
     rs_active = (
         rho_pp_active
         + dts * tend_rho_active
@@ -737,57 +788,45 @@ def _acoustic_step_assemble_active_system(
     )
     rw_rows = rw_p_active
     ww_rows = ww_avg_active
+    ww_active = None
     if nVertLevels > 1:
-        ww_active = (
-            ww_rows[:, 1:nVertLevels] + 0.5 * (1.0 - epssm) * rw_rows[:, 1:nVertLevels]
-        )
+        at_k, at_km1 = _acoustic_step_level_operands(nVertLevels, full_width_levels)
+        ww_active = at_k(ww_rows) + 0.5 * (1.0 - epssm) * at_k(rw_rows)
         rw_active = (
-            rw_rows[:, 1:nVertLevels]
-            + dts * tend_rw_active[:, 1:nVertLevels]
-            - cofwz_active[:, 1:nVertLevels]
+            at_k(rw_rows)
+            + dts * at_k(tend_rw_active)
+            - at_k(cofwz_active)
             * (
                 (
-                    zz_active[:, 1:nVertLevels] * ts_active[:, 1:nVertLevels]
-                    - zz_active[:, : nVertLevels - 1] * ts_active[:, : nVertLevels - 1]
+                    at_k(zz_active) * at_k(ts_active)
+                    - at_km1(zz_active) * at_km1(ts_active)
                 )
                 + resm
                 * (
-                    zz_active[:, 1:nVertLevels] * rtheta_pp_active[:, 1:nVertLevels]
-                    - zz_active[:, : nVertLevels - 1]
-                    * rtheta_pp_active[:, : nVertLevels - 1]
+                    at_k(zz_active) * at_k(rtheta_pp_active)
+                    - at_km1(zz_active) * at_km1(rtheta_pp_active)
                 )
             )
-            - cofwr_active[:, 1:nVertLevels]
+            - at_k(cofwr_active)
             * (
-                (rs_active[:, 1:nVertLevels] + rs_active[:, : nVertLevels - 1])
-                + resm
-                * (
-                    rho_pp_active[:, 1:nVertLevels]
-                    + rho_pp_active[:, : nVertLevels - 1]
-                )
+                (at_k(rs_active) + at_km1(rs_active))
+                + resm * (at_k(rho_pp_active) + at_km1(rho_pp_active))
             )
-            + cofwt_active[:, 1:nVertLevels]
-            * (ts_active[:, 1:nVertLevels] + resm * rtheta_pp_active[:, 1:nVertLevels])
-            + cofwt_active[:, : nVertLevels - 1]
-            * (
-                ts_active[:, : nVertLevels - 1]
-                + resm * rtheta_pp_active[:, : nVertLevels - 1]
+            + at_k(cofwt_active) * (at_k(ts_active) + resm * at_k(rtheta_pp_active))
+            + at_km1(cofwt_active)
+            * (at_km1(ts_active) + resm * at_km1(rtheta_pp_active))
+        )
+        if full_width_levels:
+            rw_rows = _acoustic_step_select_interior_levels(rw_active, rw_rows, nVertLevels)
+        else:
+            reuse_owned_rows = not full_solve_compile_path
+            rw_rows = _acoustic_step_replace_interior_rows(
+                rw_rows,
+                rw_active,
+                nVertLevels,
+                reuse_rows=reuse_owned_rows,
             )
-        )
-        reuse_owned_rows = not full_solve_compile_path
-        ww_rows = _acoustic_step_replace_interior_rows(
-            ww_rows,
-            ww_active,
-            nVertLevels,
-            reuse_rows=reuse_owned_rows,
-        )
-        rw_rows = _acoustic_step_replace_interior_rows(
-            rw_rows,
-            rw_active,
-            nVertLevels,
-            reuse_rows=reuse_owned_rows,
-        )
-    return rs_active, ts_active, rw_rows, ww_rows
+    return rs_active, ts_active, rw_rows, ww_active
 
 
 def _acoustic_step_acoustic_solve_region(
@@ -826,7 +865,15 @@ def _acoustic_step_acoustic_solve_region(
     solve_active_mask: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the acoustic-step active-row acoustic solve around the policy-selected tridiagonal solve."""
-    rs_active, ts_active, rw_rows, ww_rows = _acoustic_step_assemble_active_system(
+    full_width = _use_acoustic_step_full_width_levels(
+        nVertLevels,
+        (
+            rw_p_active, ww_avg_active, tend_rw_active, cofwz_active, cofwr_active,
+            cofwt_active, rw_save_active, rw_base_active, dss_active, w_active,
+            rs_flux, ts_flux, rho_pp_active, rtheta_pp_active, zz_active, rho_zz_active,
+        ),
+    )
+    rs_active, ts_active, rw_rows, ww_active = _acoustic_step_assemble_active_system_interior(
         nVertLevels=nVertLevels,
         dts=dts,
         resm=resm,
@@ -848,6 +895,7 @@ def _acoustic_step_acoustic_solve_region(
         cofwt_active=cofwt_active,
         zz_active=zz_active,
         full_solve_compile_path=full_solve_compile_path,
+        full_width_levels=full_width,
     )
 
     # Default execution keeps Thomas k-ordering. Scan recurrences are opt-in until
@@ -857,38 +905,48 @@ def _acoustic_step_acoustic_solve_region(
     )
 
     if nVertLevels > 1:
+        at_k, at_km1 = _acoustic_step_level_operands(nVertLevels, full_width)
         zz_interp = (
-            fzm[1:nVertLevels][None, :] * zz_active[:, 1:nVertLevels]
-            + fzp[1:nVertLevels][None, :] * zz_active[:, : nVertLevels - 1]
+            at_k(fzm)[None, :] * at_k(zz_active)
+            + at_k(fzp)[None, :] * at_km1(zz_active)
         )
         rho_zz_interp = (
-            fzm[1:nVertLevels][None, :] * rho_zz_active[:, 1:nVertLevels]
-            + fzp[1:nVertLevels][None, :] * rho_zz_active[:, : nVertLevels - 1]
+            at_k(fzm)[None, :] * at_k(rho_zz_active)
+            + at_k(fzp)[None, :] * at_km1(rho_zz_active)
         )
-        rw_delta = rw_save_active[:, 1:nVertLevels] - rw_base_active[:, 1:nVertLevels]
+        rw_delta = at_k(rw_save_active) - at_k(rw_base_active)
         rw_rayleigh = (
-            rw_rows[:, 1:nVertLevels]
+            at_k(rw_rows)
             + rw_delta
             - dts
-            * dss_active[:, 1:nVertLevels]
+            * at_k(dss_active)
             * zz_interp
             * rho_zz_interp
-            * w_active[:, 1:nVertLevels]
-        ) / (1.0 + dts * dss_active[:, 1:nVertLevels]) - rw_delta
-        ww_post = ww_rows[:, 1:nVertLevels] + 0.5 * (1.0 + epssm) * rw_rayleigh
-        reuse_owned_rows = not full_solve_compile_path
-        rw_rows = _acoustic_step_replace_interior_rows(
-            rw_rows,
-            rw_rayleigh,
-            nVertLevels,
-            reuse_rows=reuse_owned_rows,
-        )
-        ww_rows = _acoustic_step_replace_interior_rows(
-            ww_rows,
-            ww_post,
-            nVertLevels,
-            reuse_rows=reuse_owned_rows,
-        )
+            * at_k(w_active)
+        ) / (1.0 + dts * at_k(dss_active)) - rw_delta
+        # ww's interior levels before the solve plus the post-solve term, written once.
+        ww_post = ww_active + 0.5 * (1.0 + epssm) * rw_rayleigh
+        if full_width:
+            rw_rows = _acoustic_step_select_interior_levels(rw_rayleigh, rw_rows, nVertLevels)
+            ww_rows = _acoustic_step_select_interior_levels(
+                ww_post, ww_avg_active, nVertLevels
+            )
+        else:
+            reuse_owned_rows = not full_solve_compile_path
+            rw_rows = _acoustic_step_replace_interior_rows(
+                rw_rows,
+                rw_rayleigh,
+                nVertLevels,
+                reuse_rows=reuse_owned_rows,
+            )
+            ww_rows = _acoustic_step_replace_interior_rows(
+                ww_avg_active,
+                ww_post,
+                nVertLevels,
+                reuse_rows=reuse_owned_rows,
+            )
+    else:
+        ww_rows = ww_avg_active
 
     rho_patch = rs_active - cofrz[None, :] * (rw_rows[:, 1:] - rw_rows[:, :nVertLevels])
     rtheta_patch = ts_active - rdzw[None, :] * (
@@ -1114,6 +1172,62 @@ def _acoustic_step_plan_tensor_fingerprint(tensor: torch.Tensor) -> tuple[object
     )
 
 
+def _momentum_arguments_through_pad_row(
+    ru_p_base: torch.Tensor, ru_avg_base: torch.Tensor, update_arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Momentum-update arguments extended by the pad row, which the update leaves at its base value.
+
+    Compiled inference keeps this form because the momentum kernels then write the public edge
+    rows directly, without a stored edge patch copied below the pad row.
+
+    The pad row's validity is False, so each output takes the base row there (``torch.where``
+    selects, it does not compute). Its gathers read cell 0 (index 0, gather valid), and the
+    zero-padded edge inputs keep its discarded update finite: no NaN reaches a VJP through it.
+    Rows [0, nEdges) see the same values and expressions; with all edges valid the update's
+    ``where`` selects the computed row, the same value it returns unmasked.
+
+    A pending divergence damping gets its edge topology extended by a pad row that damps nothing
+    (cell 0, inactive, zero scale), and ``damping_rows`` keeps the pad row's base value.
+    """
+    relation = update_arguments["edge_cell_relation"]
+    edges = relation.first.shape[0]
+    patch_valid = relation.valid_2d
+    if patch_valid is None:
+        patch_valid = (
+            relation.valid[:, None]
+            if relation.valid is not None
+            else torch.ones((edges, 1), dtype=torch.bool, device=relation.first.device)
+        )
+    if relation.valid_all:
+        patch_valid = torch.ones_like(patch_valid)
+    gather_valid = None
+    if relation.valid is not None and not relation.valid_all:
+        gather_valid = torch.nn.functional.pad(relation.valid, (0, 1), value=True)
+    padded = dict(update_arguments)
+    padded["edge_cell_relation"] = StaticPairRelation(
+        f"{relation.name}.pad_row",
+        first=torch.nn.functional.pad(relation.first, (0, 1)),
+        second=torch.nn.functional.pad(relation.second, (0, 1)),
+        valid=gather_valid,
+        valid_2d=torch.nn.functional.pad(patch_valid, (0, 0, 0, 1), value=False),
+        valid_all=False,
+    )
+    padded["ru_p_edge"] = ru_p_base
+    padded["ru_avg_edge"] = ru_avg_base
+    damping = update_arguments.get("pending_damping")
+    if damping is not None:
+        damping = dict(damping)
+        for name, value in (("cell1", 0), ("cell2", 0), ("active_edge", False), ("edge_scale", 0.0)):
+            damping[name] = torch.nn.functional.pad(damping[name], (0, 1), value=value)
+        padded["pending_damping"] = damping
+        padded["damping_rows"] = edges
+    for name in ("tend_ru_edge", "cqu_edge", "zxu_edge"):
+        padded[name] = torch.nn.functional.pad(update_arguments[name], (0, 0, 0, 1))
+    for name in ("inv_dc_edge", "spec_zone_mask_edge"):
+        padded[name] = torch.nn.functional.pad(update_arguments[name], (0, 1))
+    return padded
+
+
 def _acoustic_step_horizontal_momentum_pack_numeric(
     *,
     edge_start: int,
@@ -1121,19 +1235,39 @@ def _acoustic_step_horizontal_momentum_pack_numeric(
     ru_p_base: torch.Tensor,
     ru_avg_base: torch.Tensor,
     **update_arguments: Any,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Horizontal momentum update followed by its edge-row writes, as one region.
 
     The writes move values only, so compiling both together writes ru_p and
     ruAvg once instead of writing a patch and copying it. Preserve the inputs
     in eager fallbacks too: the split accumulators can share these seeds.
+    ``ru_p_edge``/``ru_avg_edge`` are the rows [edge_start, edge_end) of the bases.
+    ruAvg is None with ``ru_avg_deferred``.
     """
+    if (
+        _compile_active()
+        and not torch.is_grad_enabled()
+        and edge_start == 0
+        and edge_end + 1 == ru_p_base.shape[0] == ru_avg_base.shape[0]
+    ):
+        # Inference only (derivative calls keep the patch form). All edges plus the one pad row:
+        # the update iterates the output rows, with the pad row
+        # masked to its base value, so Inductor writes both outputs in the kernel that computes
+        # them. A patch of nEdges rows concatenated with the pad row realizes the updated ru_p
+        # (too many reads to inline) and copies it in a second kernel of nEdges + 1 rows.
+        return _acoustic_step_horizontal_momentum_update(
+            **_momentum_arguments_through_pad_row(ru_p_base, ru_avg_base, update_arguments)
+        )
     ru_p_patch, ru_avg_patch = _acoustic_step_horizontal_momentum_update(
         **update_arguments
     )
     return (
         _replace_row_slice(ru_p_base, edge_start, edge_end, ru_p_patch, preserve_base=True),
-        _replace_row_slice(ru_avg_base, edge_start, edge_end, ru_avg_patch, preserve_base=True),
+        None
+        if ru_avg_patch is None
+        else _replace_row_slice(
+            ru_avg_base, edge_start, edge_end, ru_avg_patch, preserve_base=True
+        ),
     )
 
 
@@ -1165,6 +1299,26 @@ _ACOUSTIC_STEP_FIRST_STEP_ZEROED_ACTIVE_NAMES = (
 )
 
 
+def _solve_arguments_through_pad_row(solve_arguments: dict[str, Any]) -> dict[str, Any]:
+    """Acoustic-solve arguments extended by the pad row: each active field, the cell-edge slot
+    topology and the active mask get one zero (index 0, invalid, zero weight) row.
+
+    The pad row's solve reads zeros (its slot gathers read edge and cell 0 with zero weight) and
+    the pack replaces it by the base row (``torch.where`` selects, it does not compute). Rows
+    [0, nCells) see the same values and expressions.
+    """
+    pad = torch.nn.functional.pad
+    padded = dict(solve_arguments)
+    for name, value in solve_arguments.items():
+        if isinstance(value, torch.Tensor) and (
+            name.endswith("_active")
+            or name in ("edge_indices", "edge_valid", "edge_flux_weight", "active_inv_area",
+                        "edge_cell_pair", "solve_active_mask")
+        ):
+            padded[name] = pad(value, (0, 0) * (value.ndim - 1) + (0, 1))
+    return padded
+
+
 def _acoustic_step_acoustic_flux_solve_pack_numeric(
     *,
     row_start: int,
@@ -1192,6 +1346,25 @@ def _acoustic_step_acoustic_flux_solve_pack_numeric(
     if first_step is not None:
         for name in _ACOUSTIC_STEP_FIRST_STEP_ZEROED_ACTIVE_NAMES:
             solve_arguments[name] = torch.where(first_step, 0.0, solve_arguments[name])
+    bases = (rw_p_base, ww_avg_base, rho_pp_base, rtheta_pp_base)
+    if (
+        _compile_active()
+        and not torch.is_grad_enabled()
+        and row_start == 0
+        and all(row_end + 1 == base.shape[0] for base in bases)
+    ):
+        # Inference only. All cells plus the pad row: the solve iterates the output rows, the pad
+        # row taken from each base, so Inductor writes the four outputs in the kernels that compute
+        # them. With nCells rows the post-solve values are stored and concatenated with the pad row.
+        outputs = _acoustic_step_acoustic_flux_solve_numeric(
+            **_solve_arguments_through_pad_row(solve_arguments)
+        )
+        row = torch.arange(row_end + 1, device=rw_p_base.device)[:, None]
+        pad = torch.nn.functional.pad
+        return tuple(
+            torch.where(row < row_end, value, pad(base[row_end:], (0, 0, row_end, 0)))
+            for value, base in zip(outputs, bases, strict=True)
+        )
     rw_rows, ww_rows, rho_patch, rtheta_patch = (
         _acoustic_step_acoustic_flux_solve_numeric(**solve_arguments)
     )
@@ -1585,8 +1758,6 @@ def atm_advance_acoustic_step_work(
     _compile_backend: str = "inductor",
     _connectivity_payload: dict[str, Any] | None = None,
     _acoustic_solve_plan: AcousticSolvePlan | None = None,
-    _tridiag_scan_policy: str | None = None,
-    _tridiag_scan_allowed_shapes: tuple[str, ...] | list[str] | str | None = None,
     _vertical_implicit_coefficients_active_cell_start: int | None = None,
     _vertical_implicit_coefficients_active_cell_end: int | None = None,
     _vertical_implicit_coefficients_cofwt_active: torch.Tensor | None = None,
@@ -1598,6 +1769,9 @@ def atm_advance_acoustic_step_work(
     _vertical_implicit_coefficients_gamma_tri_active: torch.Tensor | None = None,
     _rtheta_pp_old_damping_only: bool = False,
     _preserve_average_inputs: bool = False,
+    _pending_divergence_damping: Mapping[str, Any] | None = None,
+    _ru_avg_deferred: bool = False,
+    _ru_avg_from_first_step: bool = False,
     gravity: float = GRAVITY,
 ) -> dict:
     """
@@ -1615,7 +1789,17 @@ def atm_advance_acoustic_step_work(
 
     ``_preserve_average_inputs`` (runner use): the ``ruAvg`` and ``wwAvg``
     inputs are shared (split-transport accumulators) and must not be written
-    in place; the returned averages are then new tensors.
+    in place; the returned averages are then new tensors. After small_step 1
+    only ruAvg can still be the shared input (``_ru_avg_from_first_step``).
+
+    Runner schedule forms (no autograd, full edge range):
+    ``_pending_divergence_damping`` applies the previous substep's divergence
+    damping inside this substep's momentum update (see
+    ``_acoustic_step_horizontal_momentum_update``); the caller then skips that
+    damping call. ``_ru_avg_deferred`` (small_step 1 of two or more) leaves
+    ruAvg unwritten (the input is returned), and the next substep, called with
+    ``_ru_avg_from_first_step``, forms the small_step 1 ruAvg rows again from
+    ``tend_ru``.
 
     This is the core acoustic substep solver implementing forward-backward
     time integration of the acoustic (fast) modes. The algorithm follows
@@ -1853,10 +2037,6 @@ def atm_advance_acoustic_step_work(
     compile_region_names = (
         frozenset(_compile_region_names or ()) & _ACOUSTIC_STEP_REGION_COMPILE_TARGETS
     )
-    tridiag_policy_key = normalize_tridiag_scan_policy(_tridiag_scan_policy)
-    tridiag_allowed_shape_key = tuple(
-        sorted(canonical_tridiag_scan_shape_keys(_tridiag_scan_allowed_shapes))
-    )
 
     def _maybe_compile_acoustic_step_region(fn_name: str, fn, specialization_key=None):
         if fn_name not in compile_region_names:
@@ -1878,6 +2058,13 @@ def atm_advance_acoustic_step_work(
 
     # =========================================================================
 
+    if (_pending_divergence_damping is not None or _ru_avg_deferred or _ru_avg_from_first_step) and (
+        torch.is_grad_enabled() or edge_start != 0 or edge_end != nEdges
+    ):
+        raise ValueError(
+            "the deferred damping and ruAvg forms require no autograd and the full edge range "
+            f"(edges {edge_start}:{edge_end} of {nEdges})"
+        )
     momentum_specialization_key = (
         "small_step",
         small_step,
@@ -1887,6 +2074,12 @@ def atm_advance_acoustic_step_work(
         edge_end - edge_start,
         "edge_valid_all",
         edge_valid_all,
+        "pending_damping",
+        None
+        if _pending_divergence_damping is None
+        else _pending_divergence_damping.get("rtheta_pp_old") is None,
+        "ru_avg",
+        (bool(_ru_avg_deferred), bool(_ru_avg_from_first_step)),
     )
     update_arguments = {
         "small_step": small_step,
@@ -1916,6 +2109,12 @@ def atm_advance_acoustic_step_work(
         "c2": c2,
         "gravity": gravity,
     }
+    if _pending_divergence_damping is not None:
+        update_arguments["pending_damping"] = _pending_divergence_damping
+    if _ru_avg_deferred:
+        update_arguments["ru_avg_deferred"] = True
+    if _ru_avg_from_first_step:
+        update_arguments["ru_avg_from_first_step"] = True
     if "acoustic_step_horizontal_momentum_pack_region" in compile_region_names:
         # Same update, with the edge-row writes inside the compiled region.
         horizontal_momentum_pack = _maybe_compile_acoustic_step_region(
@@ -1923,13 +2122,15 @@ def atm_advance_acoustic_step_work(
             _acoustic_step_horizontal_momentum_pack_numeric,
             specialization_key=momentum_specialization_key,
         )
-        ru_p_out, ruAvg_out = horizontal_momentum_pack(
+        ru_p_out, ru_avg_packed = horizontal_momentum_pack(
             edge_start=edge_start,
             edge_end=edge_end,
             ru_p_base=ru_p_out,
             ru_avg_base=ruAvg_out,
             **update_arguments,
         )
+        if ru_avg_packed is not None:
+            ruAvg_out = ru_avg_packed
     else:
         horizontal_momentum_update = _maybe_compile_acoustic_step_region(
             "acoustic_step_horizontal_momentum_update",
@@ -1938,9 +2139,10 @@ def atm_advance_acoustic_step_work(
         )
         ru_p_patch, ru_avg_patch = horizontal_momentum_update(**update_arguments)
         ru_p_out = _replace_row_slice(ru_p_out, edge_start, edge_end, ru_p_patch)
-        if preserve_average_inputs:
-            ruAvg_out = ruAvg_out.clone()
-        ruAvg_out = _replace_row_slice(ruAvg_out, edge_start, edge_end, ru_avg_patch)
+        if ru_avg_patch is not None:
+            if preserve_average_inputs:
+                ruAvg_out = ruAvg_out.clone()
+            ruAvg_out = _replace_row_slice(ruAvg_out, edge_start, edge_end, ru_avg_patch)
 
     # =========================================================================
     # SECTION 2: Save rtheta_pp_old for divergence damping
@@ -2003,7 +2205,7 @@ def atm_advance_acoustic_step_work(
     # acoustic-step carries the acoustic solve scratch as active-row tensors below; the
     # workspace intentionally has no full-cell ts/rs buffers.
 
-    if preserve_average_inputs and not solve_pack_path:
+    if preserve_average_inputs and small_step == 1 and not solve_pack_path:
         # The zeroing and the row writes below are in place here.
         wwAvg_out = wwAvg_out.clone()
 
@@ -2028,10 +2230,6 @@ def atm_advance_acoustic_step_work(
                     active_cells.numel(),
                     "slot_count",
                     active_safe_edge_idx.shape[1],
-                    "tridiag_scan_policy",
-                    tridiag_policy_key,
-                    "tridiag_scan_shapes",
-                    tridiag_allowed_shape_key,
                 ),
             )
         rho_pp_active = _active_rows(rho_pp_out)
@@ -2133,66 +2331,62 @@ def atm_advance_acoustic_step_work(
             "dss_active": _active_rows(dss),
             "w_active": _active_rows(w),
         }
-        with tridiag_scan_policy(
-            tridiag_policy_key,
-            allowed_shapes=tridiag_allowed_shape_key,
-        ):
-            packed_rows = False
-            if solve_pack_path:
-                rw_p_out, wwAvg_out, rho_pp_out, rtheta_pp_out = (
-                    _acoustic_solve_plan.pack_callable(
-                        *_acoustic_solve_plan.dynamic_values(dynamic_solve_arguments),
-                        row_start=active_cell_slice.start,
-                        row_end=active_cell_slice.stop,
-                        rw_p_base=rw_p_out,
-                        ww_avg_base=wwAvg_out,
-                        rho_pp_base=rho_pp_out,
-                        rtheta_pp_base=rtheta_pp_out,
-                        first_step=_acoustic_solve_plan.step_flags[
-                            1 if small_step == 1 else 0
-                        ],
-                    )
+        packed_rows = False
+        if solve_pack_path:
+            rw_p_out, wwAvg_out, rho_pp_out, rtheta_pp_out = (
+                _acoustic_solve_plan.pack_callable(
+                    *_acoustic_solve_plan.dynamic_values(dynamic_solve_arguments),
+                    row_start=active_cell_slice.start,
+                    row_end=active_cell_slice.stop,
+                    rw_p_base=rw_p_out,
+                    ww_avg_base=wwAvg_out,
+                    rho_pp_base=rho_pp_out,
+                    rtheta_pp_base=rtheta_pp_out,
+                    first_step=_acoustic_solve_plan.step_flags[
+                        1 if small_step == 1 else 0
+                    ],
                 )
-                packed_rows = True
-            elif _acoustic_solve_plan is not None:
-                rw_rows, ww_rows, rho_patch, rtheta_patch = (
-                    _acoustic_solve_plan.numeric_callable(
-                        *_acoustic_solve_plan.dynamic_values(dynamic_solve_arguments)
-                    )
+            )
+            packed_rows = True
+        elif _acoustic_solve_plan is not None:
+            rw_rows, ww_rows, rho_patch, rtheta_patch = (
+                _acoustic_solve_plan.numeric_callable(
+                    *_acoustic_solve_plan.dynamic_values(dynamic_solve_arguments)
                 )
-            else:
-                if acoustic_flux_solve_region is None:
-                    raise RuntimeError(
-                        "acoustic-step acoustic solve callable was not initialized"
-                    )
-                rw_rows, ww_rows, rho_patch, rtheta_patch = acoustic_flux_solve_region(
-                    nVertLevels=nVertLevels,
-                    dts=dts,
-                    resm=resm,
-                    epssm=epssm,
-                    cell_edge_relation=active_cell_edge_relation
-                    if isinstance(active_cell_edge_relation, StaticSlotRelation)
-                    else StaticSlotRelation(
-                        "acoustic_step.active_cell_edges.runtime",
-                        indices=active_safe_edge_idx,
-                        valid=active_valid,
-                        sign=active_edge_sign,
-                        weights=active_flux_weight,
-                        valid_all_by_slot=active_valid_all_by_slot,
-                        valid_weight=active_inv_area,
-                    ),
-                    edge_cell_relation=active_edge_cell_relation
-                    if isinstance(active_edge_cell_relation, StaticPairRelation)
-                    else StaticPairRelation(
-                        "acoustic_step.active_edge_cells.runtime",
-                        first=active_c1,
-                        second=active_c2,
-                        valid=active_valid,
-                    ),
-                    full_solve_compile_path=full_solve_compile_path,
-                    solve_active_mask=solve_active_mask,
-                    **dynamic_solve_arguments,
+            )
+        else:
+            if acoustic_flux_solve_region is None:
+                raise RuntimeError(
+                    "acoustic-step acoustic solve callable was not initialized"
                 )
+            rw_rows, ww_rows, rho_patch, rtheta_patch = acoustic_flux_solve_region(
+                nVertLevels=nVertLevels,
+                dts=dts,
+                resm=resm,
+                epssm=epssm,
+                cell_edge_relation=active_cell_edge_relation
+                if isinstance(active_cell_edge_relation, StaticSlotRelation)
+                else StaticSlotRelation(
+                    "acoustic_step.active_cell_edges.runtime",
+                    indices=active_safe_edge_idx,
+                    valid=active_valid,
+                    sign=active_edge_sign,
+                    weights=active_flux_weight,
+                    valid_all_by_slot=active_valid_all_by_slot,
+                    valid_weight=active_inv_area,
+                ),
+                edge_cell_relation=active_edge_cell_relation
+                if isinstance(active_edge_cell_relation, StaticPairRelation)
+                else StaticPairRelation(
+                    "acoustic_step.active_edge_cells.runtime",
+                    first=active_c1,
+                    second=active_c2,
+                    valid=active_valid,
+                ),
+                full_solve_compile_path=full_solve_compile_path,
+                solve_active_mask=solve_active_mask,
+                **dynamic_solve_arguments,
+            )
         if packed_rows:
             pass
         elif active_cells_are_slice:
@@ -2237,37 +2431,3 @@ def atm_advance_acoustic_step_work(
     }
 
 
-def acoustic_step(
-    state: dict,
-    mesh: Any,
-    dt_acoustic: float | torch.Tensor,
-    nAcousticSteps: int,
-) -> dict:
-    """
-    Perform acoustic mode time steps.
-
-    Args:
-        state: State dictionary containing all prognostic variables
-        mesh: MPAS mesh state (MESHState object or dict of mesh tensors)
-        dt_acoustic: Acoustic timestep
-        nAcousticSteps: Number of acoustic substeps per large step
-
-    Returns:
-        Updated state dictionary
-    """
-    from mpas_pytorch.dynamics.time_integration import execute_rk_step
-
-    # Convert mesh to dict if it's a MESHState object
-    if hasattr(mesh, "__dict__"):
-        mesh_dict = dict(mesh.__dict__)
-    else:
-        mesh_dict = dict(mesh) if mesh is not None else {}
-    dts_value = float(dt_acoustic)
-
-    return execute_rk_step(
-        rk_step=1,
-        state_dict=state,
-        mesh_dict=mesh_dict,
-        config={"dts": dts_value},
-        nAcousticSteps=nAcousticSteps,
-    )

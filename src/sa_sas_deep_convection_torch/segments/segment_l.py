@@ -9,11 +9,8 @@ import torch
 
 from sa_sas_deep_convection_torch import recurrence_chunks as chunks
 
-from sa_sas_deep_convection_torch.compile import masked_sum_chunk_size, run_compile_island, run_recurrence_chunk, recurrence_chunk_size, ordered_chunks_enabled
-from sa_sas_deep_convection_torch.constants import KM, NTR
+from sa_sas_deep_convection_torch.compile import run_compile_island, run_recurrence_chunk, recurrence_chunk_size, ordered_chunks_enabled
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
-
-CHECKPOINT_FIELDS = ("hcdo", "qcdo", "ucdo", "vcdo", "ecdo", "edt", "edto", "cnvflg", "return_stage")
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -194,7 +191,6 @@ def _downdraft_recurrence_block(
     hwrf_samfdeep: bool,
 ) -> tuple[torch.Tensor, ...]:
     KM = zo.shape[1]
-    NTR = ctro.shape[2]
     active = cnvflg != 0.0
     pwevo = torch.where(active, torch.zeros_like(pwevo), pwevo)
     size = recurrence_chunk_size()
@@ -256,17 +252,13 @@ def _downdraft_recurrence_block(
     edto = torch.where(active, edto_candidate, edto)
 
     profile_rows = chunks.pack_profiles(zo, qeso, to, hcdo, heso, qo)
-    size = masked_sum_chunk_size()
+    size = recurrence_chunk_size()
     for stop in range(KM - 1, 0, -size):
         start = max(0, stop - size)
         aa1 = run_recurrence_chunk("l_ordered_chunks", "downdraft_work", chunks.downdraft_work,
             active, jmin, levels[start], profile_rows[start:stop + 1], edto, aa1, el2orc, grav, cp, fv, hvap)
     cnvflg = torch.where(active & (aa1 <= 0.0), torch.zeros_like(cnvflg), cnvflg)
     return hcdo, qcdo, qrcdo, ucdo, vcdo, ecdo, dbyo, pwdo, pwevo, edto, aa1, cnvflg
-
-
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}
 
 
 def _recurrence_coordinator(category, name, fn, *args):

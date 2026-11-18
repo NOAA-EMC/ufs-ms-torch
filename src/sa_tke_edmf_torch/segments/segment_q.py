@@ -7,11 +7,9 @@ from __future__ import annotations
 
 import torch
 
-from sa_tke_edmf_torch.constants import CP, IM, KM, NDTEND, NTRAC
+from sa_tke_edmf_torch.constants import CP
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
 from sa_tke_edmf_torch.diagnostics import diagnostic_slots, add_diagnostic_
-
-CHECKPOINT_FIELDS = ("rtg", "ten_t", "dtsfc", "dqsfc", "dtend")
 
 
 def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
@@ -33,7 +31,7 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     require_float64("diss", diss, (IM, KM - 1))
 
     if bool(state.config.get("dspheat", False)):
-        increment = diss / CP
+        increment = float(state.config["dspfac"]) * diss / CP
         ten_t[:, : KM - 1] = ten_t[:, : KM - 1] + increment
         if bool(state.config.get("ldiag3d", False)) and not bool(state.config.get("gen_tend", False)):
             padding = torch.cat((increment * delt[0], torch.zeros_like(ten_t[:, -1:])), dim=1)
@@ -42,5 +40,3 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     return state.with_updates({"ten_t": ten_t, "dtend": dtend})
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

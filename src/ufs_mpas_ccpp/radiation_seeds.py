@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from rrtmgp_radiation_torch.radiation_group import gfs_mersenne_twister_uniform
 
 from .clock import _nint_nonnegative
@@ -74,9 +75,9 @@ def _permutation_seeds(
         raise ValueError("invalid radiation seed time/offset dtype, shape or device")
     if type(ipsdlim) is not int or not 0 < ipsdlim <= torch.iinfo(torch.int32).max:
         raise ValueError("ipsdlim must be a positive source int32 limit")
-    torch._assert_async(torch.isfinite(sec).all(), "nonfinite radiation seed time")
+    torch_compat.assert_async(torch.isfinite(sec).all(), "nonfinite radiation seed time")
     value = 100.0 * torch.sqrt(torch.clamp_min(sec, 0.0))
-    torch._assert_async(
+    torch_compat.assert_async(
         (value < 2147483647.5).all(), "radiation seed NINT exceeds source int32"
     )
     rounded = _nint_nonnegative(value)
@@ -127,7 +128,7 @@ def radiation_seed_draws(
     seeds = _permutation_seeds(sec, ipsd0, ipsdlim=ipsdlim)
     if not lrseeds:
         # The CCPP fallback reads SEC only on active steps (``sec`` is 0 on the others).
-        torch._assert_async(
+        torch_compat.assert_async(
             (sec >= 0.0).all(), "negative active CCPP radiation seed time"
         )
         return _random_index_rows(seeds, imax=ipsdlim, count=2 * n).reshape(-1, n, 2)
@@ -139,7 +140,7 @@ def radiation_seed_draws(
     ):
         raise ValueError("invalid native radiation global cell IDs")
     ids = index_to_cell_id[:n].to(torch.int64)
-    torch._assert_async(
+    torch_compat.assert_async(
         ((ids >= 1) & (ids <= n_cells_global)).all(),
         "radiation global cell ID outside domain",
     )
@@ -164,7 +165,7 @@ class RadiationSeedStream:
     def select(self, sec: torch.Tensor) -> torch.Tensor:
         """The ``[n, 2]`` draws of the step at elapsed seconds ``sec`` (device-side row choice)."""
         hit = self.secs == sec.reshape(())
-        torch._assert_async(hit.any(), "radiation seed stream holds no row for this step's time")
+        torch_compat.assert_async(hit.any(), "radiation seed stream holds no row for this step's time")
         row = torch.argmax(hit.to(torch.int32)).reshape(1)
         return self.draws.index_select(0, row).reshape(self.draws.shape[1:])
 

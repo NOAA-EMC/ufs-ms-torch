@@ -11,7 +11,6 @@ in the split-explicit time integration scheme.
 Lines: 2427-2508
 """
 
-import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -427,6 +426,7 @@ def atm_set_smlstep_pert_variables_work(
     _compile_backend: str = "inductor",
     _numeric_plan: SmallStepPerturbationNumericPlan | None = None,
     _take_w_tend_ownership: bool = False,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> dict:
     """
     Set perturbation variables for acoustic substep.
@@ -582,12 +582,16 @@ def atm_set_smlstep_pert_variables_work(
                     else _numeric_plan.key
                 ),
             )
+        # zb3_cell carries config_coef_3rd_order; its scale (0-d tensor or None) multiplies the slice here.
+        zb3_cell_solve = zb3_cell[cell_start:cell_end, :active_slot_count, :]
+        if coef_3rd_scale is not None:
+            zb3_cell_solve = zb3_cell_solve * coef_3rd_scale
         dynamic_arguments = {
             "w_tend_cells": w_tend_out[cell_slice, :],
             "u_tend": u_tend,
             "zz_cells": zz[cell_slice, :],
             "zb_cell_solve": zb_cell[cell_start:cell_end, :active_slot_count, :],
-            "zb3_cell_solve": zb3_cell[cell_start:cell_end, :active_slot_count, :],
+            "zb3_cell_solve": zb3_cell_solve,
         }
         if store_in_place:
             numeric_callable(*_numeric_plan.dynamic_values(dynamic_arguments))
@@ -607,133 +611,3 @@ def atm_set_smlstep_pert_variables_work(
     return {"w_tend": w_tend_out}
 
 
-def smlstep_pert(
-    state: dict,
-    mesh: Any,
-    dt: torch.Tensor,
-    *,
-    nCells: int | None = None,
-    nEdges: int | None = None,
-    nVertLevels: int | None = None,
-    maxEdges: int | None = None,
-) -> dict:
-    """
-    Set perturbation variables for acoustic substep.
-
-    High-level wrapper that delegates to atm_set_smlstep_pert_variables_work.
-
-    Args:
-        state: State dictionary containing all prognostic variables
-        mesh: MPAS mesh state
-        dt: Small timestep (unused but kept for interface consistency)
-
-    Returns:
-        Updated state dictionary with modified w_tend
-    """
-    # Handle DycoreState vs dict input for state
-    if hasattr(state, "__dict__"):
-        state_dict = dict(state.__dict__)
-    else:
-        state_dict = dict(state)
-
-    # Handle MESHState vs dict input for mesh
-    if hasattr(mesh, "__dict__"):
-        mesh_dict = dict(mesh.__dict__)
-    else:
-        mesh_dict = dict(mesh)
-
-    device = require_consistent_device("smlstep_pert inputs", state_dict, mesh_dict)
-
-    def _coerce_int_param(value, name: str, default: int | None = None) -> int:
-        if value is None:
-            if default is None:
-                raise ValueError("Missing required scalar dimension")
-            return int(default)
-        if isinstance(value, torch.Tensor):
-            if value.numel() != 1:
-                raise ValueError(
-                    f"Expected scalar tensor, got shape {tuple(value.shape)}"
-                )
-            if value.device.type != "cpu":
-                raise ValueError(
-                    f"{name} must be provided as a Python int when tensor is on {value.device}. "
-                    "Pass explicit integer args from caller to avoid host synchronization."
-                )
-            return int(value)
-        return int(value)
-
-    # Extract dimensions (prefer Python int parameters from caller).
-    nCells = _coerce_int_param(
-        nCells if nCells is not None else state_dict.get("nCells"), "nCells"
-    )
-    nEdges = _coerce_int_param(
-        nEdges if nEdges is not None else state_dict.get("nEdges"),
-        "nEdges",
-        default=nCells * 3,
-    )
-    nVertLevels = _coerce_int_param(
-        nVertLevels if nVertLevels is not None else state_dict.get("nVertLevels"),
-        "nVertLevels",
-    )
-    maxEdges = _coerce_int_param(
-        maxEdges if maxEdges is not None else mesh_dict.get("maxEdges"),
-        "maxEdges",
-        default=10,
-    )
-
-    # Require Fortran-style 1-based+padded connectivity arrays.
-    if "cellsOnEdge" in mesh_dict:
-        coe = mesh_dict["cellsOnEdge"]
-        invalid_shape = coe.shape[0] == nEdges
-        has_zero_based_sentinel = False
-        if os.environ.get("MPAS_DEBUG", "0") == "1" and isinstance(coe, torch.Tensor):
-            has_zero_based_sentinel = bool(torch.any(coe == -1))
-        if invalid_shape or has_zero_based_sentinel:
-            raise ValueError(
-                "smlstep_pert requires Fortran 1-based+padded mesh connectivity arrays. "
-                "Use raw Fortran-style mesh data instead of MESHState."
-            )
-
-    # Extract loop bounds
-    cellSolveStart = _coerce_int_param(
-        state_dict.get("cellSolveStart"), "cellSolveStart", default=1
-    )
-    cellSolveEnd = _coerce_int_param(
-        state_dict.get("cellSolveEnd"), "cellSolveEnd", default=nCells
-    )
-    nRelaxZone = _coerce_int_param(
-        state_dict.get("nRelaxZone"), "nRelaxZone", default=0
-    )
-
-    # Call work function
-    result = atm_set_smlstep_pert_variables_work(
-        nCells=nCells,
-        nEdges=nEdges,
-        nVertLevels=nVertLevels,
-        maxEdges=maxEdges,
-        cellSolveStart=cellSolveStart,
-        cellSolveEnd=cellSolveEnd,
-        nRelaxZone=nRelaxZone,
-        nEdgesOnCell=mesh_dict["nEdgesOnCell"],
-        cellsOnEdge=mesh_dict["cellsOnEdge"],
-        edgesOnCell=mesh_dict["edgesOnCell"],
-        edgesOnCell_sign=mesh_dict["edgesOnCell_sign"],
-        bdyMaskCell=mesh_dict.get(
-            "bdyMaskCell", torch.zeros(nCells + 1, dtype=torch.int32, device=device)
-        ),
-        fzm=state_dict["fzm"],
-        fzp=state_dict["fzp"],
-        zb=state_dict["zb"],
-        zb3=state_dict["zb3"],
-        zb_cell=state_dict["zb_cell"],
-        zb3_cell=state_dict["zb3_cell"],
-        zz=state_dict["zz"],
-        w_tend=state_dict["w_tend"],
-        u_tend=state_dict["u_tend"],
-    )
-
-    # Merge result into state_dict
-    output = dict(state_dict)
-    output.update(result)
-
-    return output

@@ -27,7 +27,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
-from time import perf_counter
 from types import MappingProxyType
 from typing import Any, cast
 
@@ -53,6 +52,7 @@ from mpas_pytorch.dynamics.stencil_ops import (
     _active_slot_count,
     _compile_active,
     _gather_slot_batch,
+    _read_only_zeros,
     _replace_row_slice,
     _replace_row_slice_cols,
     _slot_batches,
@@ -68,7 +68,6 @@ from mpas_pytorch.dynamics.stencil_ops import (
 from mpas_pytorch.dynamics.stencil_ops import (
     sum_fortran_order as _sum_fortran_order,
 )
-from mpas_pytorch.mesh import MESHState
 from mpas_pytorch.profiling import profile_section
 from mpas_pytorch.utils.checks import require_consistent_device
 
@@ -190,10 +189,11 @@ _DYNAMICS_TENDENCY_DYNAMIC_ARGUMENT_NAMES = (
     "visc4_scale",
     "smagorinsky_scale",
     "del4u_div_scale",
+    "coef_3rd_scale",
 )
 # Tuning-parameter scales (config["parameter_scales"]); a caller without scales may omit them (None).
 _DYNAMICS_TENDENCY_OPTIONAL_DYNAMIC_ARGUMENT_NAMES = frozenset(
-    {"visc4_scale", "smagorinsky_scale", "del4u_div_scale"}
+    {"visc4_scale", "smagorinsky_scale", "del4u_div_scale", "coef_3rd_scale"}
 )
 
 # Retain these legacy/public arguments at the API boundary, but do not expose
@@ -245,7 +245,6 @@ _DYNAMICS_TENDENCY_COMPACT_OUTPUT_NAMES = (
     "rthdynten_solve_patch",
 )
 _DYNAMICS_TENDENCY_SLOT_GATHER_BATCH = 4
-_DYNAMICS_TENDENCY_EDGE_NEIGHBOR_FULL_SLOT_COMPILE_LIMIT = 10
 _DYNAMICS_TENDENCY_AD_COMPILE_MODES = frozenset(
     {
         "eager",
@@ -411,14 +410,6 @@ def resolve_dynamics_tendency_ad_compile_mode(
             f"device {device_type!r} remains fail-closed"
         )
     return effective
-
-
-class _NoProfileSection:
-    def __enter__(self):
-        return None
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
 
 
 def _dynamics_tendency_slot_batches(
@@ -923,22 +914,6 @@ def _dynamics_tendency_gather_pair_patch_or_base_cols(
     )
 
 
-def _dynamics_tendency_can_use_no_ad_full_slot_reduce(
-    reference: torch.Tensor, *tensors: torch.Tensor | None
-) -> bool:
-    """Return True for full-slot row-owned reductions in inference/compile paths."""
-    if torch.is_grad_enabled():
-        return False
-    if reference.device.type != "cuda" and not _compile_active():
-        return False
-    if _tensor_carries_autodiff(reference):
-        return False
-    for tensor in tensors:
-        if isinstance(tensor, torch.Tensor) and _tensor_carries_autodiff(tensor):
-            return False
-    return True
-
-
 def _make_flux_divisor(reference: torch.Tensor) -> torch.Tensor:
     """Bind exact 12 in the run's dtype/device before graph capture.
 
@@ -985,7 +960,7 @@ def flux3(
     q_i: torch.Tensor,
     q_ip1: torch.Tensor,
     ua: torch.Tensor,
-    coef3: float,
+    coef3: float | torch.Tensor,
     flux_divisor: torch.Tensor | float = 12.0,
 ) -> torch.Tensor:
     """
@@ -1011,7 +986,7 @@ def _flux3_from_abs(
     q_ip1: torch.Tensor,
     ua: torch.Tensor,
     abs_ua: torch.Tensor,
-    coef3: float,
+    coef3: float | torch.Tensor,
     flux_divisor: torch.Tensor | float = 12.0,
 ) -> torch.Tensor:
     """Evaluate ``flux3`` with an explicitly supplied absolute-value primal."""
@@ -1019,49 +994,6 @@ def _flux3_from_abs(
         flux4(q_im2, q_im1, q_i, q_ip1, ua, flux_divisor=flux_divisor)
         + coef3 * abs_ua * ((q_ip1 - q_im2) - 3.0 * (q_i - q_im1)) / flux_divisor
     )
-
-
-def _full_level_vertical_flux_delta(
-    interface_flux: torch.Tensor,
-    n_levels: int,
-) -> torch.Tensor:
-    """Match padded[:, 1:n+1] - padded[:, :n] with zero boundary fluxes."""
-    expected_interfaces = max(n_levels - 1, 0)
-    if interface_flux.shape[1] != expected_interfaces:
-        raise ValueError(
-            "interface_flux has wrong vertical width: "
-            f"got {interface_flux.shape[1]}, expected {expected_interfaces}"
-        )
-    if n_levels == 0:
-        return interface_flux.new_zeros((interface_flux.shape[0], 0))
-    if expected_interfaces == 0:
-        return interface_flux.new_zeros((interface_flux.shape[0], n_levels))
-    out = interface_flux.new_empty((interface_flux.shape[0], n_levels))
-    out[:, 0] = interface_flux[:, 0]
-    if n_levels > 2:
-        out[:, 1:-1] = interface_flux[:, 1:] - interface_flux[:, :-1]
-    out[:, -1] = -interface_flux[:, -1]
-    return out
-
-
-def _interior_level_vertical_flux_delta(
-    interface_flux: torch.Tensor,
-    n_levels: int,
-) -> torch.Tensor:
-    """Match padded[:, 2:n+1] - padded[:, 1:n] with zero top flux."""
-    expected_interfaces = max(n_levels - 1, 0)
-    if interface_flux.shape[1] != expected_interfaces:
-        raise ValueError(
-            "interface_flux has wrong vertical width: "
-            f"got {interface_flux.shape[1]}, expected {expected_interfaces}"
-        )
-    if expected_interfaces == 0:
-        return interface_flux.new_zeros((interface_flux.shape[0], 0))
-    out = interface_flux.new_empty((interface_flux.shape[0], expected_interfaces))
-    if expected_interfaces > 1:
-        out[:, :-1] = interface_flux[:, 1:] - interface_flux[:, :-1]
-    out[:, -1] = -interface_flux[:, -1]
-    return out
 
 
 def _full_level_vertical_flux_delta_from_parts(
@@ -1155,8 +1087,15 @@ def _dynamics_tendency_tensor_has_forward_tangent(tensor: torch.Tensor) -> bool:
     return tangent is not None
 
 
-def _dynamics_tendency_use_ordered_reverse_vjp(*tensors: torch.Tensor) -> bool:
-    """Use measured output-owned transposes only for ordinary reverse AD."""
+def _dynamics_tendency_use_ordered_reverse_vjp(
+    *tensors: torch.Tensor,
+    tangent_tensors: tuple[torch.Tensor, ...] = (),
+) -> bool:
+    """Use measured output-owned transposes only for ordinary reverse AD.
+
+    A forward tangent on any of ``tensors`` or ``tangent_tensors`` (inputs whose gradient the transpose also
+    returns, such as a parameter scale) selects the plain numeric path.
+    """
     # Compiled forward graphs never use the reverse-only custom VJPs.  Return
     # before consulting runner-owned Python policy so Dynamo sees tensor math
     # rather than a ContextVar access at every ordered stencil site.
@@ -1169,7 +1108,8 @@ def _dynamics_tendency_use_ordered_reverse_vjp(*tensors: torch.Tensor) -> bool:
         and torch.is_grad_enabled()
         and any(tensor.requires_grad for tensor in tensors)
         and not any(
-            _dynamics_tendency_tensor_has_forward_tangent(tensor) for tensor in tensors
+            _dynamics_tendency_tensor_has_forward_tangent(tensor)
+            for tensor in (*tensors, *tangent_tensors)
         )
     )
 
@@ -1428,30 +1368,6 @@ def _edge_neighbor_pv_reduction(
         )
 
     edge_weights = edge_weights[:, : eoe_safe.shape[1]]
-    if (
-        eoe_safe.shape[1] > 1
-        and eoe_safe.shape[1]
-        <= _DYNAMICS_TENDENCY_EDGE_NEIGHBOR_FULL_SLOT_COMPILE_LIMIT
-        and _dynamics_tendency_can_use_no_ad_full_slot_reduce(
-            u,
-            eoe_safe,
-            eoe_valid,
-            edge_weights,
-            pv_edge,
-            pv_self,
-        )
-    ):
-        # Keep the upstream slot chain explicit inside one output-owned region.
-        # Inductor fuses the gathers and pointwise terms without constructing
-        # the full (edge, slot, level) pv/u/contribution tensors; eager CUDA
-        # likewise avoids those large global intermediates.
-        return _normal_velocity_tendency_edge_neighbor_pv_ordered_numeric(
-            u,
-            pv_edge,
-            pv_self,
-            eoe_safe,
-            edge_weights,
-        )
 
     q: torch.Tensor | None = None
     batch_size = _dynamics_tendency_slot_gather_batch(u, eoe_safe.shape[1])
@@ -1971,390 +1887,6 @@ def _normal_velocity_tendency_base_coupling_region(
     return u_base_patch
 
 
-def _normal_velocity_tendency_h_divergence_proof_tensors(
-    *,
-    ru: torch.Tensor,
-    dv_edge: torch.Tensor,
-    cell_edge_relation: StaticSlotRelation,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return unnormalized normal-velocity-tendency divergence sums, absolute term sums, and counts."""
-    cell_edges = _dynamics_tendency_slot_field(cell_edge_relation, 0, "indices")
-    cell_sign = _dynamics_tendency_slot_field(cell_edge_relation, 2, "sign")
-    cell_valid = _dynamics_tendency_slot_field(cell_edge_relation, 1, "valid")
-    if cell_sign is None:
-        raise ValueError(
-            "dynamics-tendency normal-velocity-tendency proof divergence requires cell-edge signs"
-        )
-    n_cells = cell_edges.shape[0]
-    n_levels = ru.shape[1]
-    total = ru.new_zeros((n_cells, n_levels))
-    abs_total = ru.new_zeros((n_cells, n_levels))
-    count = ru.new_zeros((n_cells, n_levels))
-    terms = ru.new_zeros((n_cells, cell_edges.shape[1], n_levels))
-    for slot in range(cell_edges.shape[1]):
-        edge_idx = cell_edges[:, slot]
-        weight = cell_sign[:, slot] * dv_edge[edge_idx]
-        valid = None if cell_valid is None else cell_valid[:, slot]
-        if valid is not None:
-            weight = torch.where(valid, weight, torch.zeros_like(weight))
-        contrib = weight.unsqueeze(1) * gather_rows(ru, edge_idx)
-        terms[:, slot, :] = contrib
-        total = total + contrib
-        abs_total = abs_total + torch.abs(contrib)
-        if valid is None:
-            count = count + torch.ones_like(total)
-        else:
-            count = count + valid.to(dtype=ru.dtype).unsqueeze(1)
-    return total, abs_total, count, terms
-
-
-def _normal_velocity_tendency_vertical_flux_proof_tensor(
-    *,
-    edge_cell_relation: StaticPairRelation,
-    u_edge: torch.Tensor,
-    rw: torch.Tensor,
-    fzm: torch.Tensor,
-    fzp: torch.Tensor,
-    n_vert_levels: int,
-) -> torch.Tensor:
-    """Reconstruct the normal-velocity-tendency Fortran ``wduz`` scratch array for debug proof."""
-    n_edges = u_edge.shape[0]
-    wduz = u_edge.new_zeros((n_edges, n_vert_levels + 1))
-    if n_vert_levels <= 1:
-        return wduz
-    edge_c1 = _dynamics_tendency_pair_field(edge_cell_relation, 0, "first")
-    edge_c2 = _dynamics_tendency_pair_field(edge_cell_relation, 1, "second")
-    edge_c1_rw = rw[edge_c1, 1:n_vert_levels]
-    edge_c2_rw = rw[edge_c2, 1:n_vert_levels]
-    wduz[:, 1] = (
-        0.5
-        * (edge_c1_rw[:, 0] + edge_c2_rw[:, 0])
-        * (fzm[1] * u_edge[:, 1] + fzp[1] * u_edge[:, 0])
-    )
-    if n_vert_levels > 3:
-        wduz[:, 2 : n_vert_levels - 1] = flux3(
-            u_edge[:, 0 : n_vert_levels - 3],
-            u_edge[:, 1 : n_vert_levels - 2],
-            u_edge[:, 2 : n_vert_levels - 1],
-            u_edge[:, 3:n_vert_levels],
-            0.5
-            * (
-                edge_c1_rw[:, 1 : n_vert_levels - 2]
-                + edge_c2_rw[:, 1 : n_vert_levels - 2]
-            ),
-            1.0,
-        )
-    if n_vert_levels > 2:
-        wduz[:, n_vert_levels - 1] = (
-            0.5
-            * (edge_c1_rw[:, n_vert_levels - 2] + edge_c2_rw[:, n_vert_levels - 2])
-            * (
-                fzm[n_vert_levels - 1] * u_edge[:, n_vert_levels - 1]
-                + fzp[n_vert_levels - 1] * u_edge[:, n_vert_levels - 2]
-            )
-        )
-    return wduz
-
-
-def _normal_velocity_tendency_vertical_flux_abs_term_sum_proof_tensor(
-    *,
-    edge_cell_relation: StaticPairRelation,
-    u_edge: torch.Tensor,
-    rw: torch.Tensor,
-    fzm: torch.Tensor,
-    fzp: torch.Tensor,
-    n_vert_levels: int,
-) -> torch.Tensor:
-    """Source-derived absolute scale for the normal-velocity-tendency Fortran ``wduz`` scratch array."""
-    n_edges = u_edge.shape[0]
-    wduz_abs = u_edge.new_zeros((n_edges, n_vert_levels + 1))
-    if n_vert_levels <= 1:
-        return wduz_abs
-    edge_c1 = _dynamics_tendency_pair_field(edge_cell_relation, 0, "first")
-    edge_c2 = _dynamics_tendency_pair_field(edge_cell_relation, 1, "second")
-    edge_c1_rw = rw[edge_c1, 1:n_vert_levels]
-    edge_c2_rw = rw[edge_c2, 1:n_vert_levels]
-    wduz_abs[:, 1] = 0.5 * (
-        torch.abs(edge_c1_rw[:, 0] * fzm[1] * u_edge[:, 1])
-        + torch.abs(edge_c1_rw[:, 0] * fzp[1] * u_edge[:, 0])
-        + torch.abs(edge_c2_rw[:, 0] * fzm[1] * u_edge[:, 1])
-        + torch.abs(edge_c2_rw[:, 0] * fzp[1] * u_edge[:, 0])
-    )
-    if n_vert_levels > 3:
-        wduz_abs[:, 2 : n_vert_levels - 1] = _flux3_abs_term_sum(
-            u_edge[:, 0 : n_vert_levels - 3],
-            u_edge[:, 1 : n_vert_levels - 2],
-            u_edge[:, 2 : n_vert_levels - 1],
-            u_edge[:, 3:n_vert_levels],
-            0.5
-            * (
-                edge_c1_rw[:, 1 : n_vert_levels - 2]
-                + edge_c2_rw[:, 1 : n_vert_levels - 2]
-            ),
-            1.0,
-        )
-    if n_vert_levels > 2:
-        wduz_abs[:, n_vert_levels - 1] = 0.5 * (
-            torch.abs(
-                edge_c1_rw[:, n_vert_levels - 2]
-                * fzm[n_vert_levels - 1]
-                * u_edge[:, n_vert_levels - 1]
-            )
-            + torch.abs(
-                edge_c1_rw[:, n_vert_levels - 2]
-                * fzp[n_vert_levels - 1]
-                * u_edge[:, n_vert_levels - 2]
-            )
-            + torch.abs(
-                edge_c2_rw[:, n_vert_levels - 2]
-                * fzm[n_vert_levels - 1]
-                * u_edge[:, n_vert_levels - 1]
-            )
-            + torch.abs(
-                edge_c2_rw[:, n_vert_levels - 2]
-                * fzp[n_vert_levels - 1]
-                * u_edge[:, n_vert_levels - 2]
-            )
-        )
-    return wduz_abs
-
-
-def _normal_velocity_tendency_edge_neighbor_pv_proof_tensors(
-    *,
-    edge_neighbor_relation: StaticSlotRelation,
-    u: torch.Tensor,
-    pv_edge: torch.Tensor,
-    pv_self: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return normal-velocity-tendency PV reduction and absolute term sums in Fortran slot order."""
-    eoe_safe = _dynamics_tendency_slot_field(edge_neighbor_relation, 0, "indices")
-    eoe_valid = _dynamics_tendency_slot_field(edge_neighbor_relation, 1, "valid")
-    edge_weights = _dynamics_tendency_slot_field(edge_neighbor_relation, 3, "weights")
-    if edge_weights is None:
-        raise ValueError(
-            "dynamics-tendency normal-velocity-tendency proof PV requires edge-neighbor weights"
-        )
-    n_edges = eoe_safe.shape[0]
-    n_levels = u.shape[1]
-    q = u.new_zeros((n_edges, n_levels))
-    abs_total = u.new_zeros((n_edges, n_levels))
-    for slot in range(eoe_safe.shape[1]):
-        neighbor_edges = eoe_safe[:, slot]
-        workpv = 0.5 * (pv_self + gather_rows(pv_edge, neighbor_edges))
-        contrib = (
-            edge_weights[:, slot].unsqueeze(1) * gather_rows(u, neighbor_edges) * workpv
-        )
-        if eoe_valid is not None:
-            valid = eoe_valid[:, slot].unsqueeze(1)
-            contrib = torch.where(valid, contrib, torch.zeros_like(contrib))
-        q = q + contrib
-        abs_total = abs_total + torch.abs(contrib)
-    return q, abs_total
-
-
-def _normal_velocity_tendency_pressure_proof_tensor(
-    *,
-    edge_cell_relation: StaticPairRelation,
-    cqu_solve: torch.Tensor,
-    inv_dc_edge_solve: torch.Tensor,
-    zxu_solve: torch.Tensor,
-    zz: torch.Tensor,
-    pp: torch.Tensor,
-    dpdz: torch.Tensor,
-    dpdz_cell_patch: torch.Tensor | None,
-    cell_patch_row_start: int,
-    cell_patch_row_end: int,
-) -> torch.Tensor:
-    """Return the normal-velocity-tendency horizontal pressure-gradient contribution."""
-    edge_c1 = _dynamics_tendency_pair_field(edge_cell_relation, 0, "first")
-    edge_c2 = _dynamics_tendency_pair_field(edge_cell_relation, 1, "second")
-    zz_pair_sum = zz[edge_c1, :] + zz[edge_c2, :]
-    pp_delta = pp[edge_c2, :] - pp[edge_c1, :]
-    dpdz_c1, dpdz_c2 = _dynamics_tendency_pair_gather_patch_or_base(
-        edge_cell_relation,
-        dpdz,
-        dpdz_cell_patch,
-        patch_row_start=cell_patch_row_start,
-        patch_row_end=cell_patch_row_end,
-    )
-    return -cqu_solve * (
-        pp_delta * inv_dc_edge_solve.unsqueeze(1) / (0.5 * zz_pair_sum)
-        - 0.5 * zxu_solve * (dpdz_c1 + dpdz_c2)
-    )
-
-
-def _normal_velocity_tendency_pressure_abs_term_sum_proof_tensor(
-    *,
-    edge_cell_relation: StaticPairRelation,
-    cqu_solve: torch.Tensor,
-    inv_dc_edge_solve: torch.Tensor,
-    zxu_solve: torch.Tensor,
-    zz: torch.Tensor,
-    pp: torch.Tensor,
-    dpdz: torch.Tensor,
-    dpdz_cell_patch: torch.Tensor | None,
-    cell_patch_row_start: int,
-    cell_patch_row_end: int,
-) -> torch.Tensor:
-    """Source-derived absolute scale for the normal-velocity-tendency horizontal pressure term."""
-    edge_c1 = _dynamics_tendency_pair_field(edge_cell_relation, 0, "first")
-    edge_c2 = _dynamics_tendency_pair_field(edge_cell_relation, 1, "second")
-    zz_pair_sum = zz[edge_c1, :] + zz[edge_c2, :]
-    denom = torch.clamp(torch.abs(0.5 * zz_pair_sum), min=torch.finfo(zz.dtype).tiny)
-    dc_scale = torch.abs(inv_dc_edge_solve).unsqueeze(1) / denom
-    dpdz_c1, dpdz_c2 = _dynamics_tendency_pair_gather_patch_or_base(
-        edge_cell_relation,
-        dpdz,
-        dpdz_cell_patch,
-        patch_row_start=cell_patch_row_start,
-        patch_row_end=cell_patch_row_end,
-    )
-    return torch.abs(cqu_solve) * (
-        dc_scale * (torch.abs(pp[edge_c2, :]) + torch.abs(pp[edge_c1, :]))
-        + 0.5 * torch.abs(zxu_solve) * (torch.abs(dpdz_c1) + torch.abs(dpdz_c2))
-    )
-
-
-def _normal_velocity_tendency_proof_tensors(
-    *,
-    edge_cell_relation: StaticPairRelation,
-    edge_neighbor_relation: StaticSlotRelation,
-    u: torch.Tensor,
-    u_edge: torch.Tensor,
-    rw: torch.Tensor,
-    ke: torch.Tensor,
-    h_divergence: torch.Tensor,
-    h_divergence_cell_patch: torch.Tensor,
-    h_divergence_abs_term_sum_cell_patch: torch.Tensor,
-    pv_edge: torch.Tensor,
-    pv_edge_solve: torch.Tensor,
-    rho_edge_solve: torch.Tensor,
-    inv_dc_edge_solve: torch.Tensor,
-    rdzw: torch.Tensor,
-    fzm: torch.Tensor,
-    fzp: torch.Tensor,
-    n_vert_levels: int,
-    include_pressure_gradient: bool,
-    zz: torch.Tensor,
-    pp: torch.Tensor,
-    dpdz: torch.Tensor,
-    dpdz_cell_patch: torch.Tensor | None,
-    cell_patch_row_start: int,
-    cell_patch_row_end: int,
-    inv_area_cell: torch.Tensor,
-    cqu_solve: torch.Tensor,
-    zxu_solve: torch.Tensor,
-) -> dict[str, Any]:
-    """Build dynamics-tendency normal-velocity-tendency proof operands/intermediates for debug comparisons only."""
-    wduz = _normal_velocity_tendency_vertical_flux_proof_tensor(
-        edge_cell_relation=edge_cell_relation,
-        u_edge=u_edge,
-        rw=rw,
-        fzm=fzm,
-        fzp=fzp,
-        n_vert_levels=n_vert_levels,
-    )
-    wduz_abs_term_sum = (
-        _normal_velocity_tendency_vertical_flux_abs_term_sum_proof_tensor(
-            edge_cell_relation=edge_cell_relation,
-            u_edge=u_edge,
-            rw=rw,
-            fzm=fzm,
-            fzp=fzp,
-            n_vert_levels=n_vert_levels,
-        )
-    )
-    vertical_tendency = -rdzw[:n_vert_levels].unsqueeze(0) * (
-        wduz[:, 1 : n_vert_levels + 1] - wduz[:, :n_vert_levels]
-    )
-    vertical_tendency_abs_term_sum = torch.abs(rdzw[:n_vert_levels]).unsqueeze(0) * (
-        wduz_abs_term_sum[:, 1 : n_vert_levels + 1]
-        + wduz_abs_term_sum[:, :n_vert_levels]
-    )
-    q, q_abs_term_sum = _normal_velocity_tendency_edge_neighbor_pv_proof_tensors(
-        edge_neighbor_relation=edge_neighbor_relation,
-        u=u,
-        pv_edge=pv_edge,
-        pv_self=pv_edge_solve,
-    )
-    edge_c1 = _dynamics_tendency_pair_field(edge_cell_relation, 0, "first")
-    edge_c2 = _dynamics_tendency_pair_field(edge_cell_relation, 1, "second")
-    ke_delta = ke[edge_c2, :] - ke[edge_c1, :]
-    hdiv_c1, hdiv_c2 = _dynamics_tendency_pair_gather_patch_or_base(
-        edge_cell_relation,
-        h_divergence,
-        h_divergence_cell_patch,
-        patch_row_start=cell_patch_row_start,
-        patch_row_end=cell_patch_row_end,
-    )
-    patch_rows = torch.arange(
-        cell_patch_row_start,
-        cell_patch_row_end,
-        device=h_divergence_abs_term_sum_cell_patch.device,
-    )
-    hdiv_abs_norm_patch = h_divergence_abs_term_sum_cell_patch * torch.abs(
-        inv_area_cell[patch_rows]
-    ).unsqueeze(1)
-    hdiv_abs_c1, hdiv_abs_c2 = _dynamics_tendency_pair_gather_patch_or_base(
-        edge_cell_relation,
-        torch.abs(h_divergence),
-        hdiv_abs_norm_patch,
-        patch_row_start=cell_patch_row_start,
-        patch_row_end=cell_patch_row_end,
-    )
-    base_coupling = rho_edge_solve * (
-        q - ke_delta * inv_dc_edge_solve.unsqueeze(1)
-    ) - u_edge * 0.5 * (hdiv_c1 + hdiv_c2)
-    base_coupling_abs_term_sum = torch.abs(rho_edge_solve) * (
-        q_abs_term_sum + torch.abs(ke_delta * inv_dc_edge_solve.unsqueeze(1))
-    ) + 0.5 * torch.abs(u_edge) * (hdiv_abs_c1 + hdiv_abs_c2)
-    pressure = u_edge.new_zeros(u_edge.shape)
-    pressure_abs_term_sum = u_edge.new_zeros(u_edge.shape)
-    if include_pressure_gradient:
-        pressure = _normal_velocity_tendency_pressure_proof_tensor(
-            edge_cell_relation=edge_cell_relation,
-            cqu_solve=cqu_solve,
-            inv_dc_edge_solve=inv_dc_edge_solve,
-            zxu_solve=zxu_solve,
-            zz=zz,
-            pp=pp,
-            dpdz=dpdz,
-            dpdz_cell_patch=dpdz_cell_patch,
-            cell_patch_row_start=cell_patch_row_start,
-            cell_patch_row_end=cell_patch_row_end,
-        )
-        pressure_abs_term_sum = (
-            _normal_velocity_tendency_pressure_abs_term_sum_proof_tensor(
-                edge_cell_relation=edge_cell_relation,
-                cqu_solve=cqu_solve,
-                inv_dc_edge_solve=inv_dc_edge_solve,
-                zxu_solve=zxu_solve,
-                zz=zz,
-                pp=pp,
-                dpdz=dpdz,
-                dpdz_cell_patch=dpdz_cell_patch,
-                cell_patch_row_start=cell_patch_row_start,
-                cell_patch_row_end=cell_patch_row_end,
-            )
-        )
-    return {
-        "normal_velocity_tendency_wduz": wduz,
-        "normal_velocity_tendency_wduz_abs_term_sum": wduz_abs_term_sum,
-        "normal_velocity_tendency_q": q,
-        "normal_velocity_tendency_q_abs_term_sum": q_abs_term_sum,
-        "normal_velocity_tendency_vertical_tendency": vertical_tendency,
-        "normal_velocity_tendency_vertical_tendency_abs_term_sum": vertical_tendency_abs_term_sum,
-        "normal_velocity_tendency_base_coupling": base_coupling,
-        "normal_velocity_tendency_base_coupling_abs_term_sum": base_coupling_abs_term_sum,
-        "normal_velocity_tendency_pressure_gradient": pressure,
-        "normal_velocity_tendency_pressure_gradient_abs_term_sum": pressure_abs_term_sum,
-        "normal_velocity_tendency_tend_u_abs_term_sum": (
-            vertical_tendency_abs_term_sum + base_coupling_abs_term_sum
-        ),
-        "normal_velocity_tendency_tend_u_euler_abs_term_sum": pressure_abs_term_sum,
-    }
-
-
 def _normal_velocity_tendency_pressure_curvature_region(
     *,
     edge_cell_relation: StaticPairRelation,
@@ -2478,93 +2010,6 @@ def _normal_velocity_tendency_pressure_curvature_region(
             solve_edge_mask_all=solve_edge_mask_all,
         )
     return tend_u_patch, tend_u_euler_patch
-
-
-def _normal_velocity_tendency_coupling_pressure_section_region(
-    *,
-    edge_cell_relation: StaticPairRelation,
-    vertical_tendency_patch: torch.Tensor,
-    edge_neighbor_pv_patch: torch.Tensor,
-    u_edge: torch.Tensor,
-    ke: torch.Tensor,
-    h_divergence: torch.Tensor,
-    rho_edge_solve: torch.Tensor,
-    inv_dc_edge_solve: torch.Tensor,
-    solve_edge_mask: torch.Tensor,
-    solve_edge_mask_all: bool,
-    tend_u_euler_edge: torch.Tensor,
-    include_pressure_gradient: bool,
-    zz: torch.Tensor,
-    pp: torch.Tensor,
-    dpdz: torch.Tensor,
-    cqu_solve: torch.Tensor,
-    zxu_solve: torch.Tensor,
-    include_curvature: bool,
-    w: torch.Tensor,
-    angle_edge_solve: torch.Tensor,
-    lat_edge_solve: torch.Tensor,
-    omega: float,
-    inv_r_earth: float,
-    h_divergence_cell1: torch.Tensor | None = None,
-    h_divergence_cell2: torch.Tensor | None = None,
-    h_divergence_cell_patch: torch.Tensor | None = None,
-    dpdz_cell1: torch.Tensor | None = None,
-    dpdz_cell2: torch.Tensor | None = None,
-    dpdz_cell_patch: torch.Tensor | None = None,
-    cell_patch_row_start: int = 0,
-    cell_patch_row_end: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fuse source-ordered velocity coupling and the pressure/curvature tail.
-
-    The drift-prone normal-velocity-tendency vertical transport and the ordered PV neighbor reducer stay
-    as explicit upstream inputs.  This region therefore shortens the live
-    ``normal_velocity_tendency_coupling_patch`` handoff. MPAS adds vertical transport
-    to the PV/KE term before subtracting horizontal divergence.
-    """
-    base_tendency_patch = _normal_velocity_tendency_base_coupling_region(
-        edge_cell_relation=edge_cell_relation,
-        vertical_tendency_patch=vertical_tendency_patch,
-        u_edge=u_edge,
-        ke=ke,
-        h_divergence=h_divergence,
-        h_divergence_cell1=h_divergence_cell1,
-        h_divergence_cell2=h_divergence_cell2,
-        h_divergence_cell_patch=h_divergence_cell_patch,
-        edge_neighbor_pv_patch=edge_neighbor_pv_patch,
-        rho_edge_solve=rho_edge_solve,
-        inv_dc_edge_solve=inv_dc_edge_solve,
-        solve_edge_mask=solve_edge_mask,
-        solve_edge_mask_all=solve_edge_mask_all,
-        cell_patch_row_start=cell_patch_row_start,
-        cell_patch_row_end=cell_patch_row_end,
-    )
-    return _normal_velocity_tendency_pressure_curvature_region(
-        edge_cell_relation=edge_cell_relation,
-        base_tendency_patch=base_tendency_patch,
-        u_edge=u_edge,
-        rho_edge_solve=rho_edge_solve,
-        inv_dc_edge_solve=inv_dc_edge_solve,
-        solve_edge_mask=solve_edge_mask,
-        solve_edge_mask_all=solve_edge_mask_all,
-        tend_u_euler_edge=tend_u_euler_edge,
-        include_pressure_gradient=include_pressure_gradient,
-        zz=zz,
-        pp=pp,
-        dpdz=dpdz,
-        cqu_solve=cqu_solve,
-        zxu_solve=zxu_solve,
-        include_curvature=include_curvature,
-        w=w,
-        angle_edge_solve=angle_edge_solve,
-        lat_edge_solve=lat_edge_solve,
-        omega=omega,
-        inv_r_earth=inv_r_earth,
-        dpdz_cell1=dpdz_cell1,
-        dpdz_cell2=dpdz_cell2,
-        dpdz_cell_patch=dpdz_cell_patch,
-        cell_patch_row_start=cell_patch_row_start,
-        cell_patch_row_end=cell_patch_row_end,
-    )
 
 
 def _normal_velocity_tendency_base_normal_velocity_tendency(
@@ -3660,55 +3105,6 @@ def _mixing_initialization_mixing_initialization_region(
     )
 
 
-def _sum_local_cell_edge_flux_slots(
-    *,
-    edge_flux: torch.Tensor,
-    local_edge_relation: StaticSlotRelation,
-) -> torch.Tensor:
-    """Accumulate local edge fluxes by cell without a full cell-edge gather."""
-    local_edges = _dynamics_tendency_slot_field(local_edge_relation, 0, "indices")
-    edge_sign = _dynamics_tendency_slot_field(local_edge_relation, 2, "sign")
-    edge_valid_weight = _dynamics_tendency_slot_field(
-        local_edge_relation, 7, "valid_weight"
-    )
-    edge_valid_all_by_slot = _dynamics_tendency_slot_field(
-        local_edge_relation, 6, "valid_all_by_slot"
-    )
-    if local_edges is None or edge_sign is None or edge_valid_weight is None:
-        raise ValueError(
-            "dynamics-tendency local cell-edge flux requires a static relation"
-        )
-    n_cells = local_edges.shape[0]
-    total: torch.Tensor | None = None
-    for batch_start, batch_stop in _dynamics_tendency_slot_batches(
-        local_edges.shape[1],
-        _dynamics_tendency_slot_gather_batch(edge_flux, local_edges.shape[1]),
-    ):
-        if batch_start == 0 and batch_stop == local_edges.shape[1] and batch_stop > 1:
-            flux_batch = _dynamics_tendency_gather_slot_batch(
-                edge_flux, local_edges, batch_start, batch_stop
-            )
-            contrib_batch = edge_sign.unsqueeze(2) * flux_batch
-            if edge_valid_all_by_slot is None or not all(edge_valid_all_by_slot):
-                contrib_batch = contrib_batch * edge_valid_weight.unsqueeze(2)
-            return _sum_fortran_order(contrib_batch, dim=1)
-        flux_batch = _dynamics_tendency_gather_slot_batch(
-            edge_flux, local_edges, batch_start, batch_stop
-        )
-        for local_slot in range(batch_stop - batch_start):
-            slot = batch_start + local_slot
-            contrib = edge_sign[:, slot].unsqueeze(1) * flux_batch[:, local_slot, :]
-            valid_all = (
-                edge_valid_all_by_slot is not None and edge_valid_all_by_slot[slot]
-            )
-            if not valid_all:
-                contrib = contrib * edge_valid_weight[:, slot].unsqueeze(1)
-            total = _accumulate_ordered_slot(total, contrib)
-    if total is None:
-        return edge_flux.new_zeros((n_cells, edge_flux.shape[1]))
-    return total
-
-
 def _edge_advective_cell_tendency(
     *,
     field: torch.Tensor,
@@ -3718,8 +3114,13 @@ def _edge_advective_cell_tendency(
     edge_adv_cell_relation: StaticSlotRelation | tuple[Any, ...],
     local_edge_relation: StaticSlotRelation | tuple[Any, ...],
     sign_ru: torch.Tensor,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Accumulate dynamics-tendency edge-advective fluxes and reduce them back to cells."""
+    """Accumulate dynamics-tendency edge-advective fluxes and reduce them back to cells.
+
+    ``coef_3rd_scale`` (0-d tensor or None; ``config["parameter_scales"]["config_coef_3rd_order"]``) multiplies
+    the third-order coefficients; 1.0 is bitwise neutral.
+    """
     safe_adv_cells = _dynamics_tendency_slot_field(edge_adv_cell_relation, 0, "indices")
     adv_valid = _dynamics_tendency_slot_field(edge_adv_cell_relation, 1, "valid")
     adv_coef = _dynamics_tendency_slot_field(edge_adv_cell_relation, 4, "coefficients")
@@ -3768,7 +3169,12 @@ def _edge_advective_cell_tendency(
         local_valid = torch.ones_like(local_indices, dtype=torch.bool)
 
     field_levels = field[:, field_start:field_stop]
-    ordered_reverse = _dynamics_tendency_use_ordered_reverse_vjp(field_levels, ru_edge)
+    # A tangent carried by the scale alone selects the plain numeric path (forward mode).
+    ordered_reverse = _dynamics_tendency_use_ordered_reverse_vjp(
+        field_levels,
+        ru_edge,
+        tangent_tensors=() if coef_3rd_scale is None else (coef_3rd_scale,),
+    )
     if ordered_reverse:
         if any(
             value is None
@@ -3801,8 +3207,11 @@ def _edge_advective_cell_tendency(
                 local_transpose_valid,
                 adv_valid_all_by_slot,
                 local_valid_all_by_slot,
+                coef_3rd_scale,
             ),
         )
+    if coef_3rd_scale is not None:
+        adv_coef_3rd = adv_coef_3rd * coef_3rd_scale
     return _edge_advective_cell_tendency_ordered_from_sign_numeric(
         field_levels,
         ru_edge,
@@ -4021,8 +3430,14 @@ def _edge_advective_cell_tendency_ordered_backward(
     local_destinations: torch.Tensor,
     local_transpose_valid: torch.Tensor,
     adv_valid_all_by_slot: tuple[bool, ...] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Output-owned transpose for the ordered vertical-velocity-horizontal-advection/theta-horizontal-advection edge-advection stencil."""
+    adv_coef_3rd_base: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Output-owned transpose for the ordered vertical-velocity-horizontal-advection/theta-horizontal-advection edge-advection stencil.
+
+    ``adv_coef_3rd`` is the coefficient the forward used. With ``adv_coef_3rd_base`` (the coefficient before a
+    config_coef_3rd_order scale s, ``adv_coef_3rd = adv_coef_3rd_base * s``) the third output is the gradient of
+    s, the sum of grad_adv3 * adv_coef_3rd_base; otherwise it is None.
+    """
     sign_ru = torch.where(
         ru_edge >= 0.0, torch.ones_like(ru_edge), -torch.ones_like(ru_edge)
     )
@@ -4080,11 +3495,32 @@ def _edge_advective_cell_tendency_ordered_backward(
     if grad_field is None:
         grad_field = torch.zeros_like(field_levels)
 
+    # grad_adv3[e, slot] = sum_k valid * grad_flux * sign_ru * field[adv_indices[e, slot], k]; the scale's
+    # gradient sums it against the unscaled coefficients.
+    grad_scale: torch.Tensor | None = None
+    if adv_coef_3rd_base is not None:
+        for slot in range(adv_indices.shape[1]):
+            field_slot = gather_rows(field_levels, adv_indices[:, slot])
+            slot_term = grad_flux * sign_ru * field_slot
+            valid_all = (
+                adv_valid_all_by_slot is not None and adv_valid_all_by_slot[slot]
+            )
+            if not valid_all:
+                slot_term = slot_term.masked_fill(~adv_valid[:, slot].unsqueeze(1), 0.0)
+            slot_grad = (slot_term.sum(dim=1) * adv_coef_3rd_base[:, slot]).sum()
+            grad_scale = slot_grad if grad_scale is None else grad_scale + slot_grad
+        if grad_scale is None:
+            grad_scale = adv_coef_3rd_base.new_zeros(())
+
     # ``sign(ru_edge)`` is locally constant away from its switch at zero.  The
     # release preflight rejects directions that cross that switch, so the exact
     # smooth-region contribution through the sign selector is zero.
     grad_ru = grad_ru_direct
-    return grad_field, grad_ru
+    return grad_field, grad_ru, grad_scale
+
+
+# Position of adv_coef_3rd_scale among the inputs of _EdgeAdvectiveCellTendencyFunction.forward.
+_EDGE_ADVECTIVE_SCALE_INPUT = 15
 
 
 class _EdgeAdvectiveCellTendencyFunction(torch.autograd.Function):
@@ -4106,7 +3542,13 @@ class _EdgeAdvectiveCellTendencyFunction(torch.autograd.Function):
         local_transpose_valid: torch.Tensor,
         adv_valid_all_by_slot: tuple[bool, ...] | None,
         local_valid_all_by_slot: tuple[bool, ...] | None,
+        adv_coef_3rd_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # config_coef_3rd_order scale s (0-d tensor or None): the stencil uses adv_coef_3rd * s, and the backward
+        # returns the gradient of s (input _EDGE_ADVECTIVE_SCALE_INPUT) from the unscaled coefficients.
+        adv_coef_3rd_base = adv_coef_3rd
+        if adv_coef_3rd_scale is not None:
+            adv_coef_3rd = adv_coef_3rd * adv_coef_3rd_scale
         ctx.save_for_backward(
             field_levels,
             ru_edge,
@@ -4121,6 +3563,7 @@ class _EdgeAdvectiveCellTendencyFunction(torch.autograd.Function):
             adv_transpose_valid,
             local_destinations,
             local_transpose_valid,
+            adv_coef_3rd_base if adv_coef_3rd_scale is not None else None,
         )
         ctx.adv_valid_all_by_slot = adv_valid_all_by_slot
         ctx.backward_callable = _planned_dynamics_tendency_adjoint(
@@ -4147,15 +3590,18 @@ class _EdgeAdvectiveCellTendencyFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        saved = ctx.saved_tensors
-        grad_field, grad_ru = ctx.backward_callable(
-            saved[0],
-            saved[1],
+        field_levels, ru_edge, *stencil, unscaled_coef_3rd = ctx.saved_tensors
+        scale_needs_grad = ctx.needs_input_grad[_EDGE_ADVECTIVE_SCALE_INPUT]
+        grad_field, grad_ru, grad_scale = ctx.backward_callable(
+            field_levels,
+            ru_edge,
             grad_output,
-            *saved[2:],
+            *stencil,
             ctx.adv_valid_all_by_slot,
+            unscaled_coef_3rd if scale_needs_grad else None,
         )
-        return grad_field, grad_ru, *(None for _ in range(13))
+        # No gradient for the inputs between ru_edge and the scale (stencil tensors and slot hints).
+        return grad_field, grad_ru, *(None,) * (_EDGE_ADVECTIVE_SCALE_INPUT - 2), grad_scale
 
 
 def build_dynamics_tendency_ad_compile_plan(
@@ -4254,6 +3700,7 @@ def _cell_owned_edge_advective_cell_tendency(
     edge_adv_cell_relation: StaticSlotRelation | tuple[Any, ...],
     local_edge_relation: StaticSlotRelation | tuple[Any, ...],
     sign_ru: torch.Tensor,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """A/B-only cell-owned form of the vertical-velocity-horizontal-advection/theta-horizontal-advection advective cell tendency.
 
@@ -4278,6 +3725,8 @@ def _cell_owned_edge_advective_cell_tendency(
         raise ValueError(
             "dynamics-tendency cell-owned advection requires an advection-cell relation"
         )
+    if coef_3rd_scale is not None:
+        adv_coef_3rd = adv_coef_3rd * coef_3rd_scale
     if local_edges is None or edge_sign is None or edge_valid_weight is None:
         raise ValueError(
             "dynamics-tendency cell-owned advection requires a local edge relation"
@@ -4314,116 +3763,6 @@ def _cell_owned_edge_advective_cell_tendency(
     return -total
 
 
-def _edge_advective_cell_tendency_proof_tensors(
-    *,
-    field: torch.Tensor,
-    field_start: int,
-    field_stop: int,
-    ru_edge: torch.Tensor,
-    edge_adv_cell_relation: StaticSlotRelation | tuple[Any, ...],
-    local_edge_relation: StaticSlotRelation | tuple[Any, ...],
-    sign_ru: torch.Tensor,
-    full_level_count: int,
-    ru_edge_abs_term_sum: torch.Tensor | None = None,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    """Return local vertical-velocity-horizontal-advection/theta-horizontal-advection advection components in cell, slot, level order."""
-    safe_adv_cells = _dynamics_tendency_slot_field(edge_adv_cell_relation, 0, "indices")
-    adv_coef = _dynamics_tendency_slot_field(edge_adv_cell_relation, 4, "coefficients")
-    adv_coef_3rd = _dynamics_tendency_slot_field(
-        edge_adv_cell_relation, 5, "coefficients_3rd"
-    )
-    adv_valid = _dynamics_tendency_slot_field(edge_adv_cell_relation, 1, "valid")
-    local_edges = _dynamics_tendency_slot_field(local_edge_relation, 0, "indices")
-    edge_sign = _dynamics_tendency_slot_field(local_edge_relation, 2, "sign")
-    local_valid = _dynamics_tendency_slot_field(local_edge_relation, 1, "valid")
-    if safe_adv_cells is None or adv_coef is None or adv_coef_3rd is None:
-        raise ValueError(
-            "dynamics-tendency proof advection requires an advection-cell relation"
-        )
-    if local_edges is None or edge_sign is None:
-        raise ValueError(
-            "dynamics-tendency proof advection requires a local edge relation"
-        )
-
-    n_edges = safe_adv_cells.shape[0]
-    n_levels = field_stop - field_start
-    field_levels = field[:, field_start:field_stop]
-    flux_sum = field.new_zeros((n_edges, n_levels))
-    flux_abs_sum = field.new_zeros((n_edges, n_levels))
-    for slot in range(safe_adv_cells.shape[1]):
-        idx_slot = safe_adv_cells[:, slot]
-        weight_slot = adv_coef[:, slot].unsqueeze(1) + sign_ru * adv_coef_3rd[
-            :, slot
-        ].unsqueeze(1)
-        contrib = weight_slot * gather_rows(field_levels, idx_slot)
-        if adv_valid is not None:
-            contrib = torch.where(
-                adv_valid[:, slot].unsqueeze(1),
-                contrib,
-                torch.zeros_like(contrib),
-            )
-        flux_sum = flux_sum + contrib
-        flux_abs_sum = flux_abs_sum + torch.abs(contrib)
-
-    flux_slots = gather_rows(flux_sum, local_edges)
-    flux_abs_slots = gather_rows(flux_abs_sum, local_edges)
-    ru_slots = gather_rows(ru_edge, local_edges)
-    ru_abs_source = (
-        torch.abs(ru_edge) if ru_edge_abs_term_sum is None else ru_edge_abs_term_sum
-    )
-    ru_abs_slots = gather_rows(ru_abs_source, local_edges)
-    if local_valid is not None:
-        valid = local_valid.unsqueeze(2)
-        flux_slots = torch.where(valid, flux_slots, torch.zeros_like(flux_slots))
-        flux_abs_slots = torch.where(
-            valid, flux_abs_slots, torch.zeros_like(flux_abs_slots)
-        )
-        ru_slots = torch.where(valid, ru_slots, torch.zeros_like(ru_slots))
-        ru_abs_slots = torch.where(valid, ru_abs_slots, torch.zeros_like(ru_abs_slots))
-
-    n_cells, n_slots = local_edges.shape
-    ru_full = field.new_zeros((n_cells, n_slots, full_level_count))
-    ru_abs_full = field.new_zeros((n_cells, n_slots, full_level_count))
-    flux_full = field.new_zeros((n_cells, n_slots, full_level_count))
-    flux_abs_full = field.new_zeros((n_cells, n_slots, full_level_count))
-    ru_full[:, :, field_start:field_stop] = ru_slots
-    ru_abs_full[:, :, field_start:field_stop] = ru_abs_slots
-    flux_full[:, :, field_start:field_stop] = flux_slots
-    flux_abs_full[:, :, field_start:field_stop] = flux_abs_slots
-    terms = -edge_sign.unsqueeze(2) * ru_slots * flux_slots
-    term_abs = torch.abs(terms)
-    if local_valid is not None:
-        valid = local_valid.unsqueeze(2)
-        terms = torch.where(valid, terms, torch.zeros_like(terms))
-        term_abs = torch.where(valid, term_abs, torch.zeros_like(term_abs))
-    terms_full = field.new_zeros((n_cells, n_slots, full_level_count))
-    terms_full[:, :, field_start:field_stop] = terms
-    terms_abs_source_full = field.new_zeros((n_cells, n_slots, full_level_count))
-    terms_abs_source_full[:, :, field_start:field_stop] = ru_abs_slots * flux_abs_slots
-    term_abs_full = field.new_zeros((n_cells, full_level_count))
-    term_abs_full[:, field_start:field_stop] = _sum_fortran_order(
-        ru_abs_slots * flux_abs_slots,
-        dim=1,
-    )
-    return (
-        ru_full,
-        ru_abs_full,
-        flux_full,
-        flux_abs_full,
-        term_abs_full,
-        terms_full,
-        terms_abs_source_full,
-    )
-
-
 def _vertical_velocity_horizontal_advection_w_advective_cell_tendency_region(
     *,
     w: torch.Tensor,
@@ -4434,6 +3773,7 @@ def _vertical_velocity_horizontal_advection_w_advective_cell_tendency_region(
     edge_adv_cell_relation: StaticSlotRelation,
     local_edge_relation: StaticSlotRelation,
     cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab: bool = False,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute dynamics-tendency vertical-velocity-horizontal-advection horizontal w-advection as one PyTorch regional helper."""
     ru_edge = (
@@ -4450,6 +3790,7 @@ def _vertical_velocity_horizontal_advection_w_advective_cell_tendency_region(
             edge_adv_cell_relation=edge_adv_cell_relation,
             local_edge_relation=local_edge_relation,
             sign_ru=sign_ru,
+            coef_3rd_scale=coef_3rd_scale,
         )
     return _edge_advective_cell_tendency(
         field=w,
@@ -4459,6 +3800,7 @@ def _vertical_velocity_horizontal_advection_w_advective_cell_tendency_region(
         edge_adv_cell_relation=edge_adv_cell_relation,
         local_edge_relation=local_edge_relation,
         sign_ru=sign_ru,
+        coef_3rd_scale=coef_3rd_scale,
     )
 
 
@@ -4479,6 +3821,7 @@ def _vertical_velocity_horizontal_advection_w_hadv_section_region(
     omega: float,
     r_earth: float,
     cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab: bool = False,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute dynamics-tendency vertical-velocity-horizontal-advection horizontal w-advection and optional curvature as one region."""
     tend_w_patch = _vertical_velocity_horizontal_advection_w_advective_cell_tendency_region(
@@ -4490,6 +3833,7 @@ def _vertical_velocity_horizontal_advection_w_hadv_section_region(
         edge_adv_cell_relation=edge_adv_cell_relation,
         local_edge_relation=local_edge_relation,
         cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab=cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab,
+        coef_3rd_scale=coef_3rd_scale,
     )
     if include_curvature:
         fzm_inner = fzm[1:n_vert_levels].unsqueeze(0)
@@ -4540,6 +3884,7 @@ def _vertical_velocity_horizontal_advection_w_hadv_owned_section_region(
     omega: float,
     r_earth: float,
     cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab: bool = False,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run vertical-velocity-horizontal-advection from owning fields so no aliased solve view crosses compilation."""
     # Advection also needs the non-owned edges incident to owned cells. The
@@ -4564,6 +3909,7 @@ def _vertical_velocity_horizontal_advection_w_hadv_owned_section_region(
         omega=omega,
         r_earth=r_earth,
         cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab=cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab,
+        coef_3rd_scale=coef_3rd_scale,
     )
 
 
@@ -4575,6 +3921,7 @@ def _theta_horizontal_advection_theta_advective_cell_tendency_region(
     edge_adv_cell_relation: StaticSlotRelation | tuple[Any, ...],
     local_edge_relation: StaticSlotRelation | tuple[Any, ...],
     cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab: bool = False,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute dynamics-tendency theta-horizontal-advection horizontal theta advection as one PyTorch regional helper."""
     ru_edge = ru_solve[:, :n_vert_levels]
@@ -4588,6 +3935,7 @@ def _theta_horizontal_advection_theta_advective_cell_tendency_region(
             edge_adv_cell_relation=edge_adv_cell_relation,
             local_edge_relation=local_edge_relation,
             sign_ru=sign_ru,
+            coef_3rd_scale=coef_3rd_scale,
         )
     return _edge_advective_cell_tendency(
         field=theta_m,
@@ -4597,6 +3945,7 @@ def _theta_horizontal_advection_theta_advective_cell_tendency_region(
         edge_adv_cell_relation=edge_adv_cell_relation,
         local_edge_relation=local_edge_relation,
         sign_ru=sign_ru,
+        coef_3rd_scale=coef_3rd_scale,
     )
 
 
@@ -4614,6 +3963,7 @@ def _theta_horizontal_advection_theta_hadv_section_region(
     ru_save: torch.Tensor,
     theta_m_save: torch.Tensor,
     cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab: bool = False,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute dynamics-tendency theta-horizontal-advection horizontal theta advection and RK perturbation flux."""
     tend_theta_patch = _theta_horizontal_advection_theta_advective_cell_tendency_region(
@@ -4623,6 +3973,7 @@ def _theta_horizontal_advection_theta_hadv_section_region(
         edge_adv_cell_relation=edge_adv_cell_relation,
         local_edge_relation=local_edge_relation,
         cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab=cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab,
+        coef_3rd_scale=coef_3rd_scale,
     )
     if include_perturbation_flux:
         tend_theta_patch = _sum_theta_perturbation_flux_slots(
@@ -4651,6 +4002,7 @@ def _theta_horizontal_advection_theta_hadv_owned_section_region(
     ru_save: torch.Tensor,
     theta_m_save: torch.Tensor,
     cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab: bool = False,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run theta-horizontal-advection from owning fields so no aliased solve view crosses compilation."""
     adv_rows = _dynamics_tendency_slot_field(
@@ -4670,6 +4022,7 @@ def _theta_horizontal_advection_theta_hadv_owned_section_region(
         ru_save=ru_save,
         theta_m_save=theta_m_save,
         cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab=cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab,
+        coef_3rd_scale=coef_3rd_scale,
     )
 
 
@@ -4746,112 +4099,6 @@ def _vertical_velocity_vertical_transport_w_vertical_boundary_fluxes_region(
         * (w_solve[:, k] + w_solve[:, k - 1])
     )
     return first_flux, last_flux
-
-
-def _vertical_velocity_vertical_transport_w_vertical_flux_proof_tensor(
-    *,
-    w_solve: torch.Tensor,
-    rw_solve: torch.Tensor,
-    n_vert_levels: int,
-) -> torch.Tensor:
-    """Reconstruct the vertical-velocity-vertical-transport Fortran ``wdwz`` scratch array for debug proof."""
-    n_cells = w_solve.shape[0]
-    wdwz = w_solve.new_zeros((n_cells, n_vert_levels + 1))
-    if n_vert_levels <= 1:
-        return wdwz
-    first_flux, last_flux = (
-        _vertical_velocity_vertical_transport_w_vertical_boundary_fluxes_region(
-            w_solve=w_solve,
-            rw_solve=rw_solve,
-            n_vert_levels=n_vert_levels,
-        )
-    )
-    wdwz[:, 1] = first_flux
-    if n_vert_levels > 3:
-        wdwz[:, 2 : n_vert_levels - 1] = flux3(
-            w_solve[:, 0 : n_vert_levels - 3],
-            w_solve[:, 1 : n_vert_levels - 2],
-            w_solve[:, 2 : n_vert_levels - 1],
-            w_solve[:, 3:n_vert_levels],
-            0.5
-            * (rw_solve[:, 2 : n_vert_levels - 1] + rw_solve[:, 1 : n_vert_levels - 2]),
-            1.0,
-        )
-    if n_vert_levels > 2:
-        wdwz[:, n_vert_levels - 1] = last_flux
-    return wdwz
-
-
-def _flux3_abs_term_sum(
-    q_im2: torch.Tensor,
-    q_im1: torch.Tensor,
-    q_i: torch.Tensor,
-    q_ip1: torch.Tensor,
-    ua: torch.Tensor,
-    coef3: float,
-) -> torch.Tensor:
-    """Conservative source-derived absolute scale for MPAS ``flux3``."""
-    ua_abs = torch.abs(ua)
-    flux4_terms = (
-        ua_abs
-        * (
-            7.0 * torch.abs(q_i)
-            + 7.0 * torch.abs(q_im1)
-            + torch.abs(q_ip1)
-            + torch.abs(q_im2)
-        )
-        / 12.0
-    )
-    upwind_terms = (
-        abs(float(coef3))
-        * ua_abs
-        * (
-            torch.abs(q_ip1)
-            + torch.abs(q_im2)
-            + 3.0 * torch.abs(q_i)
-            + 3.0 * torch.abs(q_im1)
-        )
-        / 12.0
-    )
-    return flux4_terms + upwind_terms
-
-
-def _vertical_velocity_vertical_transport_w_vertical_flux_abs_term_sum_proof_tensor(
-    *,
-    w_solve: torch.Tensor,
-    rw_solve: torch.Tensor,
-    n_vert_levels: int,
-) -> torch.Tensor:
-    """Return a source-derived absolute scale for the vertical-velocity-vertical-transport ``wdwz`` scratch."""
-    n_cells = w_solve.shape[0]
-    out = w_solve.new_zeros((n_cells, n_vert_levels + 1))
-    if n_vert_levels <= 1:
-        return out
-    out[:, 1] = 0.25 * (
-        torch.abs(rw_solve[:, 1] * w_solve[:, 1])
-        + torch.abs(rw_solve[:, 1] * w_solve[:, 0])
-        + torch.abs(rw_solve[:, 0] * w_solve[:, 1])
-        + torch.abs(rw_solve[:, 0] * w_solve[:, 0])
-    )
-    if n_vert_levels > 3:
-        out[:, 2 : n_vert_levels - 1] = _flux3_abs_term_sum(
-            w_solve[:, 0 : n_vert_levels - 3],
-            w_solve[:, 1 : n_vert_levels - 2],
-            w_solve[:, 2 : n_vert_levels - 1],
-            w_solve[:, 3:n_vert_levels],
-            0.5
-            * (rw_solve[:, 2 : n_vert_levels - 1] + rw_solve[:, 1 : n_vert_levels - 2]),
-            1.0,
-        )
-    if n_vert_levels > 2:
-        k = n_vert_levels - 1
-        out[:, k] = 0.25 * (
-            torch.abs(rw_solve[:, k] * w_solve[:, k])
-            + torch.abs(rw_solve[:, k] * w_solve[:, k - 1])
-            + torch.abs(rw_solve[:, k - 1] * w_solve[:, k])
-            + torch.abs(rw_solve[:, k - 1] * w_solve[:, k - 1])
-        )
-    return out
 
 
 def _vertical_velocity_vertical_transport_w_pointwise_update_region(
@@ -5080,6 +4327,7 @@ def _theta_vertical_advection_diabatic_theta_vertical_flux_delta_region(
     first_flux: torch.Tensor | None = None,
     last_flux: torch.Tensor | None = None,
     flux_divisor: torch.Tensor | float = 12.0,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute dynamics-tendency theta-vertical-advection-diabatic vertical theta-flux divergence on solve-cell rows."""
     if n_vert_levels > 1:
@@ -5100,13 +4348,19 @@ def _theta_vertical_advection_diabatic_theta_vertical_flux_delta_region(
 
         wdtz_mid = None
         if n_vert_levels > 3:
+            # config_coef_3rd_order scale (0-d tensor or None): the coefficient times s.
+            coef3: float | torch.Tensor = (
+                coef_3rd_order
+                if coef_3rd_scale is None
+                else coef_3rd_order * coef_3rd_scale
+            )
             wdtz_mid = flux3(
                 theta_m_solve[:, 0 : n_vert_levels - 3],
                 theta_m_solve[:, 1 : n_vert_levels - 2],
                 theta_m_solve[:, 2 : n_vert_levels - 1],
                 theta_m_solve[:, 3:n_vert_levels],
                 rw_solve[:, 2 : n_vert_levels - 1],
-                coef_3rd_order,
+                coef3,
                 flux_divisor=flux_divisor,
             )
             wdtz_mid = wdtz_mid + (
@@ -5160,108 +4414,6 @@ def _theta_vertical_advection_diabatic_theta_vertical_boundary_fluxes_region(
     return first_flux, last_flux
 
 
-def _theta_vertical_advection_diabatic_theta_vertical_flux_proof_tensor(
-    *,
-    theta_m_solve: torch.Tensor,
-    theta_m_save_solve: torch.Tensor,
-    rw_solve: torch.Tensor,
-    rw_save_solve: torch.Tensor,
-    fzm: torch.Tensor,
-    fzp: torch.Tensor,
-    coef_3rd_order: float,
-    n_vert_levels: int,
-) -> torch.Tensor:
-    """Reconstruct the theta-vertical-advection-diabatic Fortran ``wdtz`` scratch array for debug proof."""
-    n_cells = theta_m_solve.shape[0]
-    wdtz = theta_m_solve.new_zeros((n_cells, n_vert_levels + 1))
-    if n_vert_levels <= 1:
-        return wdtz
-    first_flux, last_flux = (
-        _theta_vertical_advection_diabatic_theta_vertical_boundary_fluxes_region(
-            theta_m_solve=theta_m_solve,
-            theta_m_save_solve=theta_m_save_solve,
-            rw_solve=rw_solve,
-            rw_save_solve=rw_save_solve,
-            fzm=fzm,
-            fzp=fzp,
-            n_vert_levels=n_vert_levels,
-        )
-    )
-    wdtz[:, 1] = first_flux
-    if n_vert_levels > 3:
-        wdtz_mid = flux3(
-            theta_m_solve[:, 0 : n_vert_levels - 3],
-            theta_m_solve[:, 1 : n_vert_levels - 2],
-            theta_m_solve[:, 2 : n_vert_levels - 1],
-            theta_m_solve[:, 3:n_vert_levels],
-            rw_solve[:, 2 : n_vert_levels - 1],
-            coef_3rd_order,
-        )
-        wdtz[:, 2 : n_vert_levels - 1] = wdtz_mid + (
-            rw_save_solve[:, 2 : n_vert_levels - 1] - rw_solve[:, 2 : n_vert_levels - 1]
-        ) * (
-            fzm[2 : n_vert_levels - 1] * theta_m_save_solve[:, 2 : n_vert_levels - 1]
-            + fzp[2 : n_vert_levels - 1] * theta_m_save_solve[:, 1 : n_vert_levels - 2]
-        )
-    if n_vert_levels > 2:
-        wdtz[:, n_vert_levels - 1] = last_flux
-    return wdtz
-
-
-def _theta_vertical_advection_diabatic_theta_vertical_flux_abs_term_sum_proof_tensor(
-    *,
-    theta_m_solve: torch.Tensor,
-    theta_m_save_solve: torch.Tensor,
-    rw_solve: torch.Tensor,
-    rw_save_solve: torch.Tensor,
-    fzm: torch.Tensor,
-    fzp: torch.Tensor,
-    coef_3rd_order: float,
-    n_vert_levels: int,
-) -> torch.Tensor:
-    """Return a source-derived absolute scale for the theta-vertical-advection-diabatic ``wdtz`` scratch."""
-    n_cells = theta_m_solve.shape[0]
-    out = theta_m_solve.new_zeros((n_cells, n_vert_levels + 1))
-    if n_vert_levels <= 1:
-        return out
-    k = 1
-    rw_diff = rw_save_solve[:, k] - rw_solve[:, k]
-    out[:, k] = (
-        torch.abs(rw_solve[:, k] * fzm[k] * theta_m_solve[:, k])
-        + torch.abs(rw_solve[:, k] * fzp[k] * theta_m_solve[:, k - 1])
-        + torch.abs(rw_diff * fzm[k] * theta_m_save_solve[:, k])
-        + torch.abs(rw_diff * fzp[k] * theta_m_save_solve[:, k - 1])
-    )
-    if n_vert_levels > 3:
-        flux_terms = _flux3_abs_term_sum(
-            theta_m_solve[:, 0 : n_vert_levels - 3],
-            theta_m_solve[:, 1 : n_vert_levels - 2],
-            theta_m_solve[:, 2 : n_vert_levels - 1],
-            theta_m_solve[:, 3:n_vert_levels],
-            rw_solve[:, 2 : n_vert_levels - 1],
-            coef_3rd_order,
-        )
-        rw_diff_mid = (
-            rw_save_solve[:, 2 : n_vert_levels - 1] - rw_solve[:, 2 : n_vert_levels - 1]
-        )
-        correction_terms = torch.abs(
-            rw_diff_mid
-            * fzm[2 : n_vert_levels - 1]
-            * theta_m_save_solve[:, 2 : n_vert_levels - 1]
-        ) + torch.abs(
-            rw_diff_mid
-            * fzp[2 : n_vert_levels - 1]
-            * theta_m_save_solve[:, 1 : n_vert_levels - 2]
-        )
-        out[:, 2 : n_vert_levels - 1] = flux_terms + correction_terms
-    if n_vert_levels > 2:
-        k = n_vert_levels - 1
-        out[:, k] = torch.abs(
-            rw_save_solve[:, k] * fzm[k] * theta_m_solve[:, k]
-        ) + torch.abs(rw_save_solve[:, k] * fzp[k] * theta_m_solve[:, k - 1])
-    return out
-
-
 def _theta_vertical_advection_diabatic_theta_pointwise_update_region(
     *,
     theta_m_solve: torch.Tensor,
@@ -5300,6 +4452,7 @@ def _theta_vertical_advection_diabatic_theta_vertical_section_region(
     coef_3rd_order: float,
     n_vert_levels: int,
     flux_divisor: torch.Tensor | float = 12.0,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute dynamics-tendency theta-vertical-advection-diabatic theta vertical tendency and diagnostic as one region."""
     wdtz_delta = _theta_vertical_advection_diabatic_theta_vertical_flux_delta_region(
@@ -5310,6 +4463,7 @@ def _theta_vertical_advection_diabatic_theta_vertical_section_region(
         fzm=fzm,
         fzp=fzp,
         coef_3rd_order=coef_3rd_order,
+        coef_3rd_scale=coef_3rd_scale,
         n_vert_levels=n_vert_levels,
         flux_divisor=flux_divisor,
     )
@@ -5496,6 +4650,7 @@ def _theta_horizontal_advection_theta_finalization_theta_tendency_region(
     prandtl_inv: float,
     kdiff_patch: torch.Tensor | None = None,
     flux_divisor: torch.Tensor | float = 12.0,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Fuse the contiguous theta-horizontal-advection-theta-finalization theta chain around its three live outputs."""
     tend_theta_solve = _theta_horizontal_advection_theta_hadv_owned_section_region(
@@ -5512,6 +4667,7 @@ def _theta_horizontal_advection_theta_finalization_theta_tendency_region(
         ru_save=ru_save,
         theta_m_save=theta_m_save,
         cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab=cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab,
+        coef_3rd_scale=coef_3rd_scale,
     )
     tend_theta_euler_cell_patch: torch.Tensor | None = None
     if include_horizontal_mix:
@@ -5560,6 +4716,7 @@ def _theta_horizontal_advection_theta_finalization_theta_tendency_region(
             fzm=fzm,
             fzp=fzp,
             coef_3rd_order=coef_3rd_order,
+            coef_3rd_scale=coef_3rd_scale,
             n_vert_levels=n_vert_levels,
             flux_divisor=flux_divisor,
         )
@@ -5613,77 +4770,6 @@ def _sum_w_mix_slots(
     if flux_valid is None:
         raise ValueError("dynamics-tendency w mix requires a valid flux mask")
     n_cells = safe_edges.shape[0]
-    if (
-        _dynamics_tendency_can_use_no_ad_full_slot_reduce(
-            w,
-            safe_edges,
-            cell1,
-            cell2,
-            flux_valid,
-            edge_sign,
-            rho_edge,
-            kdiff,
-            mesh_scaling_del2,
-            mesh_scaling_del2_slots,
-        )
-        and safe_edges.shape[1] > 1
-    ):
-        rho_batch = gather_rows(rho_edge, safe_edges)
-        w_cell1_batch = gather_rows(w, cell1)
-        w_cell2_batch = gather_rows(w, cell2)
-        if kdiff_patch is not None:
-            kdiff_cell1_batch, kdiff_cell2_batch = (
-                _dynamics_tendency_pair_gather_patch_or_base(
-                    edge_cell_relation,
-                    kdiff,
-                    kdiff_patch,
-                    patch_row_start=patch_row_start,
-                    patch_row_end=patch_row_end,
-                )
-            )
-        else:
-            kdiff_cell1_batch = gather_rows(kdiff, cell1)
-            kdiff_cell2_batch = gather_rows(kdiff, cell2)
-        if mesh_scaling_del2_slots is None:
-            if mesh_scaling_del2 is None:
-                raise ValueError(
-                    "mesh_scaling_del2 or mesh_scaling_del2_slots is required"
-                )
-            mesh_scaling_batch = gather_rows(mesh_scaling_del2, safe_edges)
-        else:
-            mesh_scaling_batch = mesh_scaling_del2_slots
-        base_flux = (
-            edge_sign.unsqueeze(2)
-            * (
-                rho_batch[:, :, 1:n_vert_levels]
-                + rho_batch[:, :, 0 : n_vert_levels - 1]
-            )
-            * (
-                w_cell2_batch[:, :, 1:n_vert_levels]
-                - w_cell1_batch[:, :, 1:n_vert_levels]
-            )
-        )
-        valid_all = (
-            flux_valid_all_by_slot is not None
-            and len(flux_valid_all_by_slot) == safe_edges.shape[1]
-            and all(flux_valid_all_by_slot)
-        )
-        if not valid_all:
-            base_flux = base_flux * flux_valid.unsqueeze(2).to(dtype=w.dtype)
-        scaled_flux = (
-            base_flux
-            * mesh_scaling_batch.unsqueeze(2)
-            * 0.25
-            * (
-                kdiff_cell1_batch[:, :, 1:n_vert_levels]
-                + kdiff_cell2_batch[:, :, 1:n_vert_levels]
-                + kdiff_cell1_batch[:, :, 0 : n_vert_levels - 1]
-                + kdiff_cell2_batch[:, :, 0 : n_vert_levels - 1]
-            )
-        )
-        return _sum_fortran_order(base_flux, dim=1), _sum_fortran_order(
-            scaled_flux, dim=1
-        )
     delsq_total: torch.Tensor | None = None
     tend_total: torch.Tensor | None = None
     gather_batch = _dynamics_tendency_slot_gather_batch(w, safe_edges.shape[1])
@@ -5859,55 +4945,6 @@ def _sum_theta_mix_slots(
     if flux_valid is None:
         raise ValueError("dynamics-tendency theta mix requires a valid flux mask")
     n_cells = safe_edges.shape[0]
-    if (
-        _dynamics_tendency_can_use_no_ad_full_slot_reduce(
-            theta_m,
-            safe_edges,
-            cell1,
-            cell2,
-            flux_valid,
-            edge_sign,
-            rho_edge,
-            kdiff,
-            pr_scale,
-        )
-        and safe_edges.shape[1] > 1
-    ):
-        theta_cell1_batch = gather_rows(theta_m, cell1)
-        theta_cell2_batch = gather_rows(theta_m, cell2)
-        rho_batch = gather_rows(rho_edge, safe_edges)
-        if kdiff_patch is not None:
-            kdiff_cell1_batch, kdiff_cell2_batch = (
-                _dynamics_tendency_pair_gather_patch_or_base(
-                    edge_cell_relation,
-                    kdiff,
-                    kdiff_patch,
-                    patch_row_start=patch_row_start,
-                    patch_row_end=patch_row_end,
-                )
-            )
-        else:
-            kdiff_cell1_batch = gather_rows(kdiff, cell1)
-            kdiff_cell2_batch = gather_rows(kdiff, cell2)
-        base_flux = (
-            edge_sign.unsqueeze(2) * (theta_cell2_batch - theta_cell1_batch) * rho_batch
-        )
-        valid_all = (
-            flux_valid_all_by_slot is not None
-            and len(flux_valid_all_by_slot) == safe_edges.shape[1]
-            and all(flux_valid_all_by_slot)
-        )
-        if not valid_all:
-            base_flux = base_flux * flux_valid.unsqueeze(2).to(dtype=theta_m.dtype)
-        scaled_flux = (
-            base_flux
-            * 0.5
-            * (kdiff_cell1_batch + kdiff_cell2_batch)
-            * pr_scale.unsqueeze(2)
-        )
-        return _sum_fortran_order(base_flux, dim=1), _sum_fortran_order(
-            scaled_flux, dim=1
-        )
     delsq_total: torch.Tensor | None = None
     tend_total: torch.Tensor | None = None
     gather_batch = _dynamics_tendency_slot_gather_batch(theta_m, safe_edges.shape[1])
@@ -6203,36 +5240,6 @@ def _sum_theta_perturbation_flux_slots(
     if flux_valid is None:
         flux_valid = torch.ones_like(safe_edges, dtype=torch.bool)
     n_cells = safe_edges.shape[0]
-    if (
-        initial is None
-        and _dynamics_tendency_can_use_no_ad_full_slot_reduce(
-            theta_m_save,
-            safe_edges,
-            cell1,
-            cell2,
-            flux_valid,
-            edge_sign,
-            ru,
-            ru_save,
-            signed_dv_edge,
-        )
-        and safe_edges.shape[1] > 1
-    ):
-        theta_cell1_batch = gather_rows(theta_m_save, cell1)
-        theta_cell2_batch = gather_rows(theta_m_save, cell2)
-        ru_save_batch = gather_rows(ru_save, safe_edges)
-        ru_batch = gather_rows(ru, safe_edges)
-        metric_batch = signed_dv_edge
-        theta_face = 0.5 * (theta_cell2_batch + theta_cell1_batch)
-        contrib = metric_batch.unsqueeze(2) * (ru_save_batch - ru_batch) * theta_face
-        valid_all = (
-            flux_valid_all_by_slot is not None
-            and len(flux_valid_all_by_slot) == safe_edges.shape[1]
-            and all(flux_valid_all_by_slot)
-        )
-        if not valid_all:
-            contrib = contrib * flux_valid.unsqueeze(2).to(dtype=theta_m_save.dtype)
-        return _sum_fortran_order(contrib, dim=1)
     total: torch.Tensor | None = initial
     for batch_start, batch_stop in _dynamics_tendency_slot_batches(
         safe_edges.shape[1],
@@ -6285,189 +5292,6 @@ def _sum_theta_perturbation_flux_slots(
     return total
 
 
-def _theta_perturbation_flux_proof_slots(
-    *,
-    cell_edge_relation: StaticSlotRelation,
-    edge_cell_relation: StaticPairRelation,
-    ru: torch.Tensor,
-    ru_save: torch.Tensor,
-    theta_m_save: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return signed and absolute dynamics-tendency theta perturbation-flux proof terms."""
-    safe_edges = _dynamics_tendency_slot_field(cell_edge_relation, 0, "indices")
-    signed_dv_edge = _dynamics_tendency_slot_field(cell_edge_relation, 3, "weights")
-    flux_valid_all_by_slot = _dynamics_tendency_slot_field(
-        cell_edge_relation, 6, "valid_all_by_slot"
-    )
-    cell1 = _dynamics_tendency_pair_field(edge_cell_relation, 0, "first")
-    cell2 = _dynamics_tendency_pair_field(edge_cell_relation, 1, "second")
-    flux_valid = _dynamics_tendency_pair_field(edge_cell_relation, 2, "valid")
-    if signed_dv_edge is None:
-        raise ValueError(
-            "dynamics-tendency theta perturbation abs proof requires signed metric weights"
-        )
-    if flux_valid is None:
-        flux_valid = torch.ones_like(safe_edges, dtype=torch.bool)
-    n_cells = safe_edges.shape[0]
-    n_slots = safe_edges.shape[1]
-    n_levels = theta_m_save.shape[1]
-    terms = theta_m_save.new_zeros((n_cells, n_slots, n_levels))
-    abs_total: torch.Tensor | None = None
-    for batch_start, batch_stop in _dynamics_tendency_slot_batches(
-        n_slots,
-        _dynamics_tendency_slot_gather_batch(theta_m_save, n_slots),
-    ):
-        theta_cell1_batch = _dynamics_tendency_gather_slot_batch(
-            theta_m_save, cell1, batch_start, batch_stop
-        )
-        theta_cell2_batch = _dynamics_tendency_gather_slot_batch(
-            theta_m_save, cell2, batch_start, batch_stop
-        )
-        ru_save_batch = _dynamics_tendency_gather_slot_batch(
-            ru_save, safe_edges, batch_start, batch_stop
-        )
-        ru_batch = _dynamics_tendency_gather_slot_batch(
-            ru, safe_edges, batch_start, batch_stop
-        )
-        metric_batch = signed_dv_edge[:, batch_start:batch_stop]
-        for local_slot in range(batch_stop - batch_start):
-            slot = batch_start + local_slot
-            theta_face = 0.5 * (
-                theta_cell2_batch[:, local_slot, :]
-                + theta_cell1_batch[:, local_slot, :]
-            )
-            contrib = -(
-                metric_batch[:, local_slot].view(n_cells, 1)
-                * (ru_save_batch[:, local_slot, :] - ru_batch[:, local_slot, :])
-                * theta_face
-            )
-            valid_all = (
-                flux_valid_all_by_slot is not None and flux_valid_all_by_slot[slot]
-            )
-            if not valid_all:
-                contrib = contrib * flux_valid[:, slot].view(n_cells, 1).to(
-                    dtype=theta_m_save.dtype
-                )
-            terms[:, slot, :] = contrib
-            abs_total = _accumulate_ordered_slot(abs_total, torch.abs(contrib))
-    if abs_total is None:
-        abs_total = theta_m_save.new_zeros((n_cells, n_levels))
-    return terms, abs_total
-
-
-def _dynamics_tendency_vertical_velocity_horizontal_advection_hadv_proof_taps(
-    *,
-    w: torch.Tensor,
-    ru: torch.Tensor,
-    fzm: torch.Tensor,
-    fzp: torch.Tensor,
-    solve_edge_slice: slice,
-    n_vert_levels: int,
-    edge_adv_cell_relation: StaticSlotRelation,
-    local_edge_relation: StaticSlotRelation,
-) -> dict[str, Any]:
-    """Reconstruct vertical-velocity-horizontal-advection diagnostic proof terms independently of the numeric helper."""
-    ru_edge = (
-        fzm[1:n_vert_levels].view(1, -1) * ru[solve_edge_slice, 1:n_vert_levels]
-        + fzp[1:n_vert_levels].view(1, -1) * ru[solve_edge_slice, 0 : n_vert_levels - 1]
-    )
-    ru_edge_abs_term_sum = torch.abs(fzm[1:n_vert_levels]).view(1, -1) * torch.abs(
-        ru[solve_edge_slice, 1:n_vert_levels]
-    ) + torch.abs(fzp[1:n_vert_levels]).view(1, -1) * torch.abs(
-        ru[solve_edge_slice, 0 : n_vert_levels - 1]
-    )
-    (
-        ru_edge_w,
-        ru_edge_w_abs_term_sum,
-        flux_arr,
-        flux_abs_term_sum,
-        tend_w_abs_term_sum,
-        tend_w_terms,
-        tend_w_terms_abs_term_sum,
-    ) = _edge_advective_cell_tendency_proof_tensors(
-        field=w,
-        field_start=1,
-        field_stop=n_vert_levels,
-        ru_edge=ru_edge,
-        ru_edge_abs_term_sum=ru_edge_abs_term_sum,
-        edge_adv_cell_relation=edge_adv_cell_relation,
-        local_edge_relation=local_edge_relation,
-        sign_ru=fct_sign_pm(ru_edge),
-        full_level_count=n_vert_levels + 1,
-    )
-    return {
-        "vertical_velocity_horizontal_advection_ru_edge_w": ru_edge_w,
-        "vertical_velocity_horizontal_advection_ru_edge_w_abs_term_sum": ru_edge_w_abs_term_sum,
-        "vertical_velocity_horizontal_advection_flux_arr": flux_arr,
-        "vertical_velocity_horizontal_advection_flux_abs_term_sum": flux_abs_term_sum,
-        "vertical_velocity_horizontal_advection_tend_w_abs_term_sum": tend_w_abs_term_sum,
-        "vertical_velocity_horizontal_advection_tend_w_terms": tend_w_terms,
-        "vertical_velocity_horizontal_advection_tend_w_terms_abs_term_sum": tend_w_terms_abs_term_sum,
-    }
-
-
-def _dynamics_tendency_theta_horizontal_advection_hadv_proof_taps(
-    *,
-    theta_m: torch.Tensor,
-    theta_m_save: torch.Tensor,
-    ru: torch.Tensor,
-    ru_save: torch.Tensor,
-    solve_edge_slice: slice,
-    n_vert_levels: int,
-    rk_step: int,
-    edge_adv_cell_relation: StaticSlotRelation,
-    local_edge_relation: StaticSlotRelation,
-    cell_edge_relation: StaticSlotRelation,
-    edge_cell_relation: StaticPairRelation,
-) -> dict[str, Any]:
-    """Reconstruct theta-horizontal-advection diagnostic proof terms independently of the numeric helper."""
-    ru_edge = ru[solve_edge_slice, :n_vert_levels]
-    (
-        _ru_edge_unused,
-        _ru_edge_abs_unused,
-        flux_arr,
-        flux_abs_term_sum,
-        tend_theta_abs_term_sum,
-        tend_theta_terms,
-        _tend_theta_terms_abs_unused,
-    ) = _edge_advective_cell_tendency_proof_tensors(
-        field=theta_m,
-        field_start=0,
-        field_stop=n_vert_levels,
-        ru_edge=ru_edge,
-        edge_adv_cell_relation=edge_adv_cell_relation,
-        local_edge_relation=local_edge_relation,
-        sign_ru=fct_sign_pm(ru_edge),
-        full_level_count=n_vert_levels,
-    )
-    if rk_step > 1:
-        perturbation_terms, perturbation_abs = _theta_perturbation_flux_proof_slots(
-            cell_edge_relation=cell_edge_relation,
-            edge_cell_relation=edge_cell_relation,
-            ru=ru,
-            ru_save=ru_save,
-            theta_m_save=theta_m_save,
-        )
-    else:
-        local_edges = _dynamics_tendency_slot_field(local_edge_relation, 0, "indices")
-        if local_edges is None:
-            raise ValueError(
-                "dynamics-tendency theta-horizontal-advection proof requires a local edge relation"
-            )
-        perturbation_terms = theta_m.new_zeros(
-            (local_edges.shape[0], local_edges.shape[1], n_vert_levels)
-        )
-        perturbation_abs = theta_m.new_zeros((local_edges.shape[0], n_vert_levels))
-    return {
-        "theta_horizontal_advection_flux_arr": flux_arr,
-        "theta_horizontal_advection_flux_abs_term_sum": flux_abs_term_sum,
-        "theta_horizontal_advection_tend_theta_abs_term_sum": tend_theta_abs_term_sum,
-        "theta_horizontal_advection_perturbation_abs_term_sum": perturbation_abs,
-        "theta_horizontal_advection_tend_theta_terms": tend_theta_terms,
-        "theta_horizontal_advection_perturbation_terms": perturbation_terms,
-    }
-
-
 def _sum_weighted_index_slots(
     *,
     field: torch.Tensor,
@@ -6486,29 +5310,6 @@ def _sum_weighted_index_slots(
             "dynamics-tendency weighted index slots require indices or index_relation"
         )
     n_rows = indices.shape[0]
-    if (
-        _dynamics_tendency_can_use_no_ad_full_slot_reduce(
-            field, indices, weights, field_patch
-        )
-        and indices.shape[1] > 1
-    ):
-        if index_relation is None:
-            values = _dynamics_tendency_gather_rows_patch_or_base(
-                field,
-                indices,
-                field_patch,
-                patch_row_start,
-                patch_row_end,
-            )
-        else:
-            values = _dynamics_tendency_slot_gather_patch_or_base(
-                index_relation,
-                field,
-                field_patch,
-                patch_row_start=patch_row_start,
-                patch_row_end=patch_row_end,
-            )
-        return _sum_fortran_order(weights.unsqueeze(2) * values, dim=1)
     total: torch.Tensor | None = None
     for batch_start, batch_stop in _dynamics_tendency_slot_batches(
         indices.shape[1], _dynamics_tendency_slot_gather_batch(field, indices.shape[1])
@@ -6541,217 +5342,6 @@ def _sum_weighted_index_slots(
             total = _accumulate_ordered_slot(total, contrib)
     if total is None:
         return field.new_zeros((n_rows, field.shape[1]))
-    return total
-
-
-def _sum_weighted_cell_delta_slots(
-    *,
-    field: torch.Tensor,
-    cell1: torch.Tensor,
-    cell2: torch.Tensor,
-    flux_valid: torch.Tensor,
-    flux_valid_all_by_slot: tuple[bool, ...] | None = None,
-    edge_sign: torch.Tensor,
-    col_start: int,
-    col_stop: int,
-    field_patch: torch.Tensor | None = None,
-    patch_row_start: int = 0,
-    patch_row_end: int = 0,
-) -> torch.Tensor:
-    """Compatibility wrapper for raw cell-pair delta reductions."""
-    relation = StaticPairRelation(
-        "dynamics_tendency.weighted_cell_delta.raw",
-        first=cell1,
-        second=cell2,
-        valid=flux_valid,
-    )
-    return _sum_weighted_pair_delta_slots(
-        field=field,
-        cell_pair_relation=relation,
-        flux_valid_all_by_slot=flux_valid_all_by_slot,
-        edge_sign=edge_sign,
-        col_start=col_start,
-        col_stop=col_stop,
-        field_patch=field_patch,
-        patch_row_start=patch_row_start,
-        patch_row_end=patch_row_end,
-    )
-
-
-def _sum_weighted_pair_delta_slots(
-    *,
-    field: torch.Tensor,
-    cell_pair_relation: StaticPairRelation | tuple[Any, ...],
-    flux_valid_all_by_slot: tuple[bool, ...] | None = None,
-    edge_sign: torch.Tensor,
-    col_start: int,
-    col_stop: int,
-    field_patch: torch.Tensor | None = None,
-    patch_row_start: int = 0,
-    patch_row_end: int = 0,
-    field_patch_col_start: int = 0,
-) -> torch.Tensor:
-    """Accumulate weighted pair deltas with relation-owned patch gathers."""
-    cell1 = _dynamics_tendency_pair_field(cell_pair_relation, 0, "first")
-    cell2 = _dynamics_tendency_pair_field(cell_pair_relation, 1, "second")
-    flux_valid = _dynamics_tendency_pair_field(cell_pair_relation, 2, "valid")
-    if flux_valid is None:
-        raise ValueError(
-            "dynamics-tendency weighted pair delta requires a relation validity mask"
-        )
-    n_cells = cell1.shape[0]
-    if (
-        _dynamics_tendency_can_use_no_ad_full_slot_reduce(
-            field,
-            cell1,
-            cell2,
-            flux_valid,
-            edge_sign,
-            field_patch,
-        )
-        and cell1.shape[1] > 1
-    ):
-        field_cell1, field_cell2 = _dynamics_tendency_gather_pair_patch_or_base_cols(
-            cell_pair_relation,
-            field,
-            field_patch,
-            patch_row_start=patch_row_start,
-            patch_row_end=patch_row_end,
-            col_start=col_start,
-            col_stop=col_stop,
-            patch_col_start=field_patch_col_start,
-        )
-        contrib = edge_sign.unsqueeze(2) * (field_cell2 - field_cell1)
-        valid_all = (
-            flux_valid_all_by_slot is not None
-            and len(flux_valid_all_by_slot) == cell1.shape[1]
-            and all(flux_valid_all_by_slot)
-        )
-        if not valid_all:
-            contrib = contrib * flux_valid.unsqueeze(2).to(dtype=field.dtype)
-        return _sum_fortran_order(contrib, dim=1)
-    total: torch.Tensor | None = None
-    for batch_start, batch_stop in _dynamics_tendency_slot_batches(
-        cell1.shape[1], _dynamics_tendency_slot_gather_batch(field, cell1.shape[1])
-    ):
-        field_cell1_batch, field_cell2_batch = (
-            _dynamics_tendency_gather_pair_patch_or_base_cols(
-                cell_pair_relation,
-                field,
-                field_patch,
-                patch_row_start=patch_row_start,
-                patch_row_end=patch_row_end,
-                col_start=col_start,
-                col_stop=col_stop,
-                patch_col_start=field_patch_col_start,
-                slot_start=batch_start,
-                slot_stop=batch_stop,
-            )
-        )
-        for local_slot in range(batch_stop - batch_start):
-            slot = batch_start + local_slot
-            contrib = edge_sign[:, slot].view(n_cells, 1) * (
-                field_cell2_batch[:, local_slot, :]
-                - field_cell1_batch[:, local_slot, :]
-            )
-            valid_all = (
-                flux_valid_all_by_slot is not None and flux_valid_all_by_slot[slot]
-            )
-            if not valid_all:
-                contrib = contrib * flux_valid[:, slot].view(n_cells, 1).to(
-                    dtype=field.dtype
-                )
-            total = _accumulate_ordered_slot(total, contrib)
-    if total is None:
-        return field.new_zeros((n_cells, max(col_stop - col_start, 0)))
-    return total
-
-
-def _sum_weighted_pair_delta_slots_level(
-    *,
-    field: torch.Tensor,
-    cell_pair_relation: StaticPairRelation | tuple[Any, ...],
-    flux_valid_all_by_slot: tuple[bool, ...] | None = None,
-    edge_sign: torch.Tensor,
-    field_patch: torch.Tensor | None = None,
-    patch_row_start: int = 0,
-    patch_row_end: int = 0,
-) -> torch.Tensor:
-    """Level-shaped dynamics-tendency pair-delta reducer with a stable compile role."""
-    cell1 = _dynamics_tendency_pair_field(cell_pair_relation, 0, "first")
-    cell2 = _dynamics_tendency_pair_field(cell_pair_relation, 1, "second")
-    flux_valid = _dynamics_tendency_pair_field(cell_pair_relation, 2, "valid")
-    if flux_valid is None:
-        raise ValueError(
-            "dynamics-tendency weighted pair delta requires a relation validity mask"
-        )
-    n_cells = cell1.shape[0]
-    col_start = 0
-    col_stop = field.shape[1]
-    if (
-        _dynamics_tendency_can_use_no_ad_full_slot_reduce(
-            field,
-            cell1,
-            cell2,
-            flux_valid,
-            edge_sign,
-            field_patch,
-        )
-        and cell1.shape[1] > 1
-    ):
-        field_cell1, field_cell2 = _dynamics_tendency_gather_pair_patch_or_base_cols(
-            cell_pair_relation,
-            field,
-            field_patch,
-            patch_row_start=patch_row_start,
-            patch_row_end=patch_row_end,
-            col_start=col_start,
-            col_stop=col_stop,
-            patch_col_start=0,
-        )
-        contrib = edge_sign.unsqueeze(2) * (field_cell2 - field_cell1)
-        valid_all = (
-            flux_valid_all_by_slot is not None
-            and len(flux_valid_all_by_slot) == cell1.shape[1]
-            and all(flux_valid_all_by_slot)
-        )
-        if not valid_all:
-            contrib = contrib * flux_valid.unsqueeze(2).to(dtype=field.dtype)
-        return _sum_fortran_order(contrib, dim=1)
-    total: torch.Tensor | None = None
-    for batch_start, batch_stop in _dynamics_tendency_slot_batches(
-        cell1.shape[1], _dynamics_tendency_slot_gather_batch(field, cell1.shape[1])
-    ):
-        field_cell1_batch, field_cell2_batch = (
-            _dynamics_tendency_gather_pair_patch_or_base_cols(
-                cell_pair_relation,
-                field,
-                field_patch,
-                patch_row_start=patch_row_start,
-                patch_row_end=patch_row_end,
-                col_start=col_start,
-                col_stop=col_stop,
-                patch_col_start=0,
-                slot_start=batch_start,
-                slot_stop=batch_stop,
-            )
-        )
-        for local_slot in range(batch_stop - batch_start):
-            slot = batch_start + local_slot
-            contrib = edge_sign[:, slot].view(n_cells, 1) * (
-                field_cell2_batch[:, local_slot, :]
-                - field_cell1_batch[:, local_slot, :]
-            )
-            valid_all = (
-                flux_valid_all_by_slot is not None and flux_valid_all_by_slot[slot]
-            )
-            if not valid_all:
-                contrib = contrib * flux_valid[:, slot].view(n_cells, 1).to(
-                    dtype=field.dtype
-                )
-            total = _accumulate_ordered_slot(total, contrib)
-    if total is None:
-        return field.new_zeros((n_cells, col_stop))
     return total
 
 
@@ -6823,95 +5413,6 @@ def _subtract_weighted_pair_delta_slots_fortran_order(
                     result,
                 )
     return result
-
-
-def _sum_weighted_pair_delta_slots_inner_interface(
-    *,
-    field: torch.Tensor,
-    cell_pair_relation: StaticPairRelation | tuple[Any, ...],
-    flux_valid_all_by_slot: tuple[bool, ...] | None = None,
-    edge_sign: torch.Tensor,
-    field_patch: torch.Tensor | None = None,
-    patch_row_start: int = 0,
-    patch_row_end: int = 0,
-    field_patch_col_start: int = 1,
-) -> torch.Tensor:
-    """Interface-shaped dynamics-tendency pair-delta reducer with a stable compile role."""
-    cell1 = _dynamics_tendency_pair_field(cell_pair_relation, 0, "first")
-    cell2 = _dynamics_tendency_pair_field(cell_pair_relation, 1, "second")
-    flux_valid = _dynamics_tendency_pair_field(cell_pair_relation, 2, "valid")
-    if flux_valid is None:
-        raise ValueError(
-            "dynamics-tendency weighted pair delta requires a relation validity mask"
-        )
-    n_cells = cell1.shape[0]
-    col_start = 1
-    col_stop = field.shape[1] - 1
-    if (
-        _dynamics_tendency_can_use_no_ad_full_slot_reduce(
-            field,
-            cell1,
-            cell2,
-            flux_valid,
-            edge_sign,
-            field_patch,
-        )
-        and cell1.shape[1] > 1
-    ):
-        field_cell1, field_cell2 = _dynamics_tendency_gather_pair_patch_or_base_cols(
-            cell_pair_relation,
-            field,
-            field_patch,
-            patch_row_start=patch_row_start,
-            patch_row_end=patch_row_end,
-            col_start=col_start,
-            col_stop=col_stop,
-            patch_col_start=field_patch_col_start,
-        )
-        contrib = edge_sign.unsqueeze(2) * (field_cell2 - field_cell1)
-        valid_all = (
-            flux_valid_all_by_slot is not None
-            and len(flux_valid_all_by_slot) == cell1.shape[1]
-            and all(flux_valid_all_by_slot)
-        )
-        if not valid_all:
-            contrib = contrib * flux_valid.unsqueeze(2).to(dtype=field.dtype)
-        return _sum_fortran_order(contrib, dim=1)
-    total: torch.Tensor | None = None
-    for batch_start, batch_stop in _dynamics_tendency_slot_batches(
-        cell1.shape[1], _dynamics_tendency_slot_gather_batch(field, cell1.shape[1])
-    ):
-        field_cell1_batch, field_cell2_batch = (
-            _dynamics_tendency_gather_pair_patch_or_base_cols(
-                cell_pair_relation,
-                field,
-                field_patch,
-                patch_row_start=patch_row_start,
-                patch_row_end=patch_row_end,
-                col_start=col_start,
-                col_stop=col_stop,
-                patch_col_start=field_patch_col_start,
-                slot_start=batch_start,
-                slot_stop=batch_stop,
-            )
-        )
-        for local_slot in range(batch_stop - batch_start):
-            slot = batch_start + local_slot
-            contrib = edge_sign[:, slot].view(n_cells, 1) * (
-                field_cell2_batch[:, local_slot, :]
-                - field_cell1_batch[:, local_slot, :]
-            )
-            valid_all = (
-                flux_valid_all_by_slot is not None and flux_valid_all_by_slot[slot]
-            )
-            if not valid_all:
-                contrib = contrib * flux_valid[:, slot].view(n_cells, 1).to(
-                    dtype=field.dtype
-                )
-            total = _accumulate_ordered_slot(total, contrib)
-    if total is None:
-        return field.new_zeros((n_cells, max(col_stop - col_start, 0)))
-    return total
 
 
 _DYNAMICS_TENDENCY_CONNECTIVITY_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -7128,791 +5629,6 @@ def _dynamics_tendency_slot_all_true(
 ) -> tuple[bool, ...] | None:
     """Return setup-time per-slot all-true metadata for static topology masks."""
     return _static_slot_all_true(mask, allow_cuda_sync=allow_cuda_sync)
-
-
-def _dynamics_tendency_zero_row_patch_like(
-    field: torch.Tensor,
-    row_start: int,
-    row_end: int,
-) -> torch.Tensor:
-    return field.new_zeros((int(row_end) - int(row_start), *field.shape[1:]))
-
-
-class _DynamicsTendencyDebugTapObserver:
-    """Capture optional diagnostic tensors from dynamics-tendency section calls.
-
-    The observer derives diagnostics from section inputs and outputs without
-    changing the tendency calculation.
-    """
-
-    def __init__(
-        self,
-        call_arguments: Mapping[str, Any],
-        taps: dict[str, dict[str, Any]],
-    ) -> None:
-        self.a = call_arguments
-        self.taps = taps
-        self.rk_step = int(call_arguments["rk_step"])
-        self.n_levels = int(call_arguments["nVertLevels"])
-        self.cell_start = int(call_arguments["cellStart"]) - 1
-        self.cell_end = int(call_arguments["cellEnd"])
-        self.cell_solve_start = int(call_arguments["cellSolveStart"]) - 1
-        self.cell_solve_end = int(call_arguments["cellSolveEnd"])
-        self.edge_start = int(call_arguments["edgeStart"]) - 1
-        self.edge_end = int(call_arguments["edgeEnd"])
-        self.edge_solve_start = int(call_arguments["edgeSolveStart"]) - 1
-        self.edge_solve_end = int(call_arguments["edgeSolveEnd"])
-        self.vertex_start = int(call_arguments["vertexStart"]) - 1
-        self.vertex_end = int(call_arguments["vertexEnd"])
-        self.cell_solve_rel_start = self.cell_solve_start - self.cell_start
-        self.cell_solve_rel_end = self.cell_solve_end - self.cell_start
-        self.edge_solve_rel_start = self.edge_solve_start - self.edge_start
-        self.edge_solve_rel_end = self.edge_solve_end - self.edge_start
-        u = self._tensor("u")
-        self.device = u.device
-        self.dtype = u.dtype
-
-        self.kdiff = self._input_or_zeros(
-            "kdiff_in", (int(call_arguments["nCells"]) + 1, self.n_levels)
-        )
-        self.tend_u_euler = self._input_or_zeros(
-            "tend_u_euler_in", (int(call_arguments["nEdges"]) + 1, self.n_levels)
-        )
-        self.tend_w_euler = self._input_or_zeros(
-            "tend_w_euler_in",
-            (int(call_arguments["nCells"]) + 1, self.n_levels + 1),
-        )
-        self.tend_theta_euler = self._input_or_zeros(
-            "tend_theta_euler_in",
-            (int(call_arguments["nCells"]) + 1, self.n_levels),
-        )
-        self.tend_rho = self._input_or_zeros(
-            "tend_rho_in", (int(call_arguments["nCells"]) + 1, self.n_levels)
-        )
-        self.tend_u = self._zeros((int(call_arguments["nEdges"]) + 1, self.n_levels))
-        self.tend_w = self._zeros(
-            (int(call_arguments["nCells"]) + 1, self.n_levels + 1)
-        )
-        self.tend_theta = self._zeros(
-            (int(call_arguments["nCells"]) + 1, self.n_levels)
-        )
-        self.h_divergence = self._zeros(
-            (int(call_arguments["nCells"]) + 1, self.n_levels)
-        )
-        self.rthdynten = self._zeros((int(call_arguments["nCells"]) + 1, self.n_levels))
-        self.dpdz = self._zeros((int(call_arguments["nCells"]) + 1, self.n_levels))
-        self.delsq_w = self._zeros(
-            (int(call_arguments["nCells"]) + 1, self.n_levels + 1)
-        )
-        self.delsq_theta = self._zeros(
-            (int(call_arguments["nCells"]) + 1, self.n_levels)
-        )
-        self.tend_u_euler_edge_patch: torch.Tensor | None = None
-        self.kdiff_cell_patch: torch.Tensor | None = None
-        self.h_divergence_cell_patch: torch.Tensor | None = None
-        self.tend_rho_cell_patch: torch.Tensor | None = None
-        self.dpdz_cell_patch: torch.Tensor | None = None
-        self.tend_w_euler_cell_patch: torch.Tensor | None = None
-        self.tend_theta_euler_cell_patch: torch.Tensor | None = None
-        self.rthdynten_solve_patch: torch.Tensor | None = None
-        self.normal_velocity_tendency_hdiv_proof_taps: dict[str, Any] = {}
-        self.vertical_velocity_horizontal_advection_proof_taps: dict[str, Any] = {}
-        self.theta_horizontal_advection_proof_taps: dict[str, Any] = {}
-        self._recorded_t04 = False
-        self._recorded_t07 = False
-        self._recorded_t11 = False
-
-    def _tensor(self, name: str) -> torch.Tensor:
-        value = self.a[name]
-        if not isinstance(value, torch.Tensor):
-            raise TypeError(
-                f"dynamics-tendency debug tap input {name!r} must be a tensor"
-            )
-        return value
-
-    def _zeros(self, shape: tuple[int, ...]) -> torch.Tensor:
-        return torch.zeros(shape, dtype=self.dtype, device=self.device)
-
-    def _input_or_zeros(self, name: str, shape: tuple[int, ...]) -> torch.Tensor:
-        value = self.a.get(name)
-        return value if isinstance(value, torch.Tensor) else self._zeros(shape)
-
-    @staticmethod
-    def _row(base: torch.Tensor, start: int, end: int, patch: object) -> torch.Tensor:
-        if not isinstance(patch, torch.Tensor):
-            return base
-        out = base.clone()
-        out[start:end, ...] = patch
-        return out
-
-    @staticmethod
-    def _row_cols(
-        base: torch.Tensor,
-        row_start: int,
-        row_end: int,
-        col_start: int,
-        col_end: int,
-        patch: object,
-    ) -> torch.Tensor:
-        if not isinstance(patch, torch.Tensor):
-            return base
-        out = base.clone()
-        out[row_start:row_end, col_start:col_end, ...] = patch
-        return out
-
-    def _record(self, name: str, **arrays: torch.Tensor) -> None:
-        self.taps[name] = {key: value.clone() for key, value in arrays.items()}
-
-    def __call__(
-        self,
-        name: str,
-        _args: tuple[object, ...],
-        kwargs: Mapping[str, Any],
-        result: object,
-        _elapsed: float,
-    ) -> None:
-        getattr(self, f"_observe_{name}")(kwargs, result)
-
-    def _observe_mixing_initialization_mixing_initialization(
-        self, _kwargs: Mapping[str, Any], result: object
-    ) -> None:
-        tend_u_euler_patch, kdiff_patch, _h_mom, _h_theta = cast(
-            tuple[torch.Tensor, torch.Tensor, float, float], result
-        )
-        if self.rk_step == 1:
-            self.tend_u_euler_edge_patch = tend_u_euler_patch
-            self.kdiff_cell_patch = kdiff_patch
-        self._record(
-            "T01_post_kdiff",
-            kdiff=self._row(
-                self.kdiff, self.cell_start, self.cell_end, self.kdiff_cell_patch
-            ),
-        )
-
-    def _observe_density_tendency_density(
-        self, kwargs: Mapping[str, Any], result: object
-    ) -> None:
-        hdiv_patch, tend_rho_patch, dpdz_patch = cast(
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor], result
-        )
-        self.h_divergence_cell_patch = hdiv_patch
-        (
-            hdiv_sum,
-            hdiv_abs,
-            hdiv_count,
-            hdiv_terms,
-        ) = _normal_velocity_tendency_h_divergence_proof_tensors(
-            ru=kwargs["ru"],
-            dv_edge=kwargs["dv_edge"],
-            cell_edge_relation=kwargs["cell_edge_relation"],
-        )
-        self.normal_velocity_tendency_hdiv_proof_taps = {
-            "h_divergence_edge_sum": hdiv_sum,
-            "h_divergence_abs_term_sum": hdiv_abs,
-            "h_divergence_term_count": hdiv_count,
-            "normal_velocity_tendency_hdiv_terms": hdiv_terms,
-        }
-        if self.rk_step == 1:
-            self.tend_rho_cell_patch = tend_rho_patch
-            self.dpdz_cell_patch = dpdz_patch
-        self._record(
-            "T02_post_density",
-            h_divergence=self._row(
-                self.h_divergence,
-                self.cell_start,
-                self.cell_end,
-                self.h_divergence_cell_patch,
-            ),
-            tend_rho=self._row(
-                self.tend_rho,
-                self.cell_start,
-                self.cell_end,
-                self.tend_rho_cell_patch,
-            ),
-            dpdz=self._row(
-                self.dpdz, self.cell_start, self.cell_end, self.dpdz_cell_patch
-            ),
-        )
-
-    def _observe_normal_velocity_tendency_normal_velocity(
-        self, kwargs: Mapping[str, Any], result: object
-    ) -> None:
-        tend_u_patch, tend_u_euler_patch = cast(
-            tuple[torch.Tensor, torch.Tensor], result
-        )
-        if self.rk_step == 1:
-            if self.tend_u_euler_edge_patch is None:
-                self.tend_u_euler_edge_patch = self.tend_u_euler[
-                    self.edge_start : self.edge_end, :
-                ]
-            self.tend_u_euler_edge_patch = _dynamics_tendency_replace_patch_rows(
-                self.tend_u_euler_edge_patch,
-                self.edge_solve_rel_start,
-                self.edge_solve_rel_end,
-                tend_u_euler_patch,
-            )
-        solve_slice = slice(
-            int(kwargs["edge_solve_start"]), int(kwargs["edge_solve_end"])
-        )
-        normal_velocity_tendency_proof_taps = _normal_velocity_tendency_proof_tensors(
-            edge_cell_relation=kwargs["edge_cell_relation"],
-            edge_neighbor_relation=kwargs["edge_neighbor_relation"],
-            u=kwargs["u"],
-            u_edge=kwargs["u"][solve_slice, :],
-            rw=kwargs["rw"],
-            ke=kwargs["ke"],
-            h_divergence=kwargs["h_divergence"],
-            h_divergence_cell_patch=kwargs["h_divergence_cell_patch"],
-            h_divergence_abs_term_sum_cell_patch=self.normal_velocity_tendency_hdiv_proof_taps[
-                "h_divergence_abs_term_sum"
-            ],
-            pv_edge=kwargs["pv_edge"],
-            pv_edge_solve=kwargs["pv_edge"][solve_slice, :],
-            rho_edge_solve=kwargs["rho_edge"][solve_slice, :],
-            inv_dc_edge_solve=kwargs["inv_dc_edge"][solve_slice],
-            rdzw=kwargs["rdzw"],
-            fzm=kwargs["fzm"],
-            fzp=kwargs["fzp"],
-            n_vert_levels=kwargs["n_vert_levels"],
-            include_pressure_gradient=kwargs["include_pressure_gradient"],
-            zz=kwargs["zz"],
-            pp=kwargs["pp"],
-            dpdz=kwargs["dpdz"],
-            dpdz_cell_patch=kwargs["dpdz_cell_patch"],
-            cell_patch_row_start=kwargs["cell_patch_row_start"],
-            cell_patch_row_end=kwargs["cell_patch_row_end"],
-            inv_area_cell=self._tensor("invAreaCell"),
-            cqu_solve=kwargs["cqu"][solve_slice, :],
-            zxu_solve=kwargs["zxu"][solve_slice, :],
-        )
-        self._record(
-            "T03_post_u_base",
-            tend_u=self._row(
-                self.tend_u,
-                self.edge_solve_start,
-                self.edge_solve_end,
-                tend_u_patch,
-            ),
-            tend_u_euler=self._row(
-                self.tend_u_euler,
-                self.edge_solve_start,
-                self.edge_solve_end,
-                self.tend_u_euler_edge_patch,
-            ),
-            h_divergence=self._row(
-                self.h_divergence,
-                self.cell_start,
-                self.cell_end,
-                self.h_divergence_cell_patch,
-            ),
-            **self.normal_velocity_tendency_hdiv_proof_taps,
-            **normal_velocity_tendency_proof_taps,
-        )
-
-    def _record_t04(self) -> None:
-        if self._recorded_t04:
-            return
-        self._recorded_t04 = True
-        self._record(
-            "T04_post_u_mixing",
-            tend_u_euler=self._row(
-                self.tend_u_euler,
-                self.edge_start,
-                self.edge_end,
-                self.tend_u_euler_edge_patch,
-            ),
-        )
-
-    def _observe_normal_velocity_mixing_u_mixing(
-        self, _kwargs: Mapping[str, Any], result: object
-    ) -> None:
-        self.tend_u_euler_edge_patch = result  # type: ignore[assignment]
-        self._record_t04()
-
-    def _observe_normal_velocity_finalization_u_final(
-        self, _kwargs: Mapping[str, Any], result: object
-    ) -> None:
-        self._record_t04()
-        self._record(
-            "T05_post_u_final",
-            tend_u=self._row(
-                self.tend_u,
-                self.edge_solve_start,
-                self.edge_solve_end,
-                result,
-            ),
-        )
-
-    def _observe_vertical_velocity_horizontal_advection_w_hadv(
-        self, kwargs: Mapping[str, Any], result: object
-    ) -> None:
-        self.vertical_velocity_horizontal_advection_proof_taps = (
-            _dynamics_tendency_vertical_velocity_horizontal_advection_hadv_proof_taps(
-                w=self._tensor("w"),
-                ru=self._tensor("ru"),
-                fzm=kwargs["fzm"],
-                fzp=kwargs["fzp"],
-                solve_edge_slice=slice(self.edge_solve_start, self.edge_solve_end),
-                n_vert_levels=kwargs["n_vert_levels"],
-                edge_adv_cell_relation=kwargs["edge_adv_cell_relation"],
-                local_edge_relation=kwargs["local_edge_relation"],
-            )
-        )
-        self._record(
-            "T06_post_w_hadv",
-            tend_w=self._row_cols(
-                self.tend_w,
-                self.cell_solve_start,
-                self.cell_solve_end,
-                1,
-                self.n_levels,
-                result,
-            ),
-            **self.vertical_velocity_horizontal_advection_proof_taps,
-        )
-
-    def _record_t07(self) -> None:
-        if self._recorded_t07:
-            return
-        self._recorded_t07 = True
-        delsq_w_patch = getattr(self, "delsq_w_cell_patch", None)
-        self._record(
-            "T07_post_w_hmix",
-            delsq_w=self._row(
-                self.delsq_w,
-                self.cell_start,
-                self.cell_end,
-                delsq_w_patch,
-            )[:, : self.n_levels],
-            tend_w_euler=self._row(
-                self.tend_w_euler,
-                self.cell_start,
-                self.cell_end,
-                self.tend_w_euler_cell_patch,
-            ),
-        )
-
-    def _observe_vertical_velocity_horizontal_mixing_w_horizontal_mix(
-        self, kwargs: Mapping[str, Any], result: object
-    ) -> None:
-        delsq_w_inner_patch, _ = _sum_w_mix_slots(
-            cell_edge_relation=kwargs["cell_edge_relation"],
-            edge_cell_relation=kwargs["edge_cell_relation"],
-            edge_sign=kwargs["edge_sign_del2"],
-            rho_edge=kwargs["rho_edge"],
-            w=kwargs["w"],
-            kdiff=kwargs["kdiff"],
-            kdiff_patch=kwargs["kdiff_patch"],
-            patch_row_start=kwargs["patch_row_start"],
-            patch_row_end=kwargs["patch_row_end"],
-            mesh_scaling_del2=kwargs["mesh_scaling_del2"],
-            mesh_scaling_del2_slots=kwargs["mesh_scaling_del2_slots"],
-            n_vert_levels=kwargs["n_vert_levels"],
-        )
-        self.tend_w_euler_cell_patch = cast(torch.Tensor, result)
-        row_patch = self._zeros((self.cell_end - self.cell_start, self.n_levels + 1))
-        row_patch[:, 1 : self.n_levels] = delsq_w_inner_patch
-        self.delsq_w_cell_patch = row_patch
-        self._record_t07()
-
-    def _observe_vertical_velocity_vertical_transport_w_vertical(
-        self, kwargs: Mapping[str, Any], result: object
-    ) -> None:
-        self._record_t07()
-        wdwz_delta = _vertical_velocity_vertical_transport_w_vertical_flux_delta_region(
-            w_solve=kwargs["w_solve"],
-            rw_solve=kwargs["rw_solve"],
-            n_vert_levels=kwargs["n_vert_levels"],
-        )
-        (
-            tend_w_vertical_inner_patch,
-            tend_w_final_inner_patch,
-            tend_w_euler_pressure_inner_patch,
-            tend_w_euler_final_inner_patch,
-        ) = _vertical_velocity_vertical_transport_w_pointwise_update_region(
-            w_solve=kwargs["w_solve"],
-            pp_solve=kwargs["pp_solve"],
-            cqw_solve=kwargs["cqw_solve"],
-            rho_zz_solve=kwargs["rho_zz_solve"],
-            dpdz_solve=kwargs["dpdz_solve"],
-            wdwz_delta=wdwz_delta,
-            tend_w_solve_inner=kwargs["tend_w_solve_inner"],
-            tend_w_euler_solve_inner=kwargs["tend_w_euler_solve_inner"],
-            inv_area_cell_solve=kwargs["inv_area_cell_solve"],
-            rdzu=kwargs["rdzu"],
-            rdzw=kwargs["rdzw"],
-            fzm=kwargs["fzm"],
-            fzp=kwargs["fzp"],
-            n_vert_levels=kwargs["n_vert_levels"],
-            include_pressure_gradient=kwargs["include_pressure_gradient"],
-            include_vertical_mix=kwargs["include_vertical_mix"],
-            v_mom_eddy_visc2=kwargs["v_mom_eddy_visc2"],
-        )
-        live_final, live_euler = cast(tuple[torch.Tensor, torch.Tensor], result)
-        if not torch.equal(live_final, tend_w_final_inner_patch) or not torch.equal(
-            live_euler, tend_w_euler_final_inner_patch
-        ):
-            raise RuntimeError(
-                "dynamics-tendency vertical-velocity-vertical-transport proof reconstruction changed live outputs"
-            )
-        before_w = kwargs["tend_w_solve_inner"]
-        before_euler = kwargs["tend_w_euler_solve_inner"]
-        w = self._tensor("w")
-        n = self.n_levels
-        vertical_velocity_vertical_transport_wdwz = (
-            _vertical_velocity_vertical_transport_w_vertical_flux_proof_tensor(
-                w_solve=kwargs["w_solve"],
-                rw_solve=kwargs["rw_solve"],
-                n_vert_levels=n,
-            )
-        )
-        vertical_velocity_vertical_transport_wdwz_abs = _vertical_velocity_vertical_transport_w_vertical_flux_abs_term_sum_proof_tensor(
-            w_solve=kwargs["w_solve"],
-            rw_solve=kwargs["rw_solve"],
-            n_vert_levels=n,
-        )
-        shape = (self.cell_solve_end - self.cell_solve_start, n + 1)
-        vertical_velocity_vertical_transport_hadv_area = w.new_zeros(shape)
-        vertical_velocity_vertical_transport_hadv_abs = w.new_zeros(shape)
-        vertical_velocity_vertical_transport_vertical = w.new_zeros(shape)
-        vertical_velocity_vertical_transport_vertical_abs = w.new_zeros(shape)
-        vertical_velocity_vertical_transport_pressure = w.new_zeros(shape)
-        vertical_velocity_vertical_transport_pressure_abs = w.new_zeros(shape)
-        vertical_velocity_vertical_transport_tend_w_abs = w.new_zeros(shape)
-        vertical_velocity_vertical_transport_euler_abs = w.new_zeros(shape)
-        inv_area = kwargs["inv_area_cell_solve"]
-        vertical_velocity_vertical_transport_hadv_area[:, 1:n] = (
-            before_w * inv_area.unsqueeze(1)
-        )
-        vertical_velocity_vertical_transport_hadv_abs[:, 1:n] = torch.abs(
-            self.vertical_velocity_horizontal_advection_proof_taps[
-                "vertical_velocity_horizontal_advection_tend_w_abs_term_sum"
-            ][:, 1:n]
-            * torch.abs(inv_area).unsqueeze(1)
-        )
-        rdzu = kwargs["rdzu"]
-        vertical_velocity_vertical_transport_vertical[:, 1:n] = -rdzu[1:n].unsqueeze(
-            0
-        ) * (
-            vertical_velocity_vertical_transport_wdwz[:, 2 : n + 1]
-            - vertical_velocity_vertical_transport_wdwz[:, 1:n]
-        )
-        vertical_velocity_vertical_transport_vertical_abs[:, 1:n] = torch.abs(
-            rdzu[1:n].unsqueeze(0)
-        ) * (
-            vertical_velocity_vertical_transport_wdwz_abs[:, 2 : n + 1]
-            + vertical_velocity_vertical_transport_wdwz_abs[:, 1:n]
-        )
-        vertical_velocity_vertical_transport_tend_w_abs[:, 1:n] = (
-            vertical_velocity_vertical_transport_hadv_abs[:, 1:n]
-            + vertical_velocity_vertical_transport_vertical_abs[:, 1:n]
-        )
-        if self.rk_step == 1:
-            vertical_velocity_vertical_transport_pressure[:, 1:n] = (
-                tend_w_euler_pressure_inner_patch - before_euler
-            )
-            cqw_inner = kwargs["cqw_solve"][:, 1:n]
-            pp_solve = kwargs["pp_solve"]
-            dpdz_solve = kwargs["dpdz_solve"]
-            fzm = kwargs["fzm"]
-            fzp = kwargs["fzp"]
-            vertical_velocity_vertical_transport_pressure_abs[:, 1:n] = torch.abs(
-                cqw_inner
-            ) * (
-                torch.abs(rdzu[1:n].unsqueeze(0) * pp_solve[:, 1:n])
-                + torch.abs(rdzu[1:n].unsqueeze(0) * pp_solve[:, : n - 1])
-                + torch.abs(fzm[1:n].unsqueeze(0) * dpdz_solve[:, 1:n])
-                + torch.abs(fzp[1:n].unsqueeze(0) * dpdz_solve[:, : n - 1])
-            )
-            vertical_velocity_vertical_transport_euler_abs[:, 1:n] = (
-                torch.abs(before_euler)
-                + vertical_velocity_vertical_transport_pressure_abs[:, 1:n]
-            )
-        vertical_velocity_vertical_transport_proof_taps = {
-            "vertical_velocity_horizontal_advection_tend_w_abs_term_sum": self.vertical_velocity_horizontal_advection_proof_taps[
-                "vertical_velocity_horizontal_advection_tend_w_abs_term_sum"
-            ],
-            "vertical_velocity_vertical_transport_wdwz": vertical_velocity_vertical_transport_wdwz,
-            "vertical_velocity_vertical_transport_wdwz_abs_term_sum": vertical_velocity_vertical_transport_wdwz_abs,
-            "vertical_velocity_vertical_transport_hadv_area": vertical_velocity_vertical_transport_hadv_area,
-            "vertical_velocity_vertical_transport_hadv_area_abs_term_sum": vertical_velocity_vertical_transport_hadv_abs,
-            "vertical_velocity_vertical_transport_vertical_tendency": vertical_velocity_vertical_transport_vertical,
-            "vertical_velocity_vertical_transport_vertical_tendency_abs_term_sum": vertical_velocity_vertical_transport_vertical_abs,
-            "vertical_velocity_vertical_transport_pressure_gradient": vertical_velocity_vertical_transport_pressure,
-            "vertical_velocity_vertical_transport_pressure_gradient_abs_term_sum": vertical_velocity_vertical_transport_pressure_abs,
-            "vertical_velocity_vertical_transport_tend_w_abs_term_sum": vertical_velocity_vertical_transport_tend_w_abs,
-            "vertical_velocity_vertical_transport_tend_w_euler_abs_term_sum": vertical_velocity_vertical_transport_euler_abs,
-        }
-        pressure_cell_patch = self.tend_w_euler_cell_patch
-        if self.rk_step == 1:
-            if pressure_cell_patch is None:
-                pressure_cell_patch = self.tend_w_euler[
-                    self.cell_start : self.cell_end, :
-                ]
-            pressure_cell_patch = _dynamics_tendency_replace_patch_rows_cols(
-                pressure_cell_patch,
-                self.cell_solve_rel_start,
-                self.cell_solve_rel_end,
-                1,
-                n,
-                tend_w_euler_pressure_inner_patch,
-            )
-            self.tend_w_euler_cell_patch = _dynamics_tendency_replace_patch_rows_cols(
-                pressure_cell_patch,
-                self.cell_solve_rel_start,
-                self.cell_solve_rel_end,
-                1,
-                n,
-                tend_w_euler_final_inner_patch,
-            )
-        self._record(
-            "T08_post_w_vert",
-            tend_w=self._row_cols(
-                self.tend_w,
-                self.cell_solve_start,
-                self.cell_solve_end,
-                1,
-                n,
-                tend_w_vertical_inner_patch,
-            ),
-            tend_w_euler=self._row(
-                self.tend_w_euler,
-                self.cell_start,
-                self.cell_end,
-                pressure_cell_patch,
-            ),
-            **vertical_velocity_vertical_transport_proof_taps,
-        )
-        self._record(
-            "T09_post_w_final",
-            tend_w=self._row_cols(
-                self.tend_w,
-                self.cell_solve_start,
-                self.cell_solve_end,
-                1,
-                n,
-                tend_w_final_inner_patch,
-            ),
-        )
-
-    def _observe_theta_horizontal_advection_theta_hadv(
-        self, kwargs: Mapping[str, Any], result: object
-    ) -> None:
-        self.theta_horizontal_advection_proof_taps = (
-            _dynamics_tendency_theta_horizontal_advection_hadv_proof_taps(
-                theta_m=self._tensor("theta_m"),
-                theta_m_save=self._tensor("theta_m_save"),
-                ru=self._tensor("ru"),
-                ru_save=self._tensor("ru_save"),
-                solve_edge_slice=slice(self.edge_solve_start, self.edge_solve_end),
-                n_vert_levels=self.n_levels,
-                rk_step=self.rk_step,
-                edge_adv_cell_relation=kwargs["edge_adv_cell_relation"],
-                local_edge_relation=kwargs["local_edge_relation"],
-                cell_edge_relation=kwargs["cell_edge_relation"],
-                edge_cell_relation=kwargs["edge_cell_relation"],
-            )
-        )
-        self.tend_theta_solve_patch = result
-        self._record(
-            "T10_post_theta_hadv",
-            tend_theta=self._row(
-                self.tend_theta,
-                self.cell_solve_start,
-                self.cell_solve_end,
-                result,
-            ),
-            **self.theta_horizontal_advection_proof_taps,
-        )
-
-    def _record_t11(self) -> None:
-        if self._recorded_t11:
-            return
-        self._recorded_t11 = True
-        self._record(
-            "T11_post_theta_hmix",
-            delsq_theta=self._row(
-                self.delsq_theta,
-                self.cell_start,
-                self.cell_end,
-                getattr(self, "delsq_theta_cell_patch", None),
-            ),
-            tend_theta_euler=self._row(
-                self.tend_theta_euler,
-                self.cell_start,
-                self.cell_end,
-                self.tend_theta_euler_cell_patch,
-            ),
-        )
-
-    def _observe_theta_horizontal_mixing_theta_horizontal_mix(
-        self, kwargs: Mapping[str, Any], result: object
-    ) -> None:
-        self.delsq_theta_cell_patch, _ = _sum_theta_mix_slots(
-            cell_edge_relation=kwargs["cell_edge_relation"],
-            edge_cell_relation=kwargs["edge_cell_relation"],
-            edge_sign=kwargs["edge_sign_del2"],
-            rho_edge=kwargs["rho_edge"],
-            theta_m=kwargs["theta_m"],
-            kdiff=kwargs["kdiff"],
-            kdiff_patch=kwargs["kdiff_patch"],
-            patch_row_start=kwargs["patch_row_start"],
-            patch_row_end=kwargs["patch_row_end"],
-            pr_scale=kwargs["pr_scale"],
-        )
-        self.tend_theta_euler_cell_patch = cast(torch.Tensor, result)
-        self._record_t11()
-
-    def _observe_theta_vertical_advection_diabatic_theta_vertical(
-        self, kwargs: Mapping[str, Any], result: object
-    ) -> None:
-        self._record_t11()
-        tend_theta_patch, self.rthdynten_solve_patch = cast(
-            tuple[torch.Tensor, torch.Tensor], result
-        )
-        n = self.n_levels
-        before = kwargs["tend_theta_solve"]
-        theta_vertical_advection_diabatic_wdtz = (
-            _theta_vertical_advection_diabatic_theta_vertical_flux_proof_tensor(
-                theta_m_solve=kwargs["theta_m_solve"],
-                theta_m_save_solve=kwargs["theta_m_save_solve"],
-                rw_solve=kwargs["rw_solve"],
-                rw_save_solve=kwargs["rw_save_solve"],
-                fzm=kwargs["fzm"],
-                fzp=kwargs["fzp"],
-                coef_3rd_order=kwargs["coef_3rd_order"],
-                n_vert_levels=n,
-            )
-        )
-        theta_vertical_advection_diabatic_wdtz_abs = _theta_vertical_advection_diabatic_theta_vertical_flux_abs_term_sum_proof_tensor(
-            theta_m_solve=kwargs["theta_m_solve"],
-            theta_m_save_solve=kwargs["theta_m_save_solve"],
-            rw_solve=kwargs["rw_solve"],
-            rw_save_solve=kwargs["rw_save_solve"],
-            fzm=kwargs["fzm"],
-            fzp=kwargs["fzp"],
-            coef_3rd_order=kwargs["coef_3rd_order"],
-            n_vert_levels=n,
-        )
-        inv_area = kwargs["inv_area_cell_solve"]
-        theta_vertical_advection_diabatic_hadv_area = before * inv_area.unsqueeze(1)
-        theta_vertical_advection_diabatic_hadv_abs = torch.abs(
-            (
-                self.theta_horizontal_advection_proof_taps[
-                    "theta_horizontal_advection_tend_theta_abs_term_sum"
-                ]
-                + self.theta_horizontal_advection_proof_taps[
-                    "theta_horizontal_advection_perturbation_abs_term_sum"
-                ]
-            )
-            * torch.abs(inv_area).unsqueeze(1)
-        )
-        rdzw = kwargs["rdzw"]
-        theta_vertical_advection_diabatic_vertical = -rdzw[:n].unsqueeze(0) * (
-            theta_vertical_advection_diabatic_wdtz[:, 1 : n + 1]
-            - theta_vertical_advection_diabatic_wdtz[:, :n]
-        )
-        theta_vertical_advection_diabatic_vertical_abs = torch.abs(
-            rdzw[:n].unsqueeze(0)
-        ) * (
-            theta_vertical_advection_diabatic_wdtz_abs[:, 1 : n + 1]
-            + theta_vertical_advection_diabatic_wdtz_abs[:, :n]
-        )
-        numerator = (
-            theta_vertical_advection_diabatic_hadv_area
-            + theta_vertical_advection_diabatic_vertical
-            - kwargs["tend_rho_solve"] * kwargs["theta_m_solve"]
-        )
-        diabatic = kwargs["rho_zz_solve"] * kwargs["rt_diabatic_tend_solve"]
-        numerator_abs = (
-            theta_vertical_advection_diabatic_hadv_abs
-            + theta_vertical_advection_diabatic_vertical_abs
-            + torch.abs(kwargs["tend_rho_solve"] * kwargs["theta_m_solve"])
-        )
-        diabatic_abs = torch.abs(diabatic)
-        tend_abs = (
-            theta_vertical_advection_diabatic_hadv_abs
-            + theta_vertical_advection_diabatic_vertical_abs
-            + diabatic_abs
-        )
-        rth_abs = numerator_abs / torch.clamp(
-            torch.abs(kwargs["rho_zz_solve"]),
-            min=torch.finfo(kwargs["rho_zz_solve"].dtype).tiny,
-        )
-        proof = {
-            "theta_horizontal_advection_tend_theta_abs_term_sum": self.theta_horizontal_advection_proof_taps[
-                "theta_horizontal_advection_tend_theta_abs_term_sum"
-            ],
-            "theta_horizontal_advection_perturbation_abs_term_sum": self.theta_horizontal_advection_proof_taps[
-                "theta_horizontal_advection_perturbation_abs_term_sum"
-            ],
-            "theta_vertical_advection_diabatic_wdtz": theta_vertical_advection_diabatic_wdtz,
-            "theta_vertical_advection_diabatic_wdtz_abs_term_sum": theta_vertical_advection_diabatic_wdtz_abs,
-            "theta_vertical_advection_diabatic_hadv_area": theta_vertical_advection_diabatic_hadv_area,
-            "theta_vertical_advection_diabatic_hadv_area_abs_term_sum": theta_vertical_advection_diabatic_hadv_abs,
-            "theta_vertical_advection_diabatic_vertical_tendency": theta_vertical_advection_diabatic_vertical,
-            "theta_vertical_advection_diabatic_vertical_tendency_abs_term_sum": theta_vertical_advection_diabatic_vertical_abs,
-            "theta_vertical_advection_diabatic_rthdynten_numerator": numerator,
-            "theta_vertical_advection_diabatic_rthdynten_numerator_abs_term_sum": numerator_abs,
-            "theta_vertical_advection_diabatic_diabatic_increment": diabatic,
-            "theta_vertical_advection_diabatic_diabatic_abs_term_sum": diabatic_abs,
-            "theta_vertical_advection_diabatic_tend_theta_abs_term_sum": tend_abs,
-            "theta_vertical_advection_diabatic_rthdynten_abs_term_sum": rth_abs,
-        }
-        self.tend_theta_solve_patch = tend_theta_patch
-        self._record(
-            "T12_post_theta_vert",
-            tend_theta=self._row(
-                self.tend_theta,
-                self.cell_solve_start,
-                self.cell_solve_end,
-                tend_theta_patch,
-            ),
-            rthdynten=self._row(
-                self.rthdynten,
-                self.cell_solve_start,
-                self.cell_solve_end,
-                self.rthdynten_solve_patch,
-            ),
-            **proof,
-        )
-
-    def _observe_theta_vertical_mixing_theta_finalization_theta_final(
-        self, _kwargs: Mapping[str, Any], result: object
-    ) -> None:
-        tend_theta_patch, self.tend_theta_euler_cell_patch = cast(
-            tuple[torch.Tensor, torch.Tensor | None], result
-        )
-        euler_solve = (
-            self.tend_theta_euler_cell_patch[
-                self.cell_solve_start - self.cell_start : self.cell_solve_end
-                - self.cell_start,
-                :,
-            ]
-            if self.tend_theta_euler_cell_patch is not None
-            else _kwargs["tend_theta_euler_solve_base"]
-        )
-        self._record(
-            "T13_post_theta_final",
-            tend_theta=self._row(
-                self.tend_theta,
-                self.cell_solve_start,
-                self.cell_solve_end,
-                tend_theta_patch,
-            ),
-            tend_theta_euler=self._row(
-                self.tend_theta_euler,
-                self.cell_solve_start,
-                self.cell_solve_end,
-                euler_solve,
-            ),
-            rthdynten=self._row(
-                self.rthdynten,
-                self.cell_solve_start,
-                self.cell_solve_end,
-                self.rthdynten_solve_patch,
-            ),
-        )
 
 
 def _dynamics_tendency_pair_local_metadata(
@@ -9060,273 +6776,6 @@ _DYNAMICS_TENDENCY_SECTION_PROFILE_NAMES = MappingProxyType(
 )
 
 
-def _observe_dynamics_tendency_vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_parent(
-    inner: Callable[..., Any],
-    observer: Callable[
-        [str, tuple[object, ...], Mapping[str, Any], object, float], None
-    ],
-) -> Callable[..., Any]:
-    """Expose vertical-velocity-horizontal-mixing/vertical-velocity-vertical-transport proof taps around the production parent without replacing it."""
-
-    @wraps(inner)
-    def observed(*args, **kwargs):
-        started = perf_counter()
-        result = inner(*args, **kwargs)
-        elapsed = perf_counter() - started
-        vertical_velocity_horizontal_mixing_keys = (
-            "cell_edge_relation",
-            "edge_cell_relation",
-            "solve_cell_pair_relation",
-            "edge_sign_del2",
-            "edge_sign_del4",
-            "rho_edge",
-            "w",
-            "kdiff",
-            "delsq_w_base",
-            "n_vert_levels",
-            "patch_row_start",
-            "patch_row_end",
-            "solve_relative_start",
-            "solve_relative_end",
-            "solve_flux_valid_all_by_slot",
-            "kdiff_patch",
-            "mesh_scaling_del2",
-            "mesh_scaling_del2_slots",
-        )
-        vertical_velocity_horizontal_mixing_kwargs = {
-            name: kwargs[name] for name in vertical_velocity_horizontal_mixing_keys
-        }
-        vertical_velocity_horizontal_mixing_result = (
-            _vertical_velocity_horizontal_mixing_w_horizontal_mix_section_region(
-                **vertical_velocity_horizontal_mixing_kwargs
-            )
-        )
-        observer(
-            "vertical_velocity_horizontal_mixing_w_horizontal_mix",
-            (),
-            vertical_velocity_horizontal_mixing_kwargs,
-            vertical_velocity_horizontal_mixing_result,
-            elapsed,
-        )
-        row_start = kwargs["patch_row_start"] + kwargs["solve_relative_start"]
-        row_end = kwargs["patch_row_start"] + kwargs["solve_relative_end"]
-        n_levels = kwargs["n_vert_levels"]
-        vertical_velocity_vertical_transport_kwargs = {
-            "w_solve": kwargs["w"][row_start:row_end, :],
-            "rw_solve": kwargs["rw_solve"],
-            "pp_solve": kwargs["pp_solve"],
-            "cqw_solve": kwargs["cqw_solve"],
-            "rho_zz_solve": kwargs["rho_zz_solve"],
-            "dpdz_solve": kwargs["dpdz_solve"],
-            "tend_w_solve_inner": kwargs["tend_w_solve_inner"],
-            "tend_w_euler_solve_inner": vertical_velocity_horizontal_mixing_result[
-                kwargs["solve_relative_start"] : kwargs["solve_relative_end"],
-                1:n_levels,
-            ],
-            "inv_area_cell_solve": kwargs["inv_area_cell_solve"],
-            "rdzu": kwargs["rdzu"],
-            "rdzw": kwargs["rdzw"],
-            "fzm": kwargs["fzm"],
-            "fzp": kwargs["fzp"],
-            "n_vert_levels": n_levels,
-            "include_pressure_gradient": kwargs["include_pressure_gradient"],
-            "include_vertical_mix": kwargs["include_vertical_mix"],
-            "v_mom_eddy_visc2": kwargs["v_mom_eddy_visc2"],
-        }
-        tend_w_final, euler_cell_final = result
-        vertical_velocity_vertical_transport_result = (
-            tend_w_final,
-            euler_cell_final[
-                kwargs["solve_relative_start"] : kwargs["solve_relative_end"],
-                1:n_levels,
-            ],
-        )
-        observer(
-            "vertical_velocity_vertical_transport_w_vertical",
-            (),
-            vertical_velocity_vertical_transport_kwargs,
-            vertical_velocity_vertical_transport_result,
-            0.0,
-        )
-        return result
-
-    return observed
-
-
-def _observe_dynamics_tendency_theta_horizontal_advection_theta_finalization_parent(
-    inner: Callable[..., Any],
-    observer: Callable[
-        [str, tuple[object, ...], Mapping[str, Any], object, float], None
-    ],
-) -> Callable[..., Any]:
-    """Expose theta proof taps without replacing the production parent call."""
-
-    @wraps(inner)
-    def observed(*args, **kwargs):
-        started = perf_counter()
-        result = inner(*args, **kwargs)
-        elapsed = perf_counter() - started
-
-        theta_horizontal_advection_keys = (
-            "theta_m",
-            "ru",
-            "edge_solve_start",
-            "edge_solve_end",
-            "n_vert_levels",
-            "edge_adv_cell_relation",
-            "local_edge_relation",
-            "include_perturbation_flux",
-            "solve_cell_edge_relation",
-            "solve_edge_cell_relation",
-            "ru_save",
-            "theta_m_save",
-            "cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab",
-        )
-        theta_horizontal_advection_kwargs = {
-            name: kwargs[name] for name in theta_horizontal_advection_keys
-        }
-        theta_horizontal_advection_kwargs["cell_edge_relation"] = (
-            theta_horizontal_advection_kwargs.pop("solve_cell_edge_relation")
-        )
-        theta_horizontal_advection_kwargs["edge_cell_relation"] = (
-            theta_horizontal_advection_kwargs.pop("solve_edge_cell_relation")
-        )
-        theta_horizontal_advection_result = (
-            _theta_horizontal_advection_theta_hadv_owned_section_region(
-                **theta_horizontal_advection_kwargs
-            )
-        )
-        observer(
-            "theta_horizontal_advection_theta_hadv",
-            (),
-            theta_horizontal_advection_kwargs,
-            theta_horizontal_advection_result,
-            elapsed,
-        )
-
-        theta_horizontal_mixing_result = None
-        if kwargs["include_horizontal_mix"]:
-            theta_horizontal_mixing_kwargs = {
-                "cell_edge_relation": kwargs["mix_cell_edge_relation"],
-                "edge_cell_relation": kwargs["mix_edge_cell_relation"],
-                "solve_cell_pair_relation": kwargs["solve_cell_pair_relation"],
-                "edge_sign_del2": kwargs["edge_sign_del2"],
-                "edge_sign_del4": kwargs["edge_sign_del4"],
-                "rho_edge": kwargs["rho_edge"],
-                "theta_m": kwargs["theta_m"],
-                "kdiff": kwargs["kdiff"],
-                "delsq_theta_base": kwargs["delsq_theta_base"],
-                "pr_scale": kwargs["pr_scale"],
-                "patch_row_start": kwargs["patch_row_start"],
-                "patch_row_end": kwargs["patch_row_end"],
-                "solve_relative_start": kwargs["solve_relative_start"],
-                "solve_relative_end": kwargs["solve_relative_end"],
-                "solve_flux_valid_all_by_slot": kwargs["solve_flux_valid_all_by_slot"],
-                "kdiff_patch": kwargs["kdiff_patch"],
-            }
-            theta_horizontal_mixing_result = (
-                _theta_horizontal_mixing_theta_horizontal_mix_section_region(
-                    **theta_horizontal_mixing_kwargs
-                )
-            )
-            observer(
-                "theta_horizontal_mixing_theta_horizontal_mix",
-                (),
-                theta_horizontal_mixing_kwargs,
-                theta_horizontal_mixing_result,
-                0.0,
-            )
-
-        theta_vertical_advection_diabatic_keys = (
-            "theta_m_solve",
-            "theta_m_save_solve",
-            "rw_solve",
-            "rw_save_solve",
-            "rho_zz_solve",
-            "rt_diabatic_tend_solve",
-            "tend_rho_solve",
-            "inv_area_cell_solve",
-            "rdzw",
-            "fzm",
-            "fzp",
-            "coef_3rd_order",
-            "n_vert_levels",
-        )
-        theta_vertical_advection_diabatic_kwargs = {
-            name: kwargs[name] for name in theta_vertical_advection_diabatic_keys
-        }
-        theta_vertical_advection_diabatic_kwargs["tend_theta_solve"] = (
-            theta_horizontal_advection_result
-        )
-        theta_vertical_advection_diabatic_result = (
-            _theta_vertical_advection_diabatic_theta_vertical_section_region(
-                **theta_vertical_advection_diabatic_kwargs
-            )
-        )
-        observer(
-            "theta_vertical_advection_diabatic_theta_vertical",
-            (),
-            theta_vertical_advection_diabatic_kwargs,
-            theta_vertical_advection_diabatic_result,
-            0.0,
-        )
-
-        theta_vertical_mixing_keys = (
-            "tend_theta_euler_cell_base",
-            "tend_theta_euler_solve_base",
-            "theta_work_solve",
-            "rho_zz_solve",
-            "zgrid_solve",
-            "tend_rtheta_physics_solve",
-            "apply_vertical_mix",
-            "v_theta_eddy_visc2",
-            "prandtl_inv",
-            "n_vert_levels",
-        )
-        theta_vertical_mixing_kwargs = {
-            name: kwargs[name] for name in theta_vertical_mixing_keys
-        }
-        theta_vertical_mixing_kwargs.update(
-            {
-                "tend_theta_solve": theta_vertical_advection_diabatic_result[0],
-                "tend_theta_euler_cell_patch": theta_horizontal_mixing_result,
-                "cell_solve_rel_start": kwargs["solve_relative_start"],
-                "cell_solve_rel_end": kwargs["solve_relative_end"],
-            }
-        )
-        theta_vertical_mixing_result = (
-            _theta_vertical_mixing_theta_finalization_theta_final_section_region(
-                **theta_vertical_mixing_kwargs
-            )
-        )
-        observer(
-            "theta_vertical_mixing_theta_finalization_theta_final",
-            (),
-            theta_vertical_mixing_kwargs,
-            theta_vertical_mixing_result,
-            0.0,
-        )
-
-        expected = (
-            theta_vertical_mixing_result[0],
-            theta_vertical_mixing_result[1],
-            theta_vertical_advection_diabatic_result[1],
-        )
-        for actual_value, expected_value in zip(result, expected):
-            if actual_value is None or expected_value is None:
-                if actual_value is not expected_value:
-                    raise RuntimeError(
-                        "dynamics-tendency theta-horizontal-advection-theta-finalization parent changed a nullable live output"
-                    )
-            elif not torch.equal(actual_value, expected_value):
-                raise RuntimeError(
-                    "dynamics-tendency theta-horizontal-advection-theta-finalization parent differs from its section sequence"
-                )
-        return result
-
-    return observed
-
-
 def _profile_dynamics_tendency_parent(
     fn: Callable[..., Any], name: str
 ) -> Callable[..., Any]:
@@ -9348,10 +6797,6 @@ def build_dynamics_tendency_section_ops(
     compile_backend: str = "inductor",
     stage_key: tuple[object, ...] = (),
     profile_sections: bool = False,
-    section_observer: (
-        Callable[[str, tuple[object, ...], Mapping[str, Any], object, float], None]
-        | None
-    ) = None,
 ) -> DynamicsTendencySectionOps:
     """Build runner-owned wrappers around the one canonical dynamics-tendency equation table."""
     requested = frozenset(compile_region_names)
@@ -9368,7 +6813,7 @@ def build_dynamics_tendency_section_ops(
         raise ValueError(
             f"unknown dynamics-tendency section compile targets: {unknown}"
         )
-    if not requested and not profile_sections and section_observer is None:
+    if not requested and not profile_sections:
         return _CANONICAL_DYNAMICS_TENDENCY_SECTION_OPS
 
     from mpas_pytorch.dynamics.compile_utils import maybe_compile_kernel
@@ -9461,23 +6906,6 @@ def build_dynamics_tendency_section_ops(
                     field_name,
                 ),
             )
-        if section_observer is not None:
-            inner = fn
-
-            @wraps(inner)
-            def observed(
-                *args,
-                _inner=inner,
-                _field_name=field_name,
-                **kwargs,
-            ):
-                started = perf_counter()
-                result = _inner(*args, **kwargs)
-                elapsed = perf_counter() - started
-                section_observer(_field_name, args, kwargs, result, elapsed)
-                return result
-
-            fn = observed
         profile_name = _DYNAMICS_TENDENCY_SECTION_PROFILE_NAMES.get(field_name)
         if profile_sections and profile_name is not None:
             inner = fn
@@ -9518,30 +6946,6 @@ def build_dynamics_tendency_section_ops(
         }
     ):
         normal_velocity_mixing_normal_velocity_finalization_u_tendency = None
-    if (
-        section_observer is not None
-        and normal_velocity_mixing_normal_velocity_finalization_u_tendency is not None
-    ):
-        inner = normal_velocity_mixing_normal_velocity_finalization_u_tendency
-
-        @wraps(inner)
-        def observed_normal_velocity_mixing_normal_velocity_finalization(
-            *args, _inner=inner, **kwargs
-        ):
-            started = perf_counter()
-            result = _inner(*args, **kwargs)
-            elapsed = perf_counter() - started
-            section_observer(
-                "normal_velocity_mixing_u_mixing", args, kwargs, result[0], elapsed
-            )
-            section_observer(
-                "normal_velocity_finalization_u_final", args, kwargs, result[1], 0.0
-            )
-            return result
-
-        normal_velocity_mixing_normal_velocity_finalization_u_tendency = (
-            observed_normal_velocity_mixing_normal_velocity_finalization
-        )
     if (
         profile_sections
         and normal_velocity_mixing_normal_velocity_finalization_u_tendency is not None
@@ -9584,15 +6988,6 @@ def build_dynamics_tendency_section_ops(
         }
     ):
         vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency = None
-    if (
-        section_observer is not None
-        and vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency
-        is not None
-    ):
-        vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency = _observe_dynamics_tendency_vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_parent(
-            vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency,
-            section_observer,
-        )
     if (
         profile_sections
         and vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency
@@ -9643,14 +7038,6 @@ def build_dynamics_tendency_section_ops(
     ):
         theta_horizontal_advection_theta_finalization_theta_tendency = None
     if (
-        section_observer is not None
-        and theta_horizontal_advection_theta_finalization_theta_tendency is not None
-    ):
-        theta_horizontal_advection_theta_finalization_theta_tendency = _observe_dynamics_tendency_theta_horizontal_advection_theta_finalization_parent(
-            theta_horizontal_advection_theta_finalization_theta_tendency,
-            section_observer,
-        )
-    if (
         profile_sections
         and theta_horizontal_advection_theta_finalization_theta_tendency is not None
     ):
@@ -9663,7 +7050,7 @@ def build_dynamics_tendency_section_ops(
     padded: dict[str, Callable[..., Any]] = {}
     # Forward-only plans only: section plans admitted for compiled reverse AD
     # keep calling their admitted regions and pad eagerly.
-    if section_observer is None and not profile_sections and not reverse_ad_requested:
+    if not profile_sections and not reverse_ad_requested:
         section_compiled = {
             **{
                 name: _DYNAMICS_TENDENCY_SECTION_COMPILE_NAMES[name] in requested
@@ -9710,130 +7097,6 @@ def build_dynamics_tendency_section_ops(
         vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency=vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency,
         theta_horizontal_advection_theta_finalization_theta_tendency=theta_horizontal_advection_theta_finalization_theta_tendency,
         padded=MappingProxyType(padded),
-    )
-
-
-def _observe_dynamics_tendency_section_ops(
-    section_ops: DynamicsTendencySectionOps,
-    observer: Callable[
-        [str, tuple[object, ...], Mapping[str, Any], object, float], None
-    ],
-) -> DynamicsTendencySectionOps:
-    """Attach a diagnostic observer without changing the numeric call table."""
-    resolved: dict[str, Callable[..., Any]] = {}
-    for field_name in DYNAMICS_TENDENCY_SECTION_CALL_SEQUENCE:
-        inner = getattr(section_ops, field_name)
-
-        @wraps(inner)
-        def observed(*args, _inner=inner, _field_name=field_name, **kwargs):
-            started = perf_counter()
-            result = _inner(*args, **kwargs)
-            elapsed = perf_counter() - started
-            observer(_field_name, args, kwargs, result, elapsed)
-            return result
-
-        resolved[field_name] = observed
-    normal_velocity_mixing_normal_velocity_finalization_u_tendency = (
-        section_ops.normal_velocity_mixing_normal_velocity_finalization_u_tendency
-    )
-    if normal_velocity_mixing_normal_velocity_finalization_u_tendency is not None:
-        inner = normal_velocity_mixing_normal_velocity_finalization_u_tendency
-
-        @wraps(inner)
-        def observed_normal_velocity_mixing_normal_velocity_finalization(
-            *args, _inner=inner, **kwargs
-        ):
-            started = perf_counter()
-            result = _inner(*args, **kwargs)
-            elapsed = perf_counter() - started
-            observer(
-                "normal_velocity_mixing_u_mixing", args, kwargs, result[0], elapsed
-            )
-            observer(
-                "normal_velocity_finalization_u_final", args, kwargs, result[1], 0.0
-            )
-            return result
-
-        normal_velocity_mixing_normal_velocity_finalization_u_tendency = (
-            observed_normal_velocity_mixing_normal_velocity_finalization
-        )
-    vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency = section_ops.vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency
-    if (
-        vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency
-        is not None
-    ):
-        vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency = _observe_dynamics_tendency_vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_parent(
-            vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency,
-            observer,
-        )
-    theta_horizontal_advection_theta_finalization_theta_tendency = (
-        section_ops.theta_horizontal_advection_theta_finalization_theta_tendency
-    )
-    if theta_horizontal_advection_theta_finalization_theta_tendency is not None:
-        theta_horizontal_advection_theta_finalization_theta_tendency = _observe_dynamics_tendency_theta_horizontal_advection_theta_finalization_parent(
-            theta_horizontal_advection_theta_finalization_theta_tendency,
-            observer,
-        )
-    return DynamicsTendencySectionOps(
-        **resolved,
-        normal_velocity_mixing_normal_velocity_finalization_u_tendency=normal_velocity_mixing_normal_velocity_finalization_u_tendency,
-        vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency=vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency,
-        theta_horizontal_advection_theta_finalization_theta_tendency=theta_horizontal_advection_theta_finalization_theta_tendency,
-    )
-
-
-def prebind_dynamics_tendency_connectivity_payload(
-    call_arguments: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Build the whole-stage static topology payload outside the numeric graph."""
-    args = call_arguments
-    device = args["u"].device  # type: ignore[union-attr]
-    build_ordered_ad_transpose = any(
-        isinstance(args.get(name), torch.Tensor)
-        and _tensor_carries_autodiff(args[name])  # type: ignore[arg-type]
-        for name in _DYNAMICS_TENDENCY_DYNAMIC_ARGUMENT_NAMES
-    )
-    return _dynamics_tendency_connectivity_payload(
-        device=device,
-        nCells=int(args["nCells"]),
-        nEdges=int(args["nEdges"]),
-        maxEdges=int(args["maxEdges"]),
-        maxEdges2=int(args["maxEdges2"]),
-        cell_start=int(args["cellStart"]) - 1,
-        cell_end=int(args["cellEnd"]),
-        cell_solve_start=int(args["cellSolveStart"]) - 1,
-        cell_solve_end=int(args["cellSolveEnd"]),
-        edge_start=int(args["edgeStart"]) - 1,
-        edge_end=int(args["edgeEnd"]),
-        edge_solve_start=int(args["edgeSolveStart"]) - 1,
-        edge_solve_end=int(args["edgeSolveEnd"]),
-        edgesOnCell=args["edgesOnCell"],
-        nEdgesOnCell=args["nEdgesOnCell"],
-        edgesOnCell_sign=args["edgesOnCell_sign"],
-        cellsOnEdge=args["cellsOnEdge"],
-        verticesOnEdge=args["verticesOnEdge"],
-        edgesOnEdge=args["edgesOnEdge"],
-        nAdvCellsForEdge=args["nAdvCellsForEdge"],
-        nEdgesOnEdge=args["nEdgesOnEdge"],
-        advCellsForEdge=args["advCellsForEdge"],
-        adv_coefs=args["adv_coefs"],
-        adv_coefs_3rd=args["adv_coefs_3rd"],
-        weightsOnEdge=args["weightsOnEdge"],
-        vertex_start=int(args["vertexStart"]) - 1,
-        vertex_end=int(args["vertexEnd"]),
-        vertexDegree=int(args["vertexDegree"]),
-        edgesOnVertex=args["edgesOnVertex"],
-        edgesOnVertex_sign=args["edgesOnVertex_sign"],
-        dvEdge=args["dvEdge"],
-        dcEdge=args["dcEdge"],
-        invDcEdge=None,
-        invDvEdge=None,
-        invAreaCell=None,
-        invAreaTriangle=args["invAreaTriangle"],
-        meshScalingDel2=None,
-        meshScalingDel4=None,
-        build_ordered_ad_transpose=build_ordered_ad_transpose,
-        build_edge_advective_ordered_ad_transpose=build_ordered_ad_transpose,
     )
 
 
@@ -9917,37 +7180,6 @@ def _normalize_dynamics_tendency_numeric_connectivity_payload(
     if payload:
         _validate_flux_divisor(payload[-1])
     return _dynamics_tendency_numeric_connectivity_values(payload)
-
-
-def _resolve_dynamics_tendency_public_section_ops(
-    call_arguments: Mapping[str, Any],
-) -> DynamicsTendencySectionOps:
-    """Resolve direct-call compile/profile wrappers before numeric composition."""
-    requested = frozenset(call_arguments.get("_compile_region_names") or ()) & (
-        _DYNAMICS_TENDENCY_REGION_COMPILE_TARGETS
-        - {_DYNAMICS_TENDENCY_WHOLE_STAGE_COMPILE_TARGET}
-    )
-    section_ops = call_arguments.get("_section_ops")
-    if section_ops is None:
-        return build_dynamics_tendency_section_ops(
-            compile_region_names=tuple(sorted(requested)),
-            compile_mode=str(call_arguments["_compile_mode"]),
-            compile_backend=str(call_arguments["_compile_backend"]),
-            stage_key=(
-                "direct_call",
-                *_dynamics_tendency_whole_stage_specialization_key(call_arguments),
-            ),
-            profile_sections=bool(call_arguments.get("_profile_sections"))
-            and not _compile_active(),
-        )
-    if not isinstance(section_ops, DynamicsTendencySectionOps):
-        raise TypeError("_section_ops must be a DynamicsTendencySectionOps instance")
-    if requested:
-        raise ValueError(
-            "prebuilt dynamics-tendency section operators cannot be combined with inline "
-            f"compile targets: {sorted(requested)}"
-        )
-    return section_ops
 
 
 def _dynamics_tendency_canonical_composition(
@@ -10096,6 +7328,8 @@ def _dynamics_tendency_canonical_composition(
     visc4_scale: torch.Tensor | None = None,  # config_visc4_2dsmag (del4 of u, w and theta)
     smagorinsky_scale: torch.Tensor | None = None,  # config_smagorinsky_coef (kdiff ~ c_s**2)
     del4u_div_scale: torch.Tensor | None = None,  # config_del4u_div_factor
+    # config_coef_3rd_order (third-order coefficients of w and theta advection and the theta vertical flux)
+    coef_3rd_scale: torch.Tensor | None = None,
     _connectivity_payload: tuple[Any, ...] | None = None,
     _section_ops: DynamicsTendencySectionOps | None = None,
     gravity: float = GRAVITY,
@@ -10139,8 +7373,7 @@ def _dynamics_tendency_canonical_composition(
         qtot: Pre-computed total moisture mixing ratio (nCells+1, nVertLevels).
               Computed by caller from scalars, matching Fortran architecture.
     Returns:
-        Fixed compact-patch tuple. Public full-field packing is owned by
-        :func:`atm_compute_dyn_tend_work` or the runner.
+        Fixed compact-patch tuple. The runner packs the public full fields.
     """
     # Infer device from input tensors for device-consistent tensor creation
     compute_dtype = u.dtype
@@ -10195,7 +7428,7 @@ def _dynamics_tendency_canonical_composition(
             return torch.empty(
                 (1, *tuple(shape)[1:]), dtype=compute_dtype, device=device
             )
-        return torch.zeros(shape, dtype=compute_dtype, device=device)
+        return _read_only_zeros(tuple(shape), dtype=compute_dtype, device=device)
 
     # Initialize output arrays.
     # For rk_step > 1, some arrays persist from rk_step==1 and must be passed in.
@@ -10230,7 +7463,7 @@ def _dynamics_tendency_canonical_composition(
     else:
         tend_rho = _output_zero_base((nCells + 1, nVertLevels))
 
-    dpdz = torch.zeros((nCells + 1, nVertLevels), dtype=compute_dtype, device=device)
+    dpdz = _read_only_zeros((nCells + 1, nVertLevels), dtype=compute_dtype, device=device)
     tend_u_solve_patch = None
     tend_w_solve_inner_patch = None
     tend_theta_solve_patch = None
@@ -10686,6 +7919,9 @@ def _dynamics_tendency_canonical_composition(
         # Compute del2(u) and add 2nd-order diffusion to tend_u_euler
 
         diff_edges = edge_idx_all
+        # The edges edge_idx_all lists (arange(edge_start, edge_end)) as a row slice: a view, not a
+        # gathered copy of the edge field.
+        diff_edge_rows = slice(edge_start, edge_end)
 
         if isinstance(edge_all_inv_dc, torch.Tensor) and isinstance(
             edge_all_min_inv_dv_dc,
@@ -10866,7 +8102,7 @@ def _dynamics_tendency_canonical_composition(
                     kdiff_patch=kdiff_cell_patch,
                     patch_row_start=cell_start,
                     patch_row_end=cell_end,
-                    rho_edge_patch=rho_edge[diff_edges, :],
+                    rho_edge_patch=rho_edge[diff_edge_rows, :],
                     tend_u_euler_edge_patch=tend_u_euler_edge_patch,
                     inv_dc_edge_patch=r_dc,
                     min_inv_dv_dc_edge_patch=r_dv,
@@ -10935,11 +8171,11 @@ def _dynamics_tendency_canonical_composition(
                 kdiff_patch=kdiff_cell_patch,
                 patch_row_start=cell_start,
                 patch_row_end=cell_end,
-                rho_edge_patch=rho_edge[diff_edges, :],
+                rho_edge_patch=rho_edge[diff_edge_rows, :],
                 tend_u_euler_edge_patch=tend_u_euler_edge_patch,
                 inv_dc_edge_patch=r_dc,
                 min_inv_dv_dc_edge_patch=r_dv,
-                mesh_scaling_del2_patch=meshScalingDel2[diff_edges],
+                mesh_scaling_del2_patch=meshScalingDel2[diff_edge_rows],
                 edge_valid=edge_all_pair_valid,
                 include_del4=include_del4,
                 vertex_edge_relation=vertex_edge_relation_arg,
@@ -11042,6 +8278,7 @@ def _dynamics_tendency_canonical_composition(
         cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab=bool(
             config_dynamics_tendency_cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab
         ),
+        coef_3rd_scale=coef_3rd_scale,
     )
     tend_w_solve_inner_patch = tend_w_patch
     # =========================================================================
@@ -11273,6 +8510,7 @@ def _dynamics_tendency_canonical_composition(
             cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab=bool(
                 config_dynamics_tendency_cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab
             ),
+            coef_3rd_scale=coef_3rd_scale,
         )
         tend_theta_solve_patch = tend_theta_patch
     else:
@@ -11423,6 +8661,7 @@ def _dynamics_tendency_canonical_composition(
             prandtl_inv=prandtl_inv,
             kdiff_patch=kdiff_cell_patch,
             flux_divisor=flux_divisor,
+            coef_3rd_scale=coef_3rd_scale,
         )
         if tend_theta_euler_public is not None:
             public_outputs["tend_theta_euler"] = tend_theta_euler_public
@@ -11515,6 +8754,7 @@ def _dynamics_tendency_canonical_composition(
                 fzm=fzm,
                 fzp=fzp,
                 coef_3rd_order=coef_3rd_order,
+                coef_3rd_scale=coef_3rd_scale,
                 n_vert_levels=nVertLevels,
                 flux_divisor=flux_divisor,
             )
@@ -11628,60 +8868,6 @@ def _dynamics_tendency_canonical_composition(
         _public_output(
             "rthdynten", rthdynten_solve_patch, cell_solve_start, nCells + 1
         ),
-    )
-
-
-@wraps(_dynamics_tendency_canonical_composition)
-def atm_compute_dyn_tend_work(*args, **kwargs):
-    """Run canonical dynamics-tendency math and pack its compact outputs at the public boundary."""
-    debug_taps = kwargs.pop("_debug_taps", None)
-    workspace = kwargs.pop("workspace", None)
-    compile_region_names = kwargs.pop("_compile_region_names", ())
-    compile_mode = kwargs.pop("_compile_mode", "reduce-overhead")
-    compile_backend = kwargs.pop("_compile_backend", "inductor")
-    profile_sections = bool(kwargs.pop("_profile_sections", False))
-    bound = _DYNAMICS_TENDENCY_WORK_SIGNATURE.bind(*args, **kwargs)
-    bound.apply_defaults()
-    _validate_dynamics_tendency_numeric_plan_inputs(bound.arguments)
-    if bound.arguments.get("_connectivity_payload") is None:
-        profile_topology = profile_sections and not _compile_active()
-        topology_context = (
-            profile_section("mpas.dynamics_tendency.topology", enabled=True)
-            if profile_topology
-            else _NoProfileSection()
-        )
-        with topology_context:
-            bound.arguments["_connectivity_payload"] = (
-                prebind_dynamics_tendency_connectivity_payload(bound.arguments)
-            )
-    bound.arguments["_connectivity_payload"] = (
-        _normalize_dynamics_tendency_numeric_connectivity_payload(
-            bound.arguments["_connectivity_payload"]
-        )
-    )
-    orchestration_arguments = dict(bound.arguments)
-    orchestration_arguments.update(
-        {
-            "_compile_region_names": compile_region_names,
-            "_compile_mode": compile_mode,
-            "_compile_backend": compile_backend,
-            "_profile_sections": profile_sections,
-        }
-    )
-    section_ops = _resolve_dynamics_tendency_public_section_ops(orchestration_arguments)
-    if debug_taps is not None:
-        if not isinstance(debug_taps, dict):
-            raise TypeError("_debug_taps must be a write-only dict")
-        observer = _DynamicsTendencyDebugTapObserver(bound.arguments, debug_taps)
-        section_ops = _observe_dynamics_tendency_section_ops(section_ops, observer)
-    bound.arguments["_section_ops"] = section_ops
-    compact_outputs = _dynamics_tendency_canonical_composition(
-        *bound.args, **bound.kwargs
-    )
-    return pack_dynamics_tendency_numeric_outputs(
-        compact_outputs,
-        bound.arguments,
-        workspace=workspace,
     )
 
 
@@ -11972,12 +9158,6 @@ def build_dynamics_tendency_numeric_plan(
 ) -> DynamicsTendencyNumericPlan:
     """Bind immutable whole-dynamics-tendency inputs and expose a dynamic-tensor call."""
     call_arguments = dict(call_arguments)
-    debug_taps = call_arguments.pop("_debug_taps", None)
-    if debug_taps is not None:
-        raise ValueError(
-            "dynamics-tendency debug taps are public-wrapper diagnostics and cannot enter "
-            "a numeric plan"
-        )
     orchestration_control_names = {
         "workspace",
         "_compile_region_names",
@@ -12409,35 +9589,3 @@ def _dynamics_tendency_whole_stage_specialization_key(
     )
 
 
-def dyn_tend(
-    state: dict,
-    state_prev: dict,
-    mesh: MESHState,
-    vert_coef: torch.Tensor,
-) -> dict:
-    """
-    High-level wrapper for atm_compute_dyn_tend_work - INTENTIONALLY NOT IMPLEMENTED.
-
-    This wrapper is a placeholder for a potential future API simplification.
-    The low-level atm_compute_dyn_tend_work() function is used directly in
-    execute_rk_step() to maintain explicit control over all parameters and
-    avoid the complexity of automatic parameter extraction from state dicts.
-
-    Design Decision:
-        The explicit parameter passing pattern in atm_compute_dyn_tend_work()
-        provides better type safety, clearer documentation, and easier debugging
-        compared to a wrapper that would need to extract ~60+ parameters from
-        nested dictionaries. This is intentional, not a TODO.
-
-    Usage:
-        Use atm_compute_dyn_tend_work() directly with explicit parameters.
-        See time_integration.py execute_rk_step() for the expected call pattern.
-
-    Raises:
-        NotImplementedError: Always - use atm_compute_dyn_tend_work() instead.
-    """
-    raise NotImplementedError(
-        "dyn_tend() wrapper is intentionally not implemented. "
-        "Use atm_compute_dyn_tend_work() directly with explicit parameters. "
-        "See execute_rk_step() for the expected call pattern."
-    )

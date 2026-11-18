@@ -8,21 +8,10 @@ from __future__ import annotations
 import torch
 
 from sa_sas_deep_convection_torch.compile import run_compile_island
-from sa_sas_deep_convection_torch.constants import FV, GRAV, KM
+from sa_sas_deep_convection_torch.constants import FV, GRAV
 from sa_sas_deep_convection_torch.segments.segment_d import _gather_column
 from ufs_physics_common.ordered_sum import masked_sum
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
-
-CHECKPOINT_FIELDS = (
-    "kbcon",
-    "kbcon1",
-    "ktcon",
-    "ktcon1",
-    "ktconn",
-    "jmin",
-    "cnvflg",
-    "return_stage",
-)
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -202,5 +191,3 @@ def _lfc_cin_cloudtop_block(
     return kbcon1, cina, ktcon, cnvflg
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

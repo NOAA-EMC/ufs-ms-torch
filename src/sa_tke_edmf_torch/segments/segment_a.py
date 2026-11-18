@@ -8,11 +8,9 @@ from __future__ import annotations
 import torch
 from sa_tke_edmf_torch.autodiff import static_tensor
 
-from sa_tke_edmf_torch.constants import IM, KM, NTRAC, NTKEV, NTQV
+from sa_tke_edmf_torch.constants import NTQV
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
 from sa_tke_edmf_torch.tracers import ozone_index, pack_indices, uses_thompson_tempo_pack
-
-CHECKPOINT_FIELDS = ("vdftra", "tracer_index_policy", "gt0", "gq0", "gu0", "gv0")
 
 
 def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
@@ -66,5 +64,3 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     return state.with_updates(updates)
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

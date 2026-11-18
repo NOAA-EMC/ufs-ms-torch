@@ -111,10 +111,6 @@ class PhysicalConstants(metaclass=_ImmutableConstantsMeta):
     # Auxiliary thermodynamic constant retained for compatibility.
     T0 = 288.15
 
-    # Latent heat of vaporization (J/kg)
-    # Auxiliary thermodynamic constant retained for compatibility.
-    LVP = 2.5e6
-
     # Latent heat of fusion (J/kg)
     # Auxiliary thermodynamic constant retained for compatibility.
     LF = 3.34e5
@@ -148,27 +144,6 @@ class PhysicalConstants(metaclass=_ImmutableConstantsMeta):
         )
 
     @classmethod
-    def get_dict(cls) -> dict[str, float]:
-        """Return all constants as a dictionary."""
-        return {
-            "g": cls.G,
-            "rd": cls.RD,
-            "rv": cls.RV,
-            "cp": cls.CP,
-            "cv": cls.CV,
-            "earth_radius": cls.EARTH_RADIUS,
-            "omega": cls.OMEGA,
-            "p0": cls.P0,
-            "t0": cls.T0,
-            "lvp": cls.LVP,
-            "lf": cls.LF,
-            "pi": cls.PI,
-            "rvord": cls.RVORD,
-            "cvpm": cls.CVPM,
-            "prandtl": cls.PRANDTL,
-        }
-
-    @classmethod
     def get_upstream_dict(cls) -> dict[str, float]:
         """Return constants using upstream MPAS variable names."""
         return {
@@ -181,7 +156,6 @@ class PhysicalConstants(metaclass=_ImmutableConstantsMeta):
 # (These are float values extracted from tensors for easier arithmetic)
 GRAVITY = 9.80616
 OMEGA = 7.29212e-5
-RGAS = 287.0
 CP = 1004.5
 CV = 717.5
 P0 = 100000.0

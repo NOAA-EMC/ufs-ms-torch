@@ -10,6 +10,7 @@ import math
 from dataclasses import dataclass, replace
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from .containers import static_tensor
 from .distributed import rank_values
@@ -47,8 +48,8 @@ class PrognosticOzone:
             if (value.dtype not in WORKING_DTYPES or value.dtype != self.data.dtype
                     or value.device != self.data.device):
                 raise ValueError("ozone tables require colocated tensors of one working dtype")
-            torch._assert_async(torch.isfinite(value).all(), "nonfinite ozone table")
-        torch._assert_async(
+            torch_compat.assert_async(torch.isfinite(value).all(), "nonfinite ozone table")
+        torch_compat.assert_async(
             (self.latitude[1:] > self.latitude[:-1]).all()
             & (self.time[1:] > self.time[:-1]).all()
             & (self.pressure > 0.0).all(),
@@ -71,7 +72,7 @@ def photochemistry_latitude_weights(
         or latitude.device != table.data.device
     ):
         raise ValueError("invalid model photochemistry latitude")
-    torch._assert_async(torch.isfinite(latitude).all(), "nonfinite model latitude")
+    torch_compat.assert_async(torch.isfinite(latitude).all(), "nonfinite model latitude")
     upper = torch.searchsorted(table.latitude, latitude.contiguous(), right=True)
     lower = torch.clamp_min(upper - 1, 0)
     upper = torch.clamp_max(upper, table.latitude.numel() - 1)
@@ -129,7 +130,7 @@ def ozone_forecast_day(jdat: torch.Tensor) -> torch.Tensor:
         dtype=torch.int64,
         device=jdat.device,
     )
-    torch._assert_async(
+    torch_compat.assert_async(
         (year >= 1583)
         & (month >= 1)
         & (month <= 12)
@@ -141,7 +142,7 @@ def ozone_forecast_day(jdat: torch.Tensor) -> torch.Tensor:
     index = torch.clamp(month - 1, 0, 11)
     month_length = lengths.index_select(0, index.reshape(1)).reshape(())
     month_offset = offsets.index_select(0, index.reshape(1)).reshape(())
-    torch._assert_async(
+    torch_compat.assert_async(
         day <= month_length + (leap & (month == 2)).to(torch.int64),
         "invalid Gregorian ozone day",
     )
@@ -209,11 +210,11 @@ def _update_photochemistry_forcing(
             or index.device != device
         ):
             raise ValueError("invalid initialized photochemistry latitude indices")
-        torch._assert_async(
+        torch_compat.assert_async(
             ((index >= 1) & (index <= table.latitude.numel())).all(),
             "uninitialized or out-of-range photochemistry latitude indices",
         )
-    torch._assert_async(
+    torch_compat.assert_async(
         torch.isfinite(day) & torch.isfinite(weight).all(),
         "nonfinite photochemistry interpolation input",
     )
@@ -295,10 +296,10 @@ def ozone_2015(
         if (value.dtype not in WORKING_DTYPES or (value.ndim and value.dtype != pressure.dtype)
                 or value.device != pressure.device):
             raise ValueError(f"ozone2015 requires colocated {name} in the working dtype")
-        torch._assert_async(torch.isfinite(value).all(), f"nonfinite ozone2015 {name}")
+        torch_compat.assert_async(torch.isfinite(value).all(), f"nonfinite ozone2015 {name}")
     if any(value.shape != pressure.shape for value in (temperature, pressure_thickness, ozone)):
         raise ValueError("ozone2015 model field extents differ")
-    torch._assert_async(
+    torch_compat.assert_async(
         (pressure > 0.).all() & (temperature > 0.).all()
         & (pressure_thickness > 0.).all() & (dtp > 0.)
         & (log_pressure[:-1] > log_pressure[1:]).all(),
@@ -331,7 +332,7 @@ def ozone_2015(
               "do3_dt_ozmx": loss * (updated - prod[..., 5]) * dtp,
               "do3_dt_temp": thermal * dtp, "do3_dt_ohoz": overhead * dtp}
     for value in result.values():
-        torch._assert_async(torch.isfinite(value).all(), "nonfinite ozone2015 output")
+        torch_compat.assert_async(torch.isfinite(value).all(), "nonfinite ozone2015 output")
     return result
 
 
@@ -370,8 +371,8 @@ def h2o_photochemistry(
         if (value.dtype not in WORKING_DTYPES or (value.ndim and value.dtype != pressure.dtype)
                 or value.device != pressure.device):
             raise ValueError(f"h2o photochemistry requires colocated {name} in the working dtype")
-        torch._assert_async(torch.isfinite(value).all(), f"nonfinite h2o photochemistry {name}")
-    torch._assert_async(
+        torch_compat.assert_async(torch.isfinite(value).all(), f"nonfinite h2o photochemistry {name}")
+    torch_compat.assert_async(
         (pressure > 0.).all() & (dtp > 0.) & (log_pressure[:-1] > log_pressure[1:]).all(),
         "invalid h2o photochemistry pressure, timestep or descending forcing grid",
     )
@@ -393,5 +394,5 @@ def h2o_photochemistry(
             nonzero, (updated - climatology) * dtp / torch.where(nonzero, scale, 1.0), 0.0),
     }
     for value in result.values():
-        torch._assert_async(torch.isfinite(value).all(), "nonfinite h2o photochemistry output")
+        torch_compat.assert_async(torch.isfinite(value).all(), "nonfinite h2o photochemistry output")
     return result

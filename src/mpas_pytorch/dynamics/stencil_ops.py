@@ -16,7 +16,7 @@ from typing import Any, cast
 import weakref
 
 import torch
-from torch._subclasses.fake_tensor import is_fake
+from mpas_pytorch import _torch_compat as torch_compat
 
 from mpas_pytorch.dynamics.ordered_sum_plans import OrderedSumPlan, build_ordered_sum_plan
 
@@ -109,28 +109,33 @@ def _compiled_stencil_reducer(name, function, *tensors, metadata=None):
     )
 
 
-def _torch_compiler_module() -> object | None:
-    try:
-        return torch.compiler
-    except AttributeError:
-        return None
-
-
-def _torch_dynamo_module() -> object | None:
-    try:
-        return torch._dynamo
-    except AttributeError:
-        return None
-
-
 def _compile_active() -> bool:
-    compiler = _torch_compiler_module()
-    if compiler is not None and hasattr(compiler, "is_compiling"):
-        return bool(compiler.is_compiling())
-    dynamo = _torch_dynamo_module()
-    if dynamo is not None and hasattr(dynamo, "is_compiling"):
-        return bool(dynamo.is_compiling())
-    return False
+    return torch.compiler.is_compiling()
+
+
+def _read_only_zeros(
+    shape: tuple[int, ...], *, dtype: torch.dtype, device: torch.device | str
+) -> torch.Tensor:
+    """Zeros for a base that every consumer only gathers or slices.
+
+    One zero element expanded to ``shape`` (stride 0) reads the same +0.0 as a filled zero field
+    without writing it on each call, and a write into it raises instead of filling the field.
+    """
+    return torch.zeros((1,) * len(shape), dtype=dtype, device=device).expand(shape)
+
+
+def _stored_when_compiled(x: torch.Tensor) -> torch.Tensor:
+    """``x``; under ``torch.compile`` an identity view whose input Inductor stores in its own buffer.
+
+    Inductor inlines a cheap elementwise result into each consumer, and a consumer that gathers it
+    from many slots is then stored per slot. Inductor realizes the input of ``as_strided``, so this
+    view marks the store point (the device of ``ufs_physics_common.compile_policy.stored``, which
+    the dycore does not import). A view or a non-contiguous tensor is returned unchanged: the
+    ``as_strided`` lowering drops a view's storage offset. Eager returns ``x`` itself.
+    """
+    if not _compile_active() or x._base is not None or not x.is_contiguous():
+        return x
+    return x.as_strided(x.size(), x.stride())
 
 
 def _tensor_carries_autodiff(tensor: torch.Tensor) -> bool:
@@ -242,10 +247,6 @@ def sum_fortran_order(x: torch.Tensor, dim: int) -> torch.Tensor:
     for idx in range(1, n):
         total = total + x.select(dim, idx)
     return total
-
-
-# Backward-compatible alias for existing call sites/tests.
-_sum_fortran_order = sum_fortran_order
 
 
 def _accumulate_ordered_slot(
@@ -631,36 +632,6 @@ class _IndexCopyRowsCols(torch.autograd.Function):
         return out
 
 
-def _replace_rows_cols(
-    base: torch.Tensor,
-    row_idx: torch.Tensor,
-    col_start: int,
-    col_end: int,
-    values: torch.Tensor,
-) -> torch.Tensor:
-    """Functional dim-0 + dim-1 slice replacement with an inference fast path."""
-    if (
-        int(row_idx.numel()) == 0 or col_start == col_end
-    ) and not _tensor_carries_autodiff(values):
-        return base
-    if _compile_active():
-        return _functional_replace_rows_cols(base, row_idx, col_start, col_end, values)
-    if not torch.is_grad_enabled():
-        values = _clone_if_storage_overlap(base, values)
-        base[row_idx, col_start:col_end, ...] = values
-        return base
-    return cast(
-        torch.Tensor,
-        _IndexCopyRowsCols.apply(base, row_idx, col_start, col_end, values),
-    )
-
-
-def _zero_rows(base: torch.Tensor, row_idx: torch.Tensor) -> torch.Tensor:
-    """Replace dim-0 rows by zeros without gathering those rows first."""
-    zeros = base.new_zeros((int(row_idx.numel()), *base.shape[1:]))
-    return _replace_rows(base, row_idx.reshape(-1), zeros)
-
-
 def _replace_all_rows_cols(
     base: torch.Tensor,
     col_start: int,
@@ -720,7 +691,7 @@ def _gather_index_entry(row_idx: torch.Tensor) -> dict[tuple[object, ...], torch
 
 def _checked_gather_index(row_idx: torch.Tensor, rows: int) -> torch.Tensor:
     """``row_idx`` as int64 with negative entries mapped to a rejected row (``rows`` when traced)."""
-    eager = not torch.compiler.is_compiling() and not is_fake(row_idx)
+    eager = not torch.compiler.is_compiling() and not torch_compat.is_fake(row_idx)
     checked = _gather_index_entry(row_idx) if eager else None
     view = (tuple(row_idx.shape), tuple(row_idx.stride()), int(row_idx.storage_offset()))
     if checked is not None and view in checked:
@@ -823,7 +794,7 @@ def _ordered_index_sum_numeric(
         # Torch 2.8 has segment_reduce kernels for CPU and CUDA only (MPS raises).
         if indices.numel() == 0:
             return values.new_zeros((n_source_rows, *values.shape[1:]))
-        if torch.compiler.is_compiling() or is_fake(values):
+        if torch.compiler.is_compiling() or torch_compat.is_fake(values):
             # A traced region (Dynamo, or AOT tracing a backward) cannot plan on the host: one
             # scatter-add, summed in the device's order (compiled derivatives are judged by the
             # derivative checks, not bit for bit).
@@ -945,86 +916,6 @@ def gather_rows(field: torch.Tensor, row_idx: torch.Tensor) -> torch.Tensor:
     return _gather_rows_numeric(field, row_idx)
 
 
-def sum_pair_rows(field: torch.Tensor, pair_idx: torch.Tensor) -> torch.Tensor:
-    """Gather two row slots once and return ``slot0 + slot1`` in Fortran order."""
-    if pair_idx.ndim != 2 or pair_idx.shape[1] != 2:
-        raise ValueError(
-            f"pair_idx must have shape (n, 2), got {tuple(pair_idx.shape)}"
-        )
-    pair = gather_rows(field, pair_idx)
-    return pair[:, 0, ...] + pair[:, 1, ...]
-
-
-def average_pair_rows(field: torch.Tensor, pair_idx: torch.Tensor) -> torch.Tensor:
-    """Gather two row slots once and return their ordered arithmetic mean."""
-    return 0.5 * sum_pair_rows(field, pair_idx)
-
-
-def build_sparse_csr_stencil(
-    indices0: torch.Tensor,
-    weights: torch.Tensor,
-    valid_mask: torch.Tensor,
-    n_cols: int,
-) -> torch.Tensor:
-    """Build a CSR sparse matrix from dense stencil indices/weights.
-
-    Args:
-        indices0: 0-based column indices, shape (n_rows, n_stencil)
-        weights: per-stencil weights, same shape as indices0
-        valid_mask: True where stencil entry is active, same shape
-        n_cols: number of source columns in the sparse matrix
-
-    Returns:
-        torch.sparse_csr_tensor of shape (n_rows, n_cols)
-    """
-    if indices0.ndim != 2:
-        raise ValueError(f"indices0 must be rank-2, got shape {tuple(indices0.shape)}")
-    if weights.shape != indices0.shape:
-        raise ValueError("weights shape must match indices0")
-    if valid_mask.shape != indices0.shape:
-        raise ValueError("valid_mask shape must match indices0")
-
-    rows = indices0.shape[0]
-    counts = valid_mask.sum(dim=1)
-    crow = torch.zeros(rows + 1, dtype=torch.int64, device=indices0.device)
-    # GPU NOTE: integer CSR row-pointer prefix sum (exact for int64).
-    crow[1:] = torch.cumsum(counts, dim=0)
-    col = indices0[valid_mask]
-    values = weights[valid_mask]
-    return torch.sparse_csr_tensor(
-        crow,
-        col,
-        values,
-        size=(rows, n_cols),
-        dtype=weights.dtype,
-        device=indices0.device,
-    )
-
-
-def apply_sparse_stencil(matrix_csr: torch.Tensor, field: torch.Tensor) -> torch.Tensor:
-    """Apply a CSR stencil matrix to a field with shape (n_src, n_levels)."""
-    if field.ndim != 2:
-        raise ValueError(f"field must be rank-2, got shape {tuple(field.shape)}")
-    if matrix_csr.shape[1] != field.shape[0]:
-        raise ValueError(
-            f"matrix columns ({matrix_csr.shape[1]}) must match field rows ({field.shape[0]})"
-        )
-    return cast(torch.Tensor, torch.sparse.mm(matrix_csr, field))
-
-
-def edge_to_cell_interp(
-    cell_pairs_idx: torch.Tensor,
-    cell_pairs_valid: torch.Tensor,
-    cell_field: torch.Tensor,
-) -> torch.Tensor:
-    """Pattern A: interpolate cell-centered field to edges via 0.5*(c1+c2)."""
-    c1 = cell_pairs_idx[:, 0]
-    c2 = cell_pairs_idx[:, 1]
-    vals = 0.5 * (cell_field[c1, :] + cell_field[c2, :])
-    mask = cell_pairs_valid[:, 0] & cell_pairs_valid[:, 1]
-    return torch.where(mask[:, None], vals, torch.zeros_like(vals))
-
-
 def cell_divergence_gather(
     edge_field: torch.Tensor,
     edge_metric: torch.Tensor,
@@ -1115,20 +1006,6 @@ def _ordered_weighted_stencil_program(
         raise ValueError("weights shape must match indices")
     if valid_mask is not None and valid_mask.shape != indices.shape:
         raise ValueError("valid_mask shape must match indices")
-    if (
-        field.device.type == "cuda"
-        and not torch.is_grad_enabled()
-        and not _compile_active()
-    ):
-        return _sum_weighted_stencil_view_reduce(
-            field=field,
-            indices=indices,
-            weights=weights,
-            valid_mask=valid_mask,
-            valid_all_by_slot=valid_all_by_slot,
-            slot_factor=slot_factor,
-        )
-
     n_rows = indices.shape[0]
     total: torch.Tensor | None = None
     for batch_start, batch_stop in _slot_batches(
@@ -1154,43 +1031,6 @@ def _ordered_weighted_stencil_program(
     if total is None:
         return field.new_zeros((n_rows, field.shape[1]))
     return total
-
-
-def _sum_weighted_stencil_view_reduce(
-    *,
-    field: torch.Tensor,
-    indices: torch.Tensor,
-    weights: torch.Tensor | None = None,
-    valid_mask: torch.Tensor | None = None,
-    valid_all_by_slot: tuple[bool, ...] | None = None,
-    slot_factor: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """No-grad row-owned stencil reduction without atomics.
-
-    The row/slot relation is already grouped by row, so the flattened gather can
-    be viewed as ``(n_rows, n_slots, n_levels)`` and reduced in upstream slot
-    order.  This avoids atomic row accumulation on CUDA and remains deterministic.
-    """
-    n_rows = indices.shape[0]
-    n_slots = indices.shape[1]
-    if n_slots == 0:
-        return field.new_zeros((n_rows, field.shape[1]))
-    contrib = gather_rows(field, indices.reshape(-1)).reshape(
-        n_rows, n_slots, field.shape[1]
-    )
-    if weights is not None:
-        contrib = weights.unsqueeze(2) * contrib
-    valid_all = (
-        valid_all_by_slot is not None
-        and len(valid_all_by_slot) == n_slots
-        and all(valid_all_by_slot)
-    )
-    if valid_mask is not None and not valid_all:
-        contrib = contrib.masked_fill(~valid_mask.unsqueeze(2), 0.0)
-    if slot_factor is not None:
-        factor = slot_factor.expand(n_rows, field.shape[1]).unsqueeze(1)
-        contrib = contrib * factor
-    return sum_fortran_order(contrib, dim=1)
 
 
 def _sum_weighted_stencil_components_view_reduce(
@@ -1302,79 +1142,3 @@ def _ordered_weighted_components_program(
     return total
 
 
-def vertex_vorticity_gather(
-    edge_field: torch.Tensor,
-    edge_metric: torch.Tensor,
-    vertex_edges_idx: torch.Tensor,
-    vertex_edges_sign: torch.Tensor,
-    vertex_edges_valid: torch.Tensor,
-    inv_area_triangle: torch.Tensor,
-) -> torch.Tensor:
-    """Pattern D gather-reduce: vertex circulation-like sum over edge stencil."""
-    weights = vertex_edges_sign * edge_metric[vertex_edges_idx]
-    return (
-        _sum_weighted_stencil_slots(
-            field=edge_field,
-            indices=vertex_edges_idx,
-            weights=weights,
-            valid_mask=vertex_edges_valid,
-        )
-        * inv_area_triangle[:, None]
-    )
-
-
-def edge_tangential_velocity_gather(
-    edge_field: torch.Tensor,
-    edge_edges_idx: torch.Tensor,
-    edge_edges_weights: torch.Tensor,
-    edge_edges_valid: torch.Tensor,
-) -> torch.Tensor:
-    """Pattern E gather-reduce: tangential reconstruction from edge-neighbor stencil."""
-    return _sum_weighted_stencil_slots(
-        field=edge_field,
-        indices=edge_edges_idx,
-        weights=edge_edges_weights,
-        valid_mask=edge_edges_valid,
-    )
-
-
-def build_divergence_csr(
-    cell_edges_idx: torch.Tensor,
-    cell_edges_sign: torch.Tensor,
-    cell_edges_valid: torch.Tensor,
-    dv_edge: torch.Tensor,
-    inv_area_cell: torch.Tensor,
-    n_edges: int,
-) -> torch.Tensor:
-    """Build CSR operator for divergence-like Pattern B."""
-    weights = cell_edges_sign * dv_edge[cell_edges_idx] * inv_area_cell[:, None]
-    return build_sparse_csr_stencil(
-        cell_edges_idx, weights, cell_edges_valid, n_cols=n_edges
-    )
-
-
-def build_vorticity_csr(
-    vertex_edges_idx: torch.Tensor,
-    vertex_edges_sign: torch.Tensor,
-    vertex_edges_valid: torch.Tensor,
-    dc_edge: torch.Tensor,
-    inv_area_triangle: torch.Tensor,
-    n_edges: int,
-) -> torch.Tensor:
-    """Build CSR operator for vorticity-like Pattern D."""
-    weights = vertex_edges_sign * dc_edge[vertex_edges_idx] * inv_area_triangle[:, None]
-    return build_sparse_csr_stencil(
-        vertex_edges_idx, weights, vertex_edges_valid, n_cols=n_edges
-    )
-
-
-def build_tangential_velocity_csr(
-    edge_edges_idx: torch.Tensor,
-    weights_on_edge: torch.Tensor,
-    edge_edges_valid: torch.Tensor,
-    n_edges: int,
-) -> torch.Tensor:
-    """Build CSR operator for tangential reconstruction Pattern E."""
-    return build_sparse_csr_stencil(
-        edge_edges_idx, weights_on_edge, edge_edges_valid, n_cols=n_edges
-    )

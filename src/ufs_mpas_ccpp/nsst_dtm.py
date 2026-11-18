@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from .nsst_thermal import CP_W, Z_W_MAX, Z_W_MIN, positive_sqrt, sw_ps_9b, sw_ps_9b_aw
 
@@ -25,7 +26,7 @@ def _sensitivity(p, state, drho, aw, norm, mask):
         p[n] for n in ("alpha", "beta", "rho", "rich", "grav")
     )
     denominator = torch.where(mask, norm, 1.0)
-    torch._assert_async(
+    torch_compat.assert_async(
         ((~mask) | (norm > 0.0)).all(), "NSST warm-layer current norm is zero"
     )
     return (1.0 / denominator) * (
@@ -149,7 +150,7 @@ def dtm_onset(p, state):
     fv0 = p["toy"] / rho
     xt1, xu1, xv1 = dt * ft0, dt * fu0, dt * fv0
     norm1 = xu1 * xu1 + xv1 * xv1
-    torch._assert_async(
+    torch_compat.assert_async(
         ((~entered) | (norm1 > 0.0)).all(), "NSST onset stress norm is zero"
     )
     divisor = torch.where(entered, norm1, 1.0)

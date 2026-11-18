@@ -18,7 +18,6 @@ def source_real(value: float, config: dict) -> float:
 IM = 4
 KM = 16
 NTRAC = 8
-NVDIFF = NTRAC
 NDTEND = 16
 
 GRAV = 9.80665
@@ -66,57 +65,8 @@ NTQV = 1
 NTCW = 2
 NTIW = 3
 NTRW = 4
-NTSW = 5
 NTOZ = 6
-NTCHM = 1
-NTCHS = 8
-NTCHE = 8
-NTCHEM = NTCHS - 1
 NTKE = 8
 NTKEV = NTKE
 
-SEGMENT_IDS = (
-    "A",
-    "B",
-    "C",
-    "D",
-    "E",
-    "F",
-    "G",
-    "H",
-    "I",
-    "J",
-    "K",
-    "L",
-    "M",
-    "N",
-    "O",
-    "P",
-    "Q",
-    "R",
-    "S",
-    "T",
-)
 
-IMPLEMENTED_SEGMENTS = (
-    "A",
-    "B",
-    "C",
-    "D",
-    "E",
-    "F",
-    "G",
-    "H",
-    "I",
-    "J",
-    "K",
-    "L",
-    "M",
-    "N",
-    "O",
-    "P",
-    "Q",
-    "R",
-    "S",
-    "T",
-)

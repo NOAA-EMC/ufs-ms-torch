@@ -7,12 +7,9 @@ from __future__ import annotations
 
 import torch
 
-from sa_tke_edmf_torch.constants import IM, KM, NTQV, NTRAC
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
 from sa_tke_edmf_torch.tracers import specific_humidity_index
 from sa_tke_edmf_torch.diagnostics import diagnostic_slots, set_diagnostic_
-
-CHECKPOINT_FIELDS = ("gt0", "gq0", "gu0", "gv0", "dqdt", "dtdt", "dudt", "dvdt", "ten_t_pbl", "ten_q_pbl")
 
 
 def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
@@ -122,5 +119,3 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     return state.with_updates(updates)
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

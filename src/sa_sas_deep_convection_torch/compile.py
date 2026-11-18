@@ -13,7 +13,7 @@ import types
 from typing import Any, TypeVar
 
 import torch
-from ufs_physics_common.ordered_sum import parallel_masked_sums
+from ufs_physics_common.compile_policy import dispatcher, island, orchestrating
 
 TensorResult = TypeVar("TensorResult")
 
@@ -73,7 +73,6 @@ DEFAULT_COMPILE_CATEGORIES = frozenset(
 )
 
 _enabled_categories: frozenset[str] = frozenset()
-_explicit_categories = False
 _recurrence_chunk_size = 8
 _symbolic_columns = False
 _COLUMN_HELPER_CATEGORIES = frozenset({
@@ -82,7 +81,6 @@ _COLUMN_HELPER_CATEGORIES = frozenset({
     "n_tensor_backward", "t_ordered_chunks",
 })
 _compile_cache: dict[tuple[Any, ...], Callable[..., Any]] = {}
-_compile_status: dict[str, dict[str, Any]] = {}
 _regional = False
 
 
@@ -119,28 +117,15 @@ def normalize_compile_categories(categories: Iterable[str] | str | None) -> froz
     return normalized
 
 
-def compile_categories_enabled() -> frozenset[str]:
-    return _enabled_categories
-
-
-def compile_categories_explicitly_set() -> bool:
-    return _explicit_categories
-
-
-def set_compile_categories(categories: Iterable[str] | str | None) -> tuple[frozenset[str], bool]:
-    global _enabled_categories, _explicit_categories
-    previous = (_enabled_categories, _explicit_categories)
+def set_compile_categories(categories: Iterable[str] | str | None) -> frozenset[str]:
+    """Enable ``categories`` for eager-mode compilation; returns the previous set."""
+    global _enabled_categories
+    previous = _enabled_categories
     _enabled_categories = normalize_compile_categories(categories)
-    _explicit_categories = True
     return previous
 
 
-def restore_compile_categories(previous: Iterable[str] | str | tuple[frozenset[str], bool] | None) -> None:
-    global _enabled_categories, _explicit_categories
-    if isinstance(previous, tuple) and len(previous) == 2 and isinstance(previous[0], frozenset):
-        _enabled_categories = previous[0]
-        _explicit_categories = bool(previous[1])
-        return
+def restore_compile_categories(previous: Iterable[str] | str | None) -> None:
     set_compile_categories(previous)
 
 
@@ -163,15 +148,6 @@ def compile_categories(categories: Iterable[str] | str | None, *, recurrence_chu
         restore_compile_categories(previous)
         _recurrence_chunk_size = previous_size
         _symbolic_columns = previous_symbolic
-
-
-def clear_compile_cache() -> None:
-    _compile_cache.clear()
-    _compile_status.clear()
-
-
-def compile_island_status() -> dict[str, dict[str, Any]]:
-    return {key: dict(value) for key, value in _compile_status.items()}
 
 
 def _tensor_spec(value: torch.Tensor, columns: int | None = None, column_axis: int | None = 0) -> tuple[Any, ...]:
@@ -312,6 +288,7 @@ def _compile_specialized_callable(fn: Callable[..., TensorResult], key: tuple[An
     return specialized
 
 
+@dispatcher
 def run_compile_island(
     category: str,
     name: str,
@@ -321,26 +298,16 @@ def run_compile_island(
 ) -> TensorResult:
     if category not in COMPILE_CATEGORIES:
         raise ValueError(f"unknown SA-SAS compile category {category!r}")
+    if _regional and (orchestrating() or not torch.compiler.is_compiling()):
+        return island(fn, args, kwargs,
+                      normalize_layouts=name not in {"join_levels", "pack_profiles", "_compact_select", "_compact_merge"})
     if torch.compiler.is_compiling():
         return fn(*args, **kwargs)
-    if _regional:
-        from ufs_physics_common.compile_policy import compiled
-
-        if name in {"join_levels", "_compact_select", "_compact_merge"}:
-            return compiled(fn, normalize_layouts=False)(*args, **kwargs)
-        return compiled(fn)(*args, **kwargs)
-    status_key = f"{category}:{name}"
     if category not in _enabled_categories:
-        _compile_status[status_key] = {"status": "eager_disabled"}
         return fn(*args, **kwargs)
     if category not in {"f_ordered_chunks", "g_ordered_chunks", "l_ordered_chunks", "n_tensor_backward", "i_ordered_chunks", "j_ordered_chunks", "k_ordered_chunks", "t_ordered_chunks"} and torch.is_grad_enabled() and (any(_has_gradient_tensor(arg) for arg in args) or any(_has_gradient_tensor(value) for value in kwargs.values())):
-        _compile_status[status_key] = {
-            "status": "eager_grad_enabled",
-            "reason": "compiled SA-SAS islands are forward-only until backward compile closure is profiled",
-        }
         return fn(*args, **kwargs)
     if not hasattr(torch, "compile"):
-        _compile_status[status_key] = {"status": "compile_unavailable"}
         raise RuntimeError("torch.compile is unavailable")
 
     key = _cache_key(category, name, fn, args, kwargs)
@@ -348,55 +315,36 @@ def run_compile_island(
     compiled = _compile_cache.get(key)
     created = compiled is None
     if compiled is None:
-        _compile_status[status_key] = {
-            "status": "compiling",
-            "cache_key": repr(key),
-            "autodiff_stabilized": False,
-        }
         compiled = torch.compile(_compile_specialized_callable(fn, key), fullgraph=True,
                                  dynamic=None if columns is not None else False, mode=None)
         _compile_cache[key] = compiled
-    _compile_status[status_key] = {
-        "status": "compiled",
-        "cache_key": repr(key),
-        "autodiff_stabilized": False,
-        "symbolic_columns": columns is not None,
-    }
-    try:
-        if created and columns is not None:
-            with _temporary_column_marks(args, kwargs, columns, fn):
-                return compiled(*args, **kwargs)
-        return compiled(*args, **kwargs)
-    except Exception as exc:  # noqa: BLE001 - compile failures are evidence.
-        _compile_status[status_key] = {
-            "status": "runtime_failed",
-            "exception_type": type(exc).__name__,
-            "exception": str(exc).splitlines()[0],
-            "cache_key": repr(key),
-        }
-        raise
+    if created and columns is not None:
+        with _temporary_column_marks(args, kwargs, columns, fn):
+            return compiled(*args, **kwargs)
+    return compiled(*args, **kwargs)
 
 
 def recurrence_chunk_size() -> int:
     return _recurrence_chunk_size
 
 
-def masked_sum_chunk_size() -> int:
-    """Levels per chunk of a masked sum; its reduction form runs all levels in one region."""
-    return 1 << 30 if parallel_masked_sums() else _recurrence_chunk_size
-
-
 def ordered_chunks_enabled(category: str) -> bool:
     return category in _enabled_categories
 
 
+@dispatcher
 def run_recurrence_chunk(category: str, name: str, fn, *args):
-    if _regional and not torch.compiler.is_compiling():
+    if _regional and (orchestrating() or not torch.compiler.is_compiling()):
         # Float scalar inputs are value-specialized by Dynamo 2.8. Keep the
         # varying first level as a one-element device tensor, not a host value.
         parameters = fn.__code__.co_varnames[:fn.__code__.co_argcount]
         args = tuple(value.reshape(1) if parameter == "first" else value
                      for parameter, value in zip(parameters[:len(args)], args, strict=True))
+        if category != "n_tensor_backward" and not torch.is_grad_enabled():
+            # A chunk writes no input (the TVD blocks of n_tensor_backward update dellaq/dellae in place), so without
+            # gradients it reads its packet slices in place instead of copying each non-contiguous slice at the
+            # region entry; values are unchanged.
+            return island(fn, args, {}, normalize_layouts=False)
         return run_compile_island(category, name, fn, *args)
     if torch.compiler.is_compiling() or category not in _enabled_categories:
         return fn(*args)

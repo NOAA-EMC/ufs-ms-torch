@@ -8,9 +8,10 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from ufs_physics_common.compile_policy import dispatcher
 
 from sa_sas_shallow_convection_torch import recurrence_chunks
-from ufs_physics_common.ordered_sum import parallel_masked_sums
+from ufs_physics_common.ordered_sum import level_prefix, level_sum
 
 from sa_sas_shallow_convection_torch.compile import (
     DEFAULT_COMPILE_CATEGORIES,
@@ -20,168 +21,41 @@ from sa_sas_shallow_convection_torch.compile import (
     selected_recurrence_chunk_size,
 )
 from sa_sas_shallow_convection_torch.constants import (
-    ASOLFAC,
-    BETADCU,
-    BETAMCU,
-    BETASCU,
-    C0S,
-    C1,
-    CAT_ADJ_SHAL,
-    CLIQ,
-    CLAM,
-    CP,
-    CSCALE,
-    CVAP,
     DELT,
-    EPS,
-    EPSM1,
-    EVEF,
-    FV,
-    GRAV,
     HVAP,
     IMPLEMENTED_SEGMENTS,
-    IM,
     ITC as ITC_DEFAULT,
-    KM,
     NCLOUD,
     NDTEND,
-    NN,
-    NTC,
     NTK,
-    NTR,
-    PGCON,
-    RD,
-    RV,
     SEGMENT_IDS,
-    T0C,
 )
 from sa_sas_shallow_convection_torch.state import SaSasShallowConvectionState, require_real, require_same_device
 from sa_sas_deep_convection_torch.samf_interstitials import (
-    IMP_PHYSICS_CODES,
     ConvectionTracerLayout,
-    build_clw,
-    interface_pressure,
+    convective_rain_scale,
+    detrain_cloud_condensate,
+    rescale_convective_tracers,
+    rain_host_tracer_tendencies,
     layout_from_config,
     legacy_layout,
-    mpas_tempo_layout,
     samf_water_reconciliation,
     tendencies_from_dclw,
 )
 from sa_sas_shallow_convection_torch.thermo import fpvs, _fpvs_lookup, _fpvs_table_for_device
 
 
-BOUNDARY_FIELDS: dict[str, tuple[str, ...]] = {
-    "A": ("errflg", "errmsg", "ten_t", "ten_u", "ten_v", "ten_q", "dqtr", "new_t1", "new_q1", "new_qtr"),
-    "B": ("do_aerosols", "ps", "prsl", "del", "cnvflg", "c0", "c0t", "cnvw", "cnvc", "ud_mf", "dt_mf"),
-    "C": ("zo", "zi", "qeso", "heo", "heso", "to", "qo", "uo", "vo", "kpbl", "kbm", "kmax"),
-    "D": ("kb", "kb1", "kbcon", "cnvflg", "pfld", "po", "to", "qo", "heo", "heso"),
-    "E": ("pdot", "cina", "rhbar", "tkemean", "clamt", "xlamue", "xlamud", "cnvflg", "return_stage"),
-    "F": ("eta", "hcko", "qcko", "ucko", "vcko", "ecko", "ercko", "chem_c", "chem_pw", "xlamue"),
-    "G": ("kbcon1", "ktcon", "ktcon1", "xmbmax", "dbyo", "cnvflg", "return_stage"),
-    "H": ("qcko", "qrcko", "pwo", "cnvwt", "dellal", "zdqca", "buo", "drag", "aa1", "dbyo1"),
-    "I": ("ktcon1", "qcko", "qrcko", "pwo", "cnvwt", "wu2", "omega_u", "omegaout", "cnvflg"),
-    "J": ("wc", "omegac", "zeta", "ktcon", "ktcon1", "qlko_ktcon", "qcko", "zdqca", "cnvflg"),
-    "K": ("dellah", "dellaq", "dellau", "dellav", "dellal", "dellae", "delubar", "delvbar"),
-    "L": ("q_diff", "e_diff", "flxtvd", "dtconv", "umean", "advfac", "dellaq", "dellae"),
-    "M": ("qadv", "tmfq", "sigmaout", "sigmab", "xmb", "sigmagfm", "scaldfunc", "new_t1", "new_q1", "new_u1", "new_v1"),
-    "N": ("new_q1", "new_qtr", "ctr", "wet_dep", "tsumn", "tsump", "rtnp", "delebar"),
-    "O": ("qeso", "rntot", "rn", "qevap", "delqev", "delqbar", "deltbar", "new_t1", "new_q1"),
-    "P": ("rn", "kbot", "ktop", "kcnv", "cnvw", "cnvc", "ud_mf", "dt_mf", "new_qtr", "ten_t", "ten_u", "ten_v", "ten_q", "dqtr"),
-    "Q": ("gt0", "gu0", "gv0", "gq0", "dtdt", "dudt", "dvdt", "dqdt", "dtend", "rainc", "cnvprcp", "cnvw_phy_f3d", "cnvc_phy_f3d", "ten_q", "errflg"),
-}
-
-PRODUCTION_FIELDS: tuple[str, ...] = (
-    "gt0",
-    "gu0",
-    "gv0",
-    "gq0",
-    "dtdt",
-    "dudt",
-    "dvdt",
-    "dqdt",
-    "dtend",
-    "rainc",
-    "cnvprcp",
-    "cnvw_phy_f3d",
-    "cnvc_phy_f3d",
-    "ten_q",
-    "ten_t",
-    "ten_u",
-    "ten_v",
-    "dqtr",
-    "kcnv",
-    "kbot",
-    "ktop",
-    "rn",
-    "ud_mf",
-    "dt_mf",
-    "cnvw",
-    "cnvc",
-    "errflg",
-    "errmsg",
-)
-
 _ORDER = {segment_id: index for index, segment_id in enumerate(SEGMENT_IDS)}
 
 _INPUT_GROUPS = {
     "scalar": ("cliq", "cp", "cvap", "eps", "epsm1", "fv", "grav", "hvap", "rd", "rv", "t0c", "delt", "cscale", "clam", "c0s", "c1", "evef", "pgcon", "asolfac", "betadcu", "betamcu", "betascu", "cat_adj_shal"),
     "column": ("psp", "rn", "garea", "hpbl", "kcnv", "kbot", "ktop", "islimsk", "rainc", "cnvprcp"),
-    "level": ("qmicro", "delp", "ten_t", "ten_u", "ten_v", "prslp", "phil", "tkeh", "prevsq", "q", "q1", "t1", "u1", "v1", "dot", "ud_mf", "dt_mf", "cnvw", "cnvc", "sigmain", "sigmaout", "omegain", "omegaout", "gt0", "gu0", "gv0", "dudt", "dvdt", "dtdt", "cnvw_phy_f3d", "cnvc_phy_f3d"),
+    "level": ("qmicro", "delp", "ten_t", "ten_u", "ten_v", "prslp", "phil", "tkeh", "prevsq", "q", "q1", "t1", "phase_entry_temperature", "u1", "v1", "dot", "ud_mf", "dt_mf", "cnvw", "cnvc", "sigmain", "sigmaout", "omegain", "omegaout", "gt0", "gu0", "gv0", "dudt", "dvdt", "dtdt", "cnvw_phy_f3d", "cnvc_phy_f3d"),
     "source_tracer": ("tmf", "qtr", "dqtr"),
     "tracer": ("ten_q", "gq0", "dqdt"),
     "chemistry": ("fscav",),
     "diagnostic": ("dtend",),
 }
-
-CASE_PROFILE_VARIANTS: dict[str, int] = {
-    "case01_no_lfc_early_return": 1,
-    "case02_pressure_depth_rejection": 2,
-    "case03_rh_rejection": 3,
-    "case04_entrained_lfc_rejection": 5,
-    "case05_cin_rejection": 6,
-    "case06_cloud_depth_rejection": 7,
-    "case07_negative_cloudwork_rejection": 8,
-}
-
-CASE_CONFIGS: dict[str, dict[str, Any]] = {
-    "case00_kcnv_precluded_return": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case01_no_lfc_early_return": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case02_pressure_depth_rejection": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case03_rh_rejection": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case04_entrained_lfc_rejection": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case05_cin_rejection": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case06_cloud_depth_rejection": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case07_negative_cloudwork_rejection": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case08_active_maritime_default": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case09_active_land_default": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case10_hwrf_samfshal_active": {"hwrf_samfshal": True, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case11_tke_entrainment_active": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case12_convective_tracer_transport": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case13_aerosol_wetdep_active": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case14_ncloud_cloudwater_detrainment": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case15_progsigma_first_step": {"hwrf_samfshal": False, "progsigma": True, "progomega": False, "tend_opt_scnv": 1},
-    "case16_progsigma_warm_restart": {"hwrf_samfshal": False, "progsigma": True, "progomega": False, "tend_opt_scnv": 1},
-    "case17_progomega_active": {"hwrf_samfshal": False, "progsigma": False, "progomega": True, "tend_opt_scnv": 1},
-    "case18_small_grid_scaleaware": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case19_tend_opt_scnv_2_accumulate": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 2},
-    "case20_tend_opt_scnv_3_apply_reset": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 3},
-    "case21_tend_opt_scnv_4_noop": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 4},
-    "case22_scnv_post_gfdl_cloud_diag": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case23_scnv_post_pdf_cloud_diag": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-    "case24_scnv_post_dtend_tracer": {"hwrf_samfshal": False, "progsigma": False, "progomega": False, "tend_opt_scnv": 1},
-}
-
-
-def _scalar(value: float, *, device: torch.device | str | None) -> torch.Tensor:
-    return torch.as_tensor(float(value), dtype=torch.float64, device=device)
-
-
-def _zeros(shape: tuple[int, ...], *, device: torch.device | str | None) -> torch.Tensor:
-    return torch.zeros(shape, dtype=torch.float64, device=device)
-
-
-def _full(shape: tuple[int, ...], value: float, *, device: torch.device | str | None) -> torch.Tensor:
-    return torch.full(shape, float(value), dtype=torch.float64, device=device)
 
 
 def _level_values(start: int, stop: int, *, reference: torch.Tensor) -> torch.Tensor:
@@ -245,11 +119,6 @@ def _put_dynamic2_many(
     return tuple(torch.where(hit, value[:, None], field) for field, value in zip(fields, values))
 
 
-def _put_dynamic3(field: torch.Tensor, index1: torch.Tensor, tracer0: int, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    tracer = torch.arange(field.shape[2], device=field.device) == int(tracer0)
-    return torch.where(_level_hit(field, index1, mask)[:, :, None] & tracer, values[:, None, None], field)
-
-
 def _put_dynamic3_all(field: torch.Tensor, index1: torch.Tensor, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return torch.where(_level_hit(field, index1, mask)[:, :, None], values[:, None, :], field)
 
@@ -267,7 +136,7 @@ def _masked_sum(mask: torch.Tensor, values: torch.Tensor, *, dim: int = 1) -> to
     if masked.shape[dim] == 0:
         return masked.sum(dim=dim)
     # The source's loop order: torch.sum groups terms differently, which changes the last bit.
-    return masked.cumsum(dim=dim).select(dim, -1).clone()
+    return level_sum(masked, dim)
 
 
 def _first_true_level(mask: torch.Tensor, levels: torch.Tensor, default: torch.Tensor) -> torch.Tensor:
@@ -374,13 +243,12 @@ def _d_environment_block(
     return kb, kb1, kbcon, cnvflg_bool, to, qo, qeso, po, rh, heo, heso, uo, vo, ctro
 
 
-
 # Static candidate granularity; exact short tails use the same equations.
 RECURRENCE_CHUNK_SIZE = 8
 
 
 def _e_cloud_base_block(cnvflg_bool, kb, kbcon, kpbl, kbm, kmax, dot, zi, pfld,
-                        heo, heso, hpbl, islimsk, pdot):
+                        heo, heso, hpbl, islimsk, pdot, cinpcr_scale=None):
     dot_kbcon, zi_kbcon = _gather2_many(kbcon, dot, zi)
     pdot = _where(cnvflg_bool, 0.01 * dot_kbcon, pdot)
     w3 = _where(islimsk == 1.0, -5.0e-3, -1.0e-3)
@@ -388,7 +256,12 @@ def _e_cloud_base_block(cnvflg_bool, kb, kbcon, kpbl, kbm, kmax, dot, zi, pfld,
     tem = _where(pdot <= w4, (pdot - w4) / (w3 - w4),
                  _where(pdot >= -w4, -(pdot + w4) / (w4 - w3), 0.0))
     tem = torch.clamp(tem, min=-1.0, max=1.0)
-    cinpcr = 180.0 - (1.0 - tem) * (0.5 * (180.0 - 120.0))
+    # samf.cinpcr_shal scales cinpcrmx and cinpcrmn together; the source expression order is kept. The scales enter
+    # as 1-element views (ufs_mpas_ccpp.parameters.region_views) and act as 0-d tensors.
+    if cinpcr_scale is not None:
+        cinpcr_scale = cinpcr_scale.reshape(())
+    cinpcrmx, cinpcrmn = (180.0, 120.0) if cinpcr_scale is None else (180.0 * cinpcr_scale, 120.0 * cinpcr_scale)
+    cinpcr = cinpcrmx - (1.0 - tem) * (0.5 * (cinpcrmx - cinpcrmn))
     pfld_kb, pfld_kbcon = _gather2_pair(pfld, kb, kbcon)
     pressure_depth = pfld_kb - pfld_kbcon
     cnvflg_bool = cnvflg_bool & ~((pressure_depth > cinpcr) & (zi_kbcon > hpbl))
@@ -411,20 +284,25 @@ def _recurrence_ranges(start: int, stop: int) -> list[tuple[int, int]]:
     return [(lo, min(lo + width, stop)) for lo in range(start, stop, width)]
 
 
+@dispatcher
 def _recurrence_chunk(name, fn, *args, **kwargs):
     return run_compile_island("recurrence_chunks", name, fn, *args, **kwargs)
+
+
+def _pair_rows(mask, first_terms, second_terms):
+    """The level-major mask rows and term pairs of ``_ordered_pair_sums``: one compiled region (a tiled transpose)
+    instead of two eager strided copies in the scheme's orchestration (round 8 wave 4). Values are copies."""
+    return mask.t().contiguous(), torch.stack((first_terms.t(), second_terms.t()), dim=1)
 
 
 def _ordered_pair_sums(mask, first_terms, second_terms, *, masked_add):
     if mask.shape[1] == 0:
         return first_terms.sum(dim=1), second_terms.sum(dim=1)
     # Pack once so contiguous level windows cross the compile boundary without copies.
-    rows = mask.t().contiguous()
-    terms = torch.stack((first_terms.t(), second_terms.t()), dim=1)
+    rows, terms = _recurrence_chunk("pair_rows", _pair_rows, mask, first_terms, second_terms)
     first = torch.zeros_like(first_terms[:, 0])
     second = torch.zeros_like(second_terms[:, 0])
-    ranges = [(0, mask.shape[1])] if parallel_masked_sums() else _recurrence_ranges(0, mask.shape[1])
-    for lo, hi in ranges:
+    for lo, hi in _recurrence_ranges(0, mask.shape[1]):
         first, second = _recurrence_chunk(
             "ordered_pair_sums", recurrence_chunks.ordered_pair_sums,
             rows[lo:hi], terms[lo:hi], first, second, masked_add=masked_add)
@@ -866,19 +744,23 @@ def _o_evap_recurrence_block(
     evef: float,
     delt: float,
     el2orc: torch.Tensor,
-    elocp: torch.Tensor,
+    entry_q: torch.Tensor,
+    entry_temperature: torch.Tensor,
+    cp: torch.Tensor,
+    rd: torch.Tensor,
+    rv: torch.Tensor,
     grav: float,
     km: int,
 ) -> tuple[torch.Tensor, ...]:
     levels = _level_values(1, km + 1, reference=new_t1)[0]
-    profiles = recurrence_chunks.pack_profiles(pwo, del_, qeso, new_t1, new_q1)
+    profiles = recurrence_chunks.pack_profiles(pwo, del_, qeso, new_t1, new_q1, entry_q, entry_temperature)
     zero = torch.zeros_like(rn)
     carry = (rn, zero, zero, zero, zero, delqbar, deltbar, cnvflg_bool.clone())
     t_parts, q_parts = [], []
     for lo, hi in reversed(_recurrence_ranges(0, km)):
         t_chunk, q_chunk, carry = _recurrence_chunk("evaporation", recurrence_chunks.evaporation,
             cnvflg_bool, kb, ktcon, kmax, levels[lo], profiles[lo:hi], xmb,
-            carry, rntot, shevf=shevf, evef=evef, delt=delt, el2orc=el2orc, elocp=elocp, grav=grav)
+            carry, rntot, shevf=shevf, evef=evef, delt=delt, el2orc=el2orc, cp=cp, rd=rd, rv=rv, grav=grav)
         t_parts.append(t_chunk)
         q_parts.append(q_chunk)
     del profiles
@@ -1003,350 +885,8 @@ def _progsigma_calc(
     return sigmab, sigmaout
 
 
-def _state_from_profile_variant(
-    profile_variant: int,
-    *,
-    device: torch.device | str | None = None,
-    ncol: int | None = None,
-    ntrac: int = NTR,
-) -> SaSasShallowConvectionState:
-    ncol = IM if ncol is None else int(ncol)
-    if ncol <= 0:
-        raise ValueError(f"ncol must be positive, got {ncol}")
-    if not isinstance(ntrac, int) or ntrac < 8:
-        raise ValueError("native profile needs at least eight declared tracer slots")
-    NTR = ntrac
-    NN = NTR + 2
-    levels = torch.arange(KM, dtype=torch.float64, device=device).reshape(1, KM)
-    columns = torch.arange(ncol, dtype=torch.int64, device=device)
-
-    prslp = (100000.0 - levels * 5500.0).repeat(ncol, 1)
-    delp = _full((ncol, KM), 5000.0, device=device)
-    phil = (GRAV * levels * 450.0).repeat(ncol, 1)
-    t1 = (304.0 - 4.0 * levels).repeat(ncol, 1)
-    if profile_variant == 1:
-        t1 = (302.0 - 3.8 * levels).repeat(ncol, 1)
-        t1[:, :4] = t1[:, :4] + 4.0 * (5.0 - torch.arange(1, 5, dtype=torch.float64, device=device))
-        t1[:, 0] = 310.0
-        t1[:, 1] = 300.0
-        t1[:, 2] = 309.0
-        t1[:, 3] = 320.0
-        t1[:, 4] = 315.0
-    elif profile_variant == 2:
-        t1 = (302.0 - 4.0 * levels).repeat(ncol, 1)
-        t1[:, 0] = 311.0
-        t1[:, 1] = 294.0
-        t1[:, 2] = 304.0
-        t1[:, 3] = 316.0
-        t1[:, 4] = 312.0
-    elif profile_variant == 3:
-        t1 = (301.0 - 3.5 * levels).repeat(ncol, 1)
-        t1[:, 0] = 307.0
-        t1[:, 1] = 302.0
-        t1[:, 2] = 301.0
-        t1[:, 3] = 306.0
-        t1[:, 4] = 310.0
-    elif profile_variant == 5:
-        t1 = (302.0 - 3.8 * levels).repeat(ncol, 1)
-        t1[:, 0] = 310.0
-        t1[:, 1] = 300.0
-        t1[:, 2] = 309.0
-        t1[:, 3] = 305.0
-        t1[:, 4] = 300.0
-    elif profile_variant == 6:
-        t1 = (302.0 - 3.8 * levels).repeat(ncol, 1)
-        t1[:, 0] = 312.0
-        t1[:, 1] = 298.0
-        t1[:, 2] = 308.0
-        t1[:, 3] = 304.0
-        t1[:, 4] = 299.0
-    elif profile_variant == 7:
-        t1[:, 3] = 330.0
-        t1[:, 4] = 318.0
-    elif profile_variant == 8:
-        t1[:, 0] = 310.0
-        t1[:, 3] = 330.0
-        t1[:, 4] = 318.0
-    elif profile_variant == 9:
-        t1[:, 0] = 310.0
-        t1[:, 4] = 330.0
-        t1[:, 5] = 318.0
-    esat = 0.01 * fpvs(t1)
-    pfmb = 0.01 * prslp
-    qsat = EPS * esat / (pfmb + EPSM1 * esat)
-    q1 = torch.clamp(0.98 * qsat, min=1.0e-8, max=0.05)
-    if profile_variant == 1:
-        q1[:, 0] = torch.clamp_min(q1[:, 0], 0.026)
-        q1[:, 1] = torch.clamp_min(q1[:, 1], 0.020)
-        q1[:, 2] = torch.clamp_min(q1[:, 2], 0.018)
-        q1[:, 3] = torch.clamp_max(q1[:, 3], 0.001)
-        q1[:, 4:] = torch.clamp_max(q1[:, 4:], 0.004)
-    elif profile_variant == 2:
-        q1[:, 0] = torch.clamp_min(q1[:, 0], 0.030)
-        q1[:, 1] = torch.clamp_min(q1[:, 1], 0.022)
-        q1[:, 2] = torch.clamp_min(q1[:, 2], 0.018)
-        q1[:, 3] = torch.clamp_max(q1[:, 3], 0.004)
-        q1[:, 4:] = torch.clamp_max(q1[:, 4:], 0.002)
-    elif profile_variant == 3:
-        q1[:, 0] = torch.clamp_min(q1[:, 0], 0.028)
-        q1[:, 1] = torch.clamp_min(q1[:, 1], 0.022)
-        q1[:, 2] = torch.clamp_min(q1[:, 2], 0.018)
-        q1[:, 3] = torch.clamp_max(q1[:, 3], 0.010)
-        q1[:, 4:] = torch.clamp_max(q1[:, 4:], 0.004)
-    elif profile_variant == 5:
-        q1[:, 0] = torch.clamp_min(q1[:, 0], 0.028)
-        q1[:, 1] = torch.clamp_min(q1[:, 1], 0.018)
-        q1[:, 2] = torch.clamp_max(q1[:, 2], 0.004)
-        q1[:, 3:] = torch.clamp_max(q1[:, 3:], 0.003)
-    elif profile_variant == 6:
-        q1[:, 0] = torch.clamp_min(q1[:, 0], 0.032)
-        q1[:, 1] = torch.clamp_min(q1[:, 1], 0.018)
-        q1[:, 2] = torch.clamp_max(q1[:, 2], 0.003)
-        q1[:, 3:] = torch.clamp_max(q1[:, 3:], 0.002)
-    elif profile_variant == 7:
-        q1[:, :3] = torch.maximum(
-            q1[:, :3],
-            0.020 - 0.0012 * torch.arange(0, 3, dtype=torch.float64, device=device).reshape(1, 3),
-        )
-        q1[:, 3] = torch.clamp_max(q1[:, 3], 0.001)
-        q1[:, 4:] = torch.clamp_max(q1[:, 4:], 0.003)
-    elif profile_variant == 8:
-        q1[:, 0] = torch.clamp_min(q1[:, 0], 0.028)
-        q1[:, 1] = torch.clamp_min(q1[:, 1], 0.020)
-        q1[:, 2] = torch.clamp_max(q1[:, 2], 0.004)
-        q1[:, 3] = torch.clamp_max(q1[:, 3], 0.001)
-        q1[:, 4:] = torch.clamp_max(q1[:, 4:], 0.003)
-    elif profile_variant == 9:
-        q1[:, 0] = torch.clamp_min(q1[:, 0], 0.028)
-        q1[:, 1] = torch.clamp_min(q1[:, 1], 0.020)
-        q1[:, 2] = torch.clamp_min(q1[:, 2], 0.016)
-        q1[:, 3] = torch.clamp_max(q1[:, 3], 0.004)
-        q1[:, 4] = torch.clamp_max(q1[:, 4], 0.001)
-        q1[:, 5:] = torch.clamp_max(q1[:, 5:], 0.003)
-    else:
-        q1[:, :5] = torch.maximum(
-            q1[:, :5],
-            0.020 - 0.0012 * torch.arange(0, 5, dtype=torch.float64, device=device).reshape(1, 5),
-        )
-
-    q = q1.clone()
-    prevsq = q1 * 0.98
-    u1 = (5.0 + 0.2 * levels).repeat(ncol, 1)
-    v1 = _full((ncol, KM), 1.0, device=device)
-    dot = _full((ncol, KM), -0.025, device=device)
-    qtr = _zeros((ncol, KM, NN), device=device)
-    qtr[:, :, 0] = q1
-    qtr[:, :, 1] = 1.0e-5
-    qtr[:, :, 2:] = 1.0e-6
-    qtr[:, :, NTK - 1] = 0.1
-
-    islimsk = (((columns + 1) % 2) == 0).to(torch.float64)
-    fields: dict[str, torch.Tensor] = {
-        "tmf": _zeros((ncol, KM, NN), device=device),
-        "qmicro": _zeros((ncol, KM), device=device),
-        "delp": delp,
-        "ten_t": _zeros((ncol, KM), device=device),
-        "ten_u": _zeros((ncol, KM), device=device),
-        "ten_v": _zeros((ncol, KM), device=device),
-        "ten_q": _zeros((ncol, KM, NTR), device=device),
-        "prslp": prslp,
-        "psp": _full((ncol,), 100000.0, device=device),
-        "phil": phil,
-        "tkeh": _full((ncol, KM), 0.1, device=device),
-        "qtr": qtr,
-        "dqtr": _zeros((ncol, KM, NN), device=device),
-        "prevsq": prevsq,
-        "q": q,
-        "q1": q1,
-        "t1": t1,
-        "u1": u1,
-        "v1": v1,
-        "fscav": _full((NTC,), 0.1, device=device),
-        "rn": _zeros((ncol,), device=device),
-        "garea": _full((ncol,), 1.0e8, device=device),
-        "dot": dot,
-        "hpbl": _full((ncol,), 700.0 if profile_variant >= 7 else 1800.0, device=device),
-        "ud_mf": _zeros((ncol, KM), device=device),
-        "dt_mf": _zeros((ncol, KM), device=device),
-        "cnvw": _zeros((ncol, KM), device=device),
-        "cnvc": _zeros((ncol, KM), device=device),
-        "sigmain": _zeros((ncol, KM), device=device),
-        "sigmaout": _zeros((ncol, KM), device=device),
-        "omegain": _zeros((ncol, KM), device=device),
-        "omegaout": _zeros((ncol, KM), device=device),
-        "kcnv": _zeros((ncol,), device=device),
-        "kbot": _zeros((ncol,), device=device),
-        "ktop": _zeros((ncol,), device=device),
-        "islimsk": islimsk,
-        "gt0": t1.clone(),
-        "gu0": u1.clone(),
-        "gv0": v1.clone(),
-        "gq0": _zeros((ncol, KM, NTR), device=device),
-        "dudt": _zeros((ncol, KM), device=device),
-        "dvdt": _zeros((ncol, KM), device=device),
-        "dtdt": _zeros((ncol, KM), device=device),
-        "dqdt": _zeros((ncol, KM, NTR), device=device),
-        "rainc": _zeros((ncol,), device=device),
-        "cnvprcp": _zeros((ncol,), device=device),
-        "cnvw_phy_f3d": _zeros((ncol, KM), device=device),
-        "cnvc_phy_f3d": _zeros((ncol, KM), device=device),
-        "dtend": _zeros((ncol, KM, NDTEND), device=device),
-        "cliq": _scalar(CLIQ, device=device),
-        "cp": _scalar(CP, device=device),
-        "cvap": _scalar(CVAP, device=device),
-        "eps": _scalar(EPS, device=device),
-        "epsm1": _scalar(EPSM1, device=device),
-        "fv": _scalar(FV, device=device),
-        "grav": _scalar(GRAV, device=device),
-        "hvap": _scalar(HVAP, device=device),
-        "rd": _scalar(RD, device=device),
-        "rv": _scalar(RV, device=device),
-        "t0c": _scalar(T0C, device=device),
-        "delt": _scalar(DELT, device=device),
-        "cscale": _scalar(CSCALE, device=device),
-        "clam": _scalar(CLAM, device=device),
-        "c0s": _scalar(C0S, device=device),
-        "c1": _scalar(C1, device=device),
-        "evef": _scalar(EVEF, device=device),
-        "pgcon": _scalar(PGCON, device=device),
-        "asolfac": _scalar(ASOLFAC, device=device),
-        "betadcu": _scalar(BETADCU, device=device),
-        "betamcu": _scalar(BETAMCU, device=device),
-        "betascu": _scalar(BETASCU, device=device),
-        "cat_adj_shal": _scalar(CAT_ADJ_SHAL, device=device),
-    }
-    fields["gq0"][:, :, 0] = q1
-
-    config: dict[str, Any] = {
-        "im": ncol,
-        "km": KM,
-        "nn": NN,
-        "ntr": NTR,
-        "ntc": NTC,
-        "itc": ITC_DEFAULT,
-        "ntk": NTK,
-        "ncloud": NCLOUD,
-        "ndtend": NDTEND,
-        "first_time_step": True,
-        "restart": False,
-        "hwrf_samfshal": False,
-        "progsigma": False,
-        "progomega": False,
-        "tend_opt_scnv": 1,
-        "imp_physics": 8,
-        "imp_physics_gfdl": 9,
-        "npdf3d": 3,
-        "num_p3d": 4,
-        "ncnvcld3d": 1,
-        "ntrac": NTR,
-        "nsamftrac": NTR,
-        "lssav": True,
-        "ldiag3d": True,
-        "qdiag3d": True,
-        "shcnvcw": True,
-        "flag_for_scnv_generic_tend": True,
-        "cscnv": False,
-        "satmedmf": True,
-        "trans_trac": True,
-        "ras": False,
-    }
-    return SaSasShallowConvectionState(fields, config)
-
-
-def initial_state_case08_active_maritime_default(
-    *,
-    device: torch.device | str | None = None,
-    ncol: int | None = None,
-    ntrac: int = NTR,
-) -> SaSasShallowConvectionState:
-    """Build the deterministic active shallow profile used by the source driver."""
-
-    return _state_from_profile_variant(9, device=device, ncol=ncol, ntrac=ntrac)
-
-
-def initial_state_for_case(
-    case_id: str,
-    *,
-    device: torch.device | str | None = None,
-    ncol: int | None = None,
-    ntrac: int = NTR,
-) -> SaSasShallowConvectionState:
-    """Build a materialized scenario-policy case with explicit branch config."""
-
-    if case_id not in CASE_CONFIGS:
-        raise KeyError(f"unknown SA-SAS shallow-convection case {case_id!r}")
-    state = _state_from_profile_variant(CASE_PROFILE_VARIANTS.get(case_id, 9), device=device, ncol=ncol, ntrac=ntrac)
-    fields = dict(state.fields)
-    config = dict(state.config)
-    config.update(CASE_CONFIGS[case_id])
-
-    if config["progsigma"]:
-        fields["sigmain"] = torch.full_like(fields["sigmain"], 0.06)
-        fields["sigmaout"] = torch.zeros_like(fields["sigmaout"])
-        fields["prevsq"] = fields["q1"] * 0.97
-        if case_id == "case16_progsigma_warm_restart":
-            config["first_time_step"] = False
-            config["restart"] = False
-    if config["progomega"]:
-        fields["omegain"] = torch.full_like(fields["omegain"], -0.25)
-    if case_id == "case00_kcnv_precluded_return":
-        fields["kcnv"] = torch.ones_like(fields["kcnv"])
-    if case_id in {"case02_pressure_depth_rejection", "case03_rh_rejection", "case05_cin_rejection", "case09_active_land_default"}:
-        fields["islimsk"] = torch.ones_like(fields["islimsk"])
-    if case_id == "case01_no_lfc_early_return":
-        fields["q1"] = torch.full_like(fields["q1"], 1.0e-8)
-        fields["q"] = fields["q1"].clone()
-        fields["qtr"] = fields["qtr"].clone()
-        fields["qtr"][:, :, 0] = fields["q1"]
-        fields["dot"] = torch.full_like(fields["dot"], 0.02)
-    if case_id == "case03_rh_rejection":
-        fields["q1"] = torch.clamp_min(fields["q1"] * 0.05, 1.0e-8)
-        fields["q"] = fields["q1"].clone()
-        fields["qtr"] = fields["qtr"].clone()
-        fields["qtr"][:, :, 0] = fields["q1"]
-    if case_id in {"case02_pressure_depth_rejection", "case05_cin_rejection"}:
-        fields["dot"] = torch.full_like(fields["dot"], 0.08)
-    if case_id == "case04_entrained_lfc_rejection":
-        fields["q1"] = fields["q1"].clone()
-        fields["q1"][:, 3:] = torch.clamp_min(fields["q1"][:, 3:] * 0.1, 1.0e-8)
-    if case_id == "case06_cloud_depth_rejection":
-        fields["hpbl"] = torch.full_like(fields["hpbl"], 120.0)
-    if case_id == "case07_negative_cloudwork_rejection":
-        fields["t1"] = fields["t1"] + 8.0
-    if case_id == "case18_small_grid_scaleaware":
-        fields["garea"] = torch.full_like(fields["garea"], 1.0e6)
-    if case_id == "case13_aerosol_wetdep_active":
-        fields["fscav"] = torch.full_like(fields["fscav"], 0.5)
-    if case_id == "case11_tke_entrainment_active":
-        fields["qtr"] = fields["qtr"].clone()
-        fields["qtr"][:, :, NTK - 1] = 0.2
-    if case_id == "case22_scnv_post_gfdl_cloud_diag":
-        config["imp_physics"] = config["imp_physics_gfdl"]
-    if case_id == "case23_scnv_post_pdf_cloud_diag":
-        config.update({"shcnvcw": True, "npdf3d": 3, "num_p3d": 4, "ncnvcld3d": 1})
-    if case_id == "case24_scnv_post_dtend_tracer":
-        config.update({"ldiag3d": True, "qdiag3d": True, "flag_for_scnv_generic_tend": True})
-    return SaSasShallowConvectionState(fields, config)
-
-
 def _runs_through(through: str, segment_id: str) -> bool:
     return _ORDER[through] >= _ORDER[segment_id]
-
-
-def run_sa_sas_shallow_convection(state: SaSasShallowConvectionState, *, through: str = "A") -> SaSasShallowConvectionState:
-    """Run cumulative SA-SAS shallow-convection segments A-Q for the sealed active path."""
-
-    return _run_sa_sas_shallow_convection_mutable(state, through=through).immutable_copy()
-
-
-def _run_sa_sas_shallow_convection_mutable(state: SaSasShallowConvectionState, *, through: str) -> SaSasShallowConvectionState:
-    """Run cumulative segments and return the mutable working state."""
-
-    if through not in SEGMENT_IDS:
-        raise ValueError(f"unknown SA-SAS shallow-convection segment {through!r}")
-    if through not in IMPLEMENTED_SEGMENTS:
-        raise NotImplementedError(f"SA-SAS shallow-convection segment {through!r} is not implemented yet")
-    return _in_scheme_context(state, lambda: _run_scheme(state.mutable_copy(), through))
 
 
 def _in_scheme_context(state: SaSasShallowConvectionState, run):
@@ -1355,14 +895,6 @@ def _in_scheme_context(state: SaSasShallowConvectionState, run):
         with compile_categories(DEFAULT_COMPILE_CATEGORIES):
             return run()
     return run()
-
-
-def run_sa_sas_shallow_convection_production(state: SaSasShallowConvectionState) -> SaSasShallowConvectionState:
-    """Run the full scheme and retain only host-visible production outputs."""
-
-    full = _run_sa_sas_shallow_convection_mutable(state, through="Q")
-    compact = {name: full.require(name) for name in PRODUCTION_FIELDS}
-    return SaSasShallowConvectionState(compact, full.config)
 
 
 def run_sa_sas_shallow_convection_compacted(
@@ -1431,6 +963,7 @@ def run_sa_sas_shallow_convection_compacted(
             config, mutable=True)
         locals_e = {name: part[env_slots[name]] if name in env_slots else value for name, value in env.items()}
         locals_e["ncol"] = size
+        _separate_new_qtr(buffer.fields, locals_e)
         current = _in_scheme_context(buffer, lambda: _run_scheme(buffer, through, locals_e))
         batch.update({name: current.require(name) for name in outputs if name not in kept})
         return {f"at_e.{name}": current.require(name) for name in kept}
@@ -1442,6 +975,17 @@ def run_sa_sas_shallow_convection_compacted(
                            fraction=fraction, tensor_call=tensor_call, inputs=gathered)
     return SaSasShallowConvectionState(
         {name: batch[name] if name in batch else merged[f"at_e.{name}"] for name in outputs}, state.config)
+
+
+def _separate_new_qtr(fields: dict[str, Any], env: dict[str, Any]) -> None:
+    """Bind new_qtr to its own copy of qtr when it is still qtr itself (segment N writes new_qtr in place), in
+    ``env`` and ``fields`` alike: names bound to one tensor stay one tensor."""
+    qtr = env.get("qtr", fields.get("qtr"))
+    if isinstance(qtr, torch.Tensor) and (env.get("new_qtr") is qtr or fields.get("new_qtr") is qtr):
+        copy = qtr.clone()
+        for values in (env, fields):
+            if values.get("new_qtr") is qtr:
+                values["new_qtr"] = copy
 
 
 def _run_scheme_through_e(state: SaSasShallowConvectionState, through: str) -> dict[str, Any] | None:
@@ -1470,7 +1014,7 @@ def _run_scheme_through_e(state: SaSasShallowConvectionState, through: str) -> d
                         ("ntrac", NTRAC), ("nsamftrac", NTR), ("ntc", NTC)):
         if name in state.config and state.config[name] != value:
             raise ValueError(f"{name} metadata disagrees with input shapes: expected {value}")
-    ntk = int(state.config.get("ntk", NTK))
+    ntk = layout.ntk
     if ntk < 0 or ntk > NN or (NTC and ITC and (ITC < 1 or ITC + NTC - 1 > NN)) or NTR + 2 > NN:
         raise ValueError("tracer slot metadata exceeds the qtr axis")
     shapes = {"scalar": (), "column": (ncol,), "level": (ncol, KM),
@@ -1519,11 +1063,13 @@ def _run_scheme_through_e(state: SaSasShallowConvectionState, through: str) -> d
     ten_v = torch.zeros_like(v1)
     ten_q = torch.zeros((ncol, KM, NTRAC), dtype=dtype, device=device)
     dqtr = torch.zeros_like(qtr)
-    new_t1 = t1.clone()
-    new_u1 = u1.clone()
-    new_v1 = v1.clone()
-    new_q1 = q1.clone()
-    new_qtr = qtr.clone()
+    # Not copied here: segment M forms new_t1, new_q1, new_u1 and new_v1 with where before any write in place, and the
+    # run from F copies new_qtr once (_separate_new_qtr), at the buffer's size when compacted.
+    new_t1 = t1
+    new_u1 = u1
+    new_v1 = v1
+    new_q1 = q1
+    new_qtr = qtr
     zero_scalar = torch.zeros((), dtype=dtype, device=device)
     fields.update(
         {
@@ -1555,13 +1101,11 @@ def _run_scheme_through_e(state: SaSasShallowConvectionState, through: str) -> d
     progomega = bool(state.config.get("progomega", False))
     first_time_step = bool(state.config.get("first_time_step", True))
     restart = bool(state.config.get("restart", False))
-    ntk = int(state.config.get("ntk", NTK))
     ntr = int(state.config.get("ntr", NTR))
     ntc = int(state.config.get("ntc", NTC))
     itc = int(state.config.get("itc", ITC))
     ncloud = int(state.config.get("ncloud", NCLOUD))
 
-    km1 = KM - 1
     do_aerosols_bool = False if hwrf else (itc > 0 and ntc > 0 and ntr > 0 and ntr >= itc + ntc - 3)
     do_aerosols = torch.full((ncol,), 1.0 if do_aerosols_bool else 0.0, dtype=dtype, device=device)
     ps = psp * 0.001
@@ -1624,13 +1168,10 @@ def _run_scheme_through_e(state: SaSasShallowConvectionState, through: str) -> d
 
     aafac = 0.1
     crtlame = 1.0e-4
-    w1l, w2l, w3l, w4l = -8.0e-3, -4.0e-2, -5.0e-3, -5.0e-4
-    w1s, w2s, w3s, w4s = -2.0e-4, -2.0e-3, -1.0e-3, -2.0e-5
     clamd, tkemx, tkemn = 0.1, 0.65, 0.05
     dtke = tkemx - tkemn
     cthk, cthkmn, dthk = 200.0, 0.0, 25.0
     rhcrt = 0.75
-    cinpcrmx, cinpcrmn = 180.0, 120.0
     cinacrmx = -120.0
     cinacrmn = -80.0 if not hwrf else 0.0
     dtmax, dtmin = 10800.0, 600.0
@@ -1645,7 +1186,6 @@ def _run_scheme_through_e(state: SaSasShallowConvectionState, through: str) -> d
     shevf = 2.0
 
     tx1 = 1.0 / ps
-    levels_full = _level_values(1, KM + 1, reference=ps)
     ratio = prsl * tx1[:, None]
     kbm = (ratio > 0.70).to(dtype).sum(dim=1) + 1.0
     kmax = (ratio > 0.60).to(dtype).sum(dim=1) + 1.0
@@ -1751,7 +1291,6 @@ def _run_scheme_through_e(state: SaSasShallowConvectionState, through: str) -> d
     if through == "C":
         return None
 
-    levels_full = _level_values(1, KM + 1, reference=ps)
     levels_inner = _level_values(2, KM, reference=ps)
     kb, kb1, kbcon, cnvflg_bool, to, qo, qeso, po, rh, heo, heso, uo, vo, ctro = run_compile_island(
         "trigger", "environment_adjustment", _d_environment_block,
@@ -1767,7 +1306,8 @@ def _run_scheme_through_e(state: SaSasShallowConvectionState, through: str) -> d
 
     cnvflg_bool, kb, kbcon, pdot, w3, w4 = run_compile_island(
         "trigger", "cloud_base", _e_cloud_base_block,
-        cnvflg_bool, kb, kbcon, kpbl, kbm, kmax, dot, zi, pfld, heo, heso, hpbl, islimsk, pdot)
+        cnvflg_bool, kb, kbcon, kpbl, kbm, kmax, dot, zi, pfld, heo, heso, hpbl, islimsk, pdot,
+        fields["cinpcr_scale"] if "cinpcr_scale" in fields else None)
 
     levels_left = _level_values(1, KM, reference=ps)
     dz_left = zo[:, 1:KM] - zo[:, : KM - 1]
@@ -1775,6 +1315,8 @@ def _run_scheme_through_e(state: SaSasShallowConvectionState, through: str) -> d
     rhbar = _masked_sum(layer_between_kb_kbcon, rh[:, : KM - 1] * dz_left)
     sumx = _masked_sum(layer_between_kb_kbcon, dz_left)
     rhbar = _where_div(cnvflg_bool, rhbar, sumx, rhbar)
+    if "rhcrt_scale" in fields:  # samf.rhcrt_shal
+        rhcrt = rhcrt * fields["rhcrt_scale"].reshape(())
     cnvflg_bool = cnvflg_bool & (rhbar >= rhcrt)
 
     tkemean = torch.zeros_like(ps)
@@ -1851,6 +1393,7 @@ def _run_scheme(state: SaSasShallowConvectionState, through: str,
         env = _run_scheme_through_e(state, through)
         if env is None:
             return state
+        _separate_new_qtr(state.fields, env)
     fields = state.fields
     (
         C1, CAT_ADJ_SHAL, CP, CSCALE, DELT, EPS, EPSM1, EVEF, FV, GRAV, HVAP, KM, NTC, NTR, PGCON, RD, aa1,
@@ -2036,7 +1579,7 @@ def _run_scheme(state: SaSasShallowConvectionState, through: str,
     stop_i = torch.zeros_like(cond_i_cross)
     if add_i.shape[1]:
         # aa1 enters first: the source adds each level's term to the running aa1.
-        aa1_path = _place(add_i, add_i[:, :1] + aa1[:, None], 0).cumsum(dim=1)
+        aa1_path = level_prefix(_place(add_i, add_i[:, :1] + aa1[:, None], 0), 1)
         stop_i = cond_i_cross & (aa1_path < 0.0)
     ktcon1 = _first_true_level(stop_i, levels_i, _where(cnvflg_bool, kbm, 0.0))
     if stop_i.shape[1]:
@@ -2212,6 +1755,8 @@ def _run_scheme(state: SaSasShallowConvectionState, through: str,
     dtconv = _where_div(cnvflg_bool, cloud_tem, wc_for_dtconv, dtconv)
     if not hwrf:
         dtconv = _where(cnvflg_bool, (1.0 + gdx / 75000.0) * dtconv, dtconv)
+    if "tau_scale" in fields:  # samf.tau_shal: the turnover time, before the clamp
+        dtconv = _where(cnvflg_bool, dtconv * fields["tau_scale"].reshape(()), dtconv)
     dtconv = _where(cnvflg_bool, torch.clamp(torch.clamp_min(dtconv, DELT), min=dtmin, max=dtmax), dtconv)
     umean_avg = _where_div(cnvflg_bool, umean, sumx, 0.0)
     umean = _where(cnvflg_bool, torch.clamp_min(umean_avg, 1.0), umean)
@@ -2268,7 +1813,6 @@ def _run_scheme(state: SaSasShallowConvectionState, through: str,
     deltbar = torch.zeros_like(ps)
     delubar = torch.zeros_like(ps)
     delvbar = torch.zeros_like(ps)
-    qcond = torch.zeros_like(ps)
     delebar = torch.zeros((ncol, NTR), dtype=dtype, device=device)
     levels_full = _level_values(1, KM + 1, reference=ps)
     cond_qeso = cnvflg_bool[:, None] & (levels_full <= kmax[:, None])
@@ -2404,11 +1948,18 @@ def _run_scheme(state: SaSasShallowConvectionState, through: str,
         evef=EVEF,
         delt=DELT,
         el2orc=el2orc,
-        elocp=elocp,
+        entry_q=q,
+        entry_temperature=fields["phase_entry_temperature"],
+        cp=CP,
+        rd=RD,
+        rv=fields["rv"],
         grav=GRAV,
         km=KM,
     )
-    fields.update({"qeso": qeso, "rntot": rntot, "rn": rn, "qevap": qevap, "delqev": delqev, "delqbar": delqbar, "deltbar": deltbar, "new_t1": new_t1, "new_q1": new_q1})
+    rain_evaporation_scale = convective_rain_scale(fields["new_q1"], new_q1)
+    new_qtr = rescale_convective_tracers(new_qtr, fields["new_q1"], new_q1, ntk - 1)
+    fields["rain_evaporation_scale"] = rain_evaporation_scale
+    fields.update({"qeso": qeso, "rntot": rntot, "rn": rn, "qevap": qevap, "delqev": delqev, "delqbar": delqbar, "deltbar": deltbar, "new_t1": new_t1, "new_q1": new_q1, "new_qtr": new_qtr})
     if through == "O":
         return state
 
@@ -2424,13 +1975,12 @@ def _run_scheme(state: SaSasShallowConvectionState, through: str,
     if ncloud > 0:
         cond_detrain = cnvflg_bool[:, None] & (levels_full[:, : KM - 1] >= kbcon[:, None]) & (levels_full[:, : KM - 1] <= ktcon[:, None])
         tem = dellal[:, : KM - 1] * xmb[:, None] * DELT
-        tem1 = torch.clamp((263.16 - new_t1[:, : KM - 1]) * (1.0 / (263.16 - 233.16)), min=0.0, max=1.0)
-        liquid_present = new_qtr[:, : KM - 1, 1] > -999.0
-        ice_after = _where(cond_detrain & liquid_present, new_qtr[:, : KM - 1, 0] + tem * tem1, new_qtr[:, : KM - 1, 0].clone())
-        liq_after = _where(cond_detrain & liquid_present, new_qtr[:, : KM - 1, 1] + tem * (1.0 - tem1), new_qtr[:, : KM - 1, 1].clone())
-        ice_after = _where(cond_detrain & (~liquid_present), ice_after + tem, ice_after)
+        ice_after, liq_after, temperature_after = detrain_cloud_condensate(new_qtr[:, : KM - 1, 0],
+            new_qtr[:, : KM - 1, 1], new_t1[:, : KM - 1], new_q1[:, : KM - 1],
+            q[:, : KM - 1], tem, cond_detrain, CP)
         new_qtr[:, : KM - 1, 0] = ice_after
         new_qtr[:, : KM - 1, 1] = liq_after
+        new_t1 = _place(new_t1, temperature_after, 0)
     cond_ud = cnvflg_bool[:, None] & (levels_full >= kb[:, None]) & (levels_full < ktop[:, None])
     ud_mf = _where(cond_ud, eta * xmb[:, None] * DELT, ud_mf)
     dt_mf = _put_dynamic2(dt_mf, ktop - 1.0, _gather2(ud_mf, ktop - 1.0), cnvflg_bool)
@@ -2450,6 +2000,7 @@ def _run_scheme(state: SaSasShallowConvectionState, through: str,
     ten_u = (new_u1 - u1) / DELT
     ten_v = (new_v1 - v1) / DELT
     ten_q[:, :, 0] = (new_q1 - q1) / DELT
+    ten_q = rain_host_tracer_tendencies(fields["gq0"], fields["rain_evaporation_scale"], ten_q[:, :, 0], DELT)
     dqtr = (new_qtr - qtr) / DELT
     fields.update({"rn": rn, "kbot": kbot, "ktop": ktop, "kcnv": kcnv, "cnvw": cnvw, "cnvc": cnvc, "ud_mf": ud_mf, "dt_mf": dt_mf, "new_qtr": new_qtr, "ten_t": ten_t, "ten_u": ten_u, "ten_v": ten_v, "ten_q": ten_q, "dqtr": dqtr})
     if through == "P":
@@ -2468,6 +2019,9 @@ LEGACY_INDICES = {"ntqv": 1, "ntcw": 2, "ntiw": 3, "ntclamt": 4, "ntrw": 5, "nts
 def tracer_layout_from(fields: dict[str, torch.Tensor], config: dict[str, Any]) -> ConvectionTracerLayout:
     layout = layout_from_config(config.get("tracer_layout"))
     if layout is not None:
+        # One source for the TKE slot: a config ntk must agree with the declared layout.
+        if "ntk" in config and int(config["ntk"]) != layout.ntk:
+            raise ValueError(f"shallow config ntk={config['ntk']} disagrees with the tracer layout ntk={layout.ntk}")
         return layout
     nn = fields["qtr"].shape[2]
     return legacy_layout(
@@ -2543,6 +2097,8 @@ def _run_post(fields: dict[str, torch.Tensor], config: dict[str, Any]) -> None:
         gq0, gt0, reconcile_errflg = samf_water_reconciliation(
             fields["gq0"], fields["gt0"], save_q, fields["rn"], fields["garea"], fields["prsi"], frain,
             fields["grav"], fields["cp"], fields["hvap"], layout, delt=delt,
+            entry_qv=fields["q"],
+            entry_temperature=fields["phase_entry_temperature"], con_rd=fields["rd"], con_rv=fields["rv"],
         )
         fields["gq0"] = gq0
         fields["gt0"] = gt0
@@ -2579,89 +2135,3 @@ def _run_post(fields: dict[str, torch.Tensor], config: dict[str, Any]) -> None:
     fields["dtend"] = dtend
 
 
-def initial_state_oracle_mpas_case(
-    case_id: str,
-    *,
-    reconciliation: bool,
-    tracer_values: dict[str, float] | None = None,
-    device: torch.device | str | None = None,
-    ncol: int | None = None,
-) -> SaSasShallowConvectionState:
-    """SCNV-entry state of the G3.2 oracle lane for an approved scenario case.
-
-    Mirrors ``tools/run_sa_sas_convection_oracle_g3_2_mint.py`` (shallow, ``mpas_tempo``):
-    the legacy profile and scenario adjustments, then the MPAS tracer state (``gq0``
-    with qv = q1, state = samf input), ``clw`` from the ``GFS_suite_interstitial_3``
-    rule, TEMPO, satmedmf/trans_trac, ``npdf3d=0, num_p3d=3, ncnvcld3d=1``,
-    ``shcnvcw=.false.`` and ``ncloud=ncnd=5``.
-    """
-
-    legacy = initial_state_for_case(case_id, device=device, ncol=ncol)
-    layout = mpas_tempo_layout()
-    fields = {name: tensor.clone() for name, tensor in legacy.fields.items()}
-    ncol_runtime, km = fields["q1"].shape
-    dtype, dev = fields["q1"].dtype, fields["q1"].device
-    values = dict(tracer_values or ORACLE_MPAS_TRACER_VALUES)
-    if case_id == "case11_tke_entrainment_active":
-        values["ntke"] = 0.2
-    gq0 = torch.zeros((ncol_runtime, km, layout.ntrac), dtype=dtype, device=dev)
-    gq0[:, :, layout.index("ntqv") - 1] = fields["q1"]
-    for name, value in values.items():
-        gq0[:, :, layout.index(name) - 1] = value
-    clw = build_clw(
-        gq0,
-        torch.zeros((ncol_runtime, km, layout.nn), dtype=dtype, device=dev),
-        layout,
-        imp_physics=IMP_PHYSICS_CODES["tempo"],
-        transport=True,
-    )
-    fields.update(
-        {
-            "qtr": clw,
-            "dqtr": torch.zeros_like(clw),
-            "tmf": torch.zeros_like(clw),
-            "ten_q": torch.zeros_like(gq0),
-            "dqdt": torch.zeros_like(gq0),
-            "gq0": gq0,
-            "gt0": fields["t1"].clone(),
-            "gu0": fields["u1"].clone(),
-            "gv0": fields["v1"].clone(),
-            "fscav": torch.full((layout.ntc,), 0.5 if case_id == "case13_aerosol_wetdep_active" else 0.1, dtype=dtype, device=dev),
-            "prsi": interface_pressure(fields["psp"], fields["delp"]),
-        }
-    )
-    config = {
-        **legacy.config,
-        "tracer_layout": layout.as_config(),
-        "nn": layout.nn,
-        "ntr": layout.ntr,
-        "ntk": layout.ntk,
-        "itc": layout.itc,
-        "ntc": layout.ntc,
-        "ntrac": layout.ntrac,
-        "nsamftrac": layout.ntr,
-        "ncloud": 2 if case_id == "case14_ncloud_cloudwater_detrainment" else 5,
-        "imp_physics": IMP_PHYSICS_CODES["tempo"],
-        "imp_physics_gfdl": IMP_PHYSICS_CODES["gfdl"],
-        "npdf3d": 0,
-        "num_p3d": 3,
-        "ncnvcld3d": 1,
-        "shcnvcw": False,
-        "satmedmf": True,
-        "trans_trac": True,
-        "samf_water_reconciliation": bool(reconciliation),
-    }
-    return SaSasShallowConvectionState(fields, config)
-
-
-# G3.2 oracle lane (MPAS_GFS_v17_tempo_rrtmgp): MPAS tracer values of the approved cases.
-ORACLE_MPAS_TRACER_VALUES = {
-    "ntcw": 1.0e-5, "ntrw": 1.0e-6, "ntiw": 1.0e-6, "ntsw": 1.0e-6, "ntgl": 1.0e-6,
-    "ntinc": 1.0e-6, "ntrnc": 1.0e-6, "ntke": 0.1, "ntoz": 1.0e-6,
-}
-
-
-def checkpoint_fields(state: SaSasShallowConvectionState, boundary_id: str) -> dict[str, torch.Tensor]:
-    if boundary_id not in BOUNDARY_FIELDS:
-        raise NotImplementedError(f"SA-SAS shallow-convection checkpoint {boundary_id!r} is not implemented yet")
-    return {name: state.require(name) for name in BOUNDARY_FIELDS[boundary_id]}

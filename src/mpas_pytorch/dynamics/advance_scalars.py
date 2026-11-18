@@ -23,7 +23,7 @@ Index Convention:
     values that must be converted to 0-based when used as indices.
 """
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, cast
@@ -47,17 +47,12 @@ from mpas_pytorch.dynamics.static_payloads import (
 from mpas_pytorch.dynamics.stencil_ops import (
     _accumulate_ordered_slot,
     _active_slot_count,
-    _compile_active,
-    _gather_slot_batch,
     _pinned_identity,
-    _slot_batches,
-    _slot_gather_batch,
     _static_connectivity_cache_allowed,
     _static_mask_all_true,
     _static_slot_all_true,
     _tensor_version_cache_key,
     gather_rows,
-    sum_fortran_order,
 )
 from mpas_pytorch.utils.checks import require_consistent_device
 
@@ -65,7 +60,6 @@ _EXPLICIT_SCALAR_TRANSPORT_REGION_COMPILE_TARGETS = frozenset(
     {
         "explicit_scalar_transport_horizontal_transport_composition",
         "explicit_scalar_transport_vertical_finish_region",
-        "explicit_scalar_transport_vertical_interior_flux_region",
     }
 )
 _EXPLICIT_SCALAR_TRANSPORT_CONNECTIVITY_TENSOR_NAMES = (
@@ -81,7 +75,7 @@ _EXPLICIT_SCALAR_TRANSPORT_CONNECTIVITY_TENSOR_NAMES = (
 _EXPLICIT_SCALAR_TRANSPORT_DYNAMIC_ARGUMENT_NAMES = (
     "scalar_old_cells",
     "scalar_new",
-    "scalar_tend_save_cells",
+    "scalar_tend_save",
     "rho_zz_old_cells",
     "rho_zz_new_cells",
     "uh_avg",
@@ -96,7 +90,6 @@ class ExplicitScalarTransportSectionOps:
 
     horizontal_transport: Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
     vertical_finish: Callable[..., torch.Tensor]
-    vertical_interior_flux: Callable[..., torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -155,7 +148,7 @@ def _flux3(
     q_i: torch.Tensor,
     q_ip1: torch.Tensor,
     ua: torch.Tensor,
-    coef3: float,
+    coef3: float | torch.Tensor,
     divisor: float | torch.Tensor = 12.0,
 ) -> torch.Tensor:
     """
@@ -171,78 +164,6 @@ def _flux3(
         coef3 * fct_abs(ua) * ((q_ip1 - q_im2) - 3.0 * (q_i - q_im1)) / divisor
     )
     return f4 + upwind_corr
-
-
-def _sum_horizontal_flux_slots(
-    *,
-    uh_avg: torch.Tensor,
-    horiz_flux: torch.Tensor,
-    cell_edges_0based: torch.Tensor,
-    edge_sign: torch.Tensor,
-    edge_valid: torch.Tensor,
-    edge_valid_all_by_slot: tuple[bool, ...] | None = None,
-) -> torch.Tensor:
-    """Accumulate explicit-scalar-transport horizontal flux divergence without full cell-edge tensors."""
-    n_cells = cell_edges_0based.shape[0]
-    n_slots = cell_edges_0based.shape[1]
-    if (
-        not torch.is_grad_enabled()
-        and (horiz_flux.device.type == "cuda" or _compile_active())
-        and n_slots > 1
-    ):
-        uh_batch = gather_rows(uh_avg, cell_edges_0based.reshape(-1)).reshape(
-            n_cells,
-            n_slots,
-            uh_avg.shape[1],
-        )
-        flux_batch = gather_rows(horiz_flux, cell_edges_0based.reshape(-1)).reshape(
-            n_cells,
-            n_slots,
-            horiz_flux.shape[1],
-            horiz_flux.shape[2],
-        )
-        contrib = (
-            -edge_sign.view(n_cells, n_slots, 1, 1) * uh_batch.unsqueeze(3) * flux_batch
-        )
-        valid_all = (
-            edge_valid_all_by_slot is not None
-            and len(edge_valid_all_by_slot) == n_slots
-            and all(edge_valid_all_by_slot)
-        )
-        if not valid_all:
-            contrib = contrib * edge_valid.view(n_cells, n_slots, 1, 1).to(
-                dtype=horiz_flux.dtype
-            )
-        return sum_fortran_order(contrib, dim=1)
-    total: torch.Tensor | None = None
-    for batch_start, batch_stop in _slot_batches(
-        cell_edges_0based.shape[1],
-        _slot_gather_batch(horiz_flux, cell_edges_0based.shape[1]),
-    ):
-        uh_batch = _gather_slot_batch(
-            uh_avg, cell_edges_0based, batch_start, batch_stop
-        )
-        flux_batch = _gather_slot_batch(
-            horiz_flux, cell_edges_0based, batch_start, batch_stop
-        )
-        for local_slot in range(batch_stop - batch_start):
-            slot = batch_start + local_slot
-            contrib = (
-                -edge_sign[:, slot].view(n_cells, 1, 1)
-                * uh_batch[:, local_slot, :].unsqueeze(2)
-                * flux_batch[:, local_slot, :, :]
-            )
-            valid_all = (
-                edge_valid_all_by_slot is not None and edge_valid_all_by_slot[slot]
-            )
-            if not valid_all:
-                contrib = contrib * edge_valid[:, slot].view(n_cells, 1, 1).to(
-                    dtype=horiz_flux.dtype
-                )
-            total = _accumulate_ordered_slot(total, contrib)
-    if total is None:
-        return horiz_flux.new_zeros((n_cells, horiz_flux.shape[1], horiz_flux.shape[2]))
-    return total
 
 
 def _explicit_scalar_transport_static_all_true(
@@ -272,12 +193,6 @@ def _explicit_scalar_transport_safe_zero_invalid(
     return _explicit_scalar_transport_long_index(
         torch.where(valid, indices0, torch.zeros_like(indices0))
     )
-
-
-def _explicit_scalar_transport_zero_row_patch_like(
-    field: torch.Tensor, row_start: int, row_end: int
-) -> torch.Tensor:
-    return field.new_zeros((int(row_end) - int(row_start), *field.shape[1:]))
 
 
 def _explicit_scalar_transport_density_time_weights(
@@ -469,32 +384,6 @@ def _explicit_scalar_transport_pattern_c_flux_region(
     return horiz_flux
 
 
-def _explicit_scalar_transport_horizontal_flux_divergence_region(
-    *,
-    uhAvg: torch.Tensor,
-    horiz_flux_arr: torch.Tensor,
-    cell_edge_relation: StaticSlotRelation,
-) -> torch.Tensor:
-    """Reduce explicit-scalar-transport edge fluxes to cell-centered horizontal divergence."""
-    compute_dtype = uhAvg.dtype
-    cell_edges_0based = cell_edge_relation.indices
-    edge_valid = cell_edge_relation.valid
-    edge_sign = cell_edge_relation.sign
-    edge_valid_all_by_slot = cell_edge_relation.valid_all_by_slot
-    if edge_valid is None:
-        edge_valid = torch.ones_like(cell_edges_0based, dtype=torch.bool)
-    if edge_sign is None:
-        edge_sign = torch.ones_like(cell_edges_0based, dtype=compute_dtype)
-    return _sum_horizontal_flux_slots(
-        uh_avg=uhAvg,
-        horiz_flux=horiz_flux_arr,
-        cell_edges_0based=cell_edges_0based,
-        edge_sign=edge_sign,
-        edge_valid=edge_valid,
-        edge_valid_all_by_slot=edge_valid_all_by_slot,
-    )
-
-
 def _explicit_scalar_transport_scalar_tend_column_region(
     *,
     scalar_tend_save_cells: torch.Tensor,
@@ -581,7 +470,7 @@ def _explicit_scalar_transport_vertical_interior_flux_region(
     *,
     scalar_new_cells: torch.Tensor,
     ww_cells: torch.Tensor,
-    coef_3rd_order: float,
+    coef_3rd_order: float | torch.Tensor,
     nVertLevels: int,
     num_scalars: int,
     flux_divisor: float | torch.Tensor = 12.0,
@@ -715,40 +604,33 @@ def _explicit_scalar_transport_scalar_update_region(
 
 def _sum_explicit_scalar_transport_pre_gathered_slots(
     *,
-    uh_slots: torch.Tensor,
-    flux_slots: torch.Tensor,
+    uh_slots: Sequence[torch.Tensor],
+    flux_slots: Sequence[torch.Tensor],
     edge_sign: torch.Tensor,
     edge_valid: torch.Tensor,
     edge_valid_all_by_slot: tuple[bool, ...],
 ) -> torch.Tensor:
-    """Reduce pre-gathered explicit-scalar-transport cell-edge fluxes in Fortran slot order."""
-    n_cells, n_slots = edge_sign.shape
-    if not torch.is_grad_enabled() and (
-        _compile_active() or flux_slots.device.type == "cuda"
-    ):
-        contrib = (
-            -edge_sign.view(n_cells, n_slots, 1, 1) * uh_slots.unsqueeze(3) * flux_slots
-        )
-        if not all(edge_valid_all_by_slot):
-            contrib = contrib * edge_valid.view(n_cells, n_slots, 1, 1).to(
-                dtype=flux_slots.dtype
-            )
-        return sum_fortran_order(contrib, dim=1)
+    """Reduce pre-gathered explicit-scalar-transport cell-edge fluxes in Fortran slot order.
 
+    One form on every device and mode: slot by slot, so no ``[nCells, slots, levels, scalars]``
+    contribution array is formed (the former CUDA/compiled branch; round-4 M1c). The gathers are per
+    slot too (``uh_slots[slot]``: ``[nCells, levels]``, ``flux_slots[slot]``: ``[nCells, levels,
+    scalars]``): a whole-slot gather is read once per slot, so a compiled region stores it."""
+    n_cells, n_slots = edge_sign.shape
     total: torch.Tensor | None = None
     for slot in range(n_slots):
         contrib = (
             -edge_sign[:, slot].view(n_cells, 1, 1)
-            * uh_slots[:, slot, :].unsqueeze(2)
-            * flux_slots[:, slot, :, :]
+            * uh_slots[slot].unsqueeze(2)
+            * flux_slots[slot]
         )
         if not edge_valid_all_by_slot[slot]:
             contrib = contrib * edge_valid[:, slot].view(n_cells, 1, 1).to(
-                dtype=flux_slots.dtype
+                dtype=flux_slots[slot].dtype
             )
         total = _accumulate_ordered_slot(total, contrib)
     if total is None:
-        return flux_slots.new_zeros((n_cells, flux_slots.shape[2], flux_slots.shape[3]))
+        raise ValueError("explicit scalar transport needs at least one cell-edge slot")
     return total
 
 
@@ -798,15 +680,18 @@ def _explicit_scalar_transport_horizontal_transport_composition(
         fallback_rows=fallback_rows,
     )
 
-    uh_slots = gather_rows(uh_avg, cell_edges_0based)
-    flux_slots = static_patch_gather(
-        horiz_flux_base,
-        horiz_flux,
-        cell_edges_0based,
-        cell_edges_local,
-        cell_edges_in_patch,
-        cell_edges_in_patch_all,
-    )
+    uh_slots = [gather_rows(uh_avg, cell_edges_0based[:, slot]) for slot in range(cell_edges_0based.shape[1])]
+    flux_slots = [
+        static_patch_gather(
+            horiz_flux_base,
+            horiz_flux,
+            cell_edges_0based[:, slot],
+            cell_edges_local[:, slot],
+            cell_edges_in_patch[:, slot],
+            cell_edges_in_patch_all,
+        )
+        for slot in range(cell_edges_0based.shape[1])
+    ]
     horizontal_divergence = _sum_explicit_scalar_transport_pre_gathered_slots(
         uh_slots=uh_slots,
         flux_slots=flux_slots,
@@ -836,17 +721,31 @@ def _explicit_scalar_transport_vertical_finish_region(
     rho_zz_old_cells: torch.Tensor,
     rho_zz_new_cells: torch.Tensor,
     ww_cells: torch.Tensor,
-    wdtn_interior: torch.Tensor,
     fnm: torch.Tensor,
     fnp: torch.Tensor,
     rdnw: torch.Tensor,
     dt: float,
+    coef_3rd_order: float | torch.Tensor,
+    flux_divisor: float | torch.Tensor,
     weight_time_old: float,
     weight_time_new: float,
     nVertLevels: int,
     num_scalars: int,
 ) -> torch.Tensor:
-    """Finish explicit-scalar-transport vertically from the separately computed interior flux."""
+    """Finish explicit-scalar-transport vertically: interface fluxes, divergence and scalar update.
+
+    Compiled callers pass the exact 12 as the tensor ``flux_divisor``, so Inductor keeps the division.
+    """
+    # The interior flux is formed before the boundary fluxes: autograd sums the contributions to
+    # scalar_new and ww in the order the graph was built.
+    wdtn_interior = _explicit_scalar_transport_vertical_interior_flux_region(
+        scalar_new_cells=scalar_new_cells,
+        ww_cells=ww_cells,
+        coef_3rd_order=coef_3rd_order,
+        nVertLevels=nVertLevels,
+        num_scalars=num_scalars,
+        flux_divisor=flux_divisor,
+    )
     wdtn_k1, wdtn_last = _explicit_scalar_transport_vertical_boundary_flux_region(
         scalar_new_cells=scalar_new_cells,
         ww_cells=ww_cells,
@@ -855,14 +754,12 @@ def _explicit_scalar_transport_vertical_finish_region(
         nVertLevels=nVertLevels,
         num_scalars=num_scalars,
     )
-    vert_flux_divergence = (
-        _explicit_scalar_transport_vertical_flux_divergence_from_fluxes_region(
-            wdtn_k1=wdtn_k1,
-            wdtn_interior=wdtn_interior,
-            wdtn_last=wdtn_last,
-            rdnw=rdnw,
-            nVertLevels=nVertLevels,
-        )
+    vert_flux_divergence = _explicit_scalar_transport_vertical_flux_divergence_from_fluxes_region(
+        wdtn_k1=wdtn_k1,
+        wdtn_interior=wdtn_interior,
+        wdtn_last=wdtn_last,
+        rdnw=rdnw,
+        nVertLevels=nVertLevels,
     )
     return _explicit_scalar_transport_final_scalar_update_region(
         scalar_old_cells=scalar_old_cells,
@@ -913,37 +810,43 @@ def _explicit_scalar_transport_numeric_composition(
     cell_end: int,
     scalar_old_cells: torch.Tensor,
     scalar_new: torch.Tensor,
-    scalar_tend_save_cells: torch.Tensor,
+    scalar_tend_save: torch.Tensor,
     rho_zz_old_cells: torch.Tensor,
     rho_zz_new_cells: torch.Tensor,
     uh_avg: torch.Tensor,
     ww_cells: torch.Tensor,
     horiz_flux_base: torch.Tensor,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute explicit-scalar-transport through one canonical compact composition."""
+    """Compute explicit-scalar-transport through one canonical compact composition.
+
+    ``scalar_tend_save`` is the public (padded) field; the result's saved tendency is that field with
+    its owned rows replaced (without physics, by zeros), packed by the horizontal section.
+
+    ``coef_3rd_scale`` (0-d tensor or None; ``config["parameter_scales"]["config_coef_3rd_order"]``) multiplies
+    the third-order coefficients of the horizontal and vertical fluxes; 1.0 is bitwise neutral.
+    """
     scalar_new_cells = scalar_new[cell_start:cell_end]
-    scalar_tend_column, horiz_flux, scalar_tend_patch = (
+    scalar_tend_column, horiz_flux, scalar_tend_save_out = (
         _section_ops.horizontal_transport(
             scalar_new=scalar_new,
-            scalar_tend_save_cells=scalar_tend_save_cells,
+            scalar_tend_save=scalar_tend_save,
             uh_avg=uh_avg,
             horiz_flux_base=horiz_flux_base,
+            coef_3rd_scale=coef_3rd_scale,
         )
     )
-    wdtn_interior = _section_ops.vertical_interior_flux(
-        scalar_new_cells=scalar_new_cells,
-        ww_cells=ww_cells,
-    )
-    scalar_new_patch = _section_ops.vertical_finish(
+    scalar_new_out = _section_ops.vertical_finish(
+        scalar_new=scalar_new,
         scalar_old_cells=scalar_old_cells,
         scalar_new_cells=scalar_new_cells,
         scalar_tend_column=scalar_tend_column,
         rho_zz_old_cells=rho_zz_old_cells,
         rho_zz_new_cells=rho_zz_new_cells,
         ww_cells=ww_cells,
-        wdtn_interior=wdtn_interior,
+        coef_3rd_scale=coef_3rd_scale,
     )
-    return scalar_new_patch, scalar_tend_patch, horiz_flux
+    return scalar_new_out, scalar_tend_save_out, horiz_flux
 
 
 def _explicit_scalar_transport_plan_tensor_fingerprint(
@@ -1083,13 +986,17 @@ def build_explicit_scalar_transport_numeric_plan(
     def _explicit_scalar_transport_bound_horizontal_transport(
         *,
         scalar_new: torch.Tensor,
-        scalar_tend_save_cells: torch.Tensor,
+        scalar_tend_save: torch.Tensor,
         uh_avg: torch.Tensor,
         horiz_flux_base: torch.Tensor,
+        coef_3rd_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return _explicit_scalar_transport_horizontal_transport_composition(
+        # The flux and the saved tendency leave with the base's rows outside the owned edges and cells (the
+        # padded public layouts), formed in this region rather than by an eager copy of each whole field
+        # after it (G4a). With physics the saved tendency is the input itself.
+        scalar_tend_column, horiz_flux, scalar_tend_patch = _explicit_scalar_transport_horizontal_transport_composition(
             scalar_new=scalar_new,
-            scalar_tend_save_cells=scalar_tend_save_cells,
+            scalar_tend_save_cells=scalar_tend_save[cell_start_v:cell_end_v],
             uh_avg=uh_avg,
             horiz_flux_base=horiz_flux_base,
             edge_start=edge_start_v,
@@ -1097,7 +1004,11 @@ def build_explicit_scalar_transport_numeric_plan(
             edge_count=edge_count_v,
             slot_count=slot_count_v,
             adv_coef=adv_coef_v,
-            adv_coef_3rd=adv_coef_3rd_v,
+            adv_coef_3rd=(
+                adv_coef_3rd_v
+                if coef_3rd_scale is None
+                else adv_coef_3rd_v * coef_3rd_scale
+            ),
             slot_cells_matrix=slot_cells_matrix_v,
             slot_valid_matrix=slot_valid_matrix_v,
             slot_valid_matrix_all=slot_valid_matrix_all_v,
@@ -1114,50 +1025,49 @@ def build_explicit_scalar_transport_numeric_plan(
             inv_area_cells=inv_area_cells_v,
             do_physics=do_physics_v,
         )
+        return (scalar_tend_column,
+                _explicit_scalar_transport_pack_public_rows(horiz_flux_base, edge_start_v, edge_end_v, horiz_flux),
+                scalar_tend_save if do_physics_v else _explicit_scalar_transport_pack_public_rows(
+                    scalar_tend_save, cell_start_v, cell_end_v, scalar_tend_patch))
+
+    flux_divisor_v = _monotonic_scalar_transport_flux_divisor(rdnw_v)
 
     def _explicit_scalar_transport_bound_vertical_finish(
         *,
+        scalar_new: torch.Tensor,
         scalar_old_cells: torch.Tensor,
         scalar_new_cells: torch.Tensor,
         scalar_tend_column: torch.Tensor,
         rho_zz_old_cells: torch.Tensor,
         rho_zz_new_cells: torch.Tensor,
         ww_cells: torch.Tensor,
-        wdtn_interior: torch.Tensor,
+        coef_3rd_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return _explicit_scalar_transport_vertical_finish_region(
+        # The updated scalar leaves in the padded public layout (the input's rows outside the owned cells).
+        # The float coefficient stays in the plan key; a scale multiplies it at run time.
+        scalar_new_patch = _explicit_scalar_transport_vertical_finish_region(
             scalar_old_cells=scalar_old_cells,
             scalar_new_cells=scalar_new_cells,
             scalar_tend_column=scalar_tend_column,
             rho_zz_old_cells=rho_zz_old_cells,
             rho_zz_new_cells=rho_zz_new_cells,
             ww_cells=ww_cells,
-            wdtn_interior=wdtn_interior,
             fnm=fnm_v,
             fnp=fnp_v,
             rdnw=rdnw_v,
             dt=dt_v,
+            coef_3rd_order=(
+                coef_3rd_order_v
+                if coef_3rd_scale is None
+                else coef_3rd_order_v * coef_3rd_scale
+            ),
+            flux_divisor=flux_divisor_v,
             weight_time_old=weight_time_old_v,
             weight_time_new=weight_time_new_v,
             nVertLevels=nVertLevels_v,
             num_scalars=num_scalars_v,
         )
-
-    flux_divisor_v = _monotonic_scalar_transport_flux_divisor(rdnw_v)
-
-    def _explicit_scalar_transport_bound_vertical_interior_flux(
-        *,
-        scalar_new_cells: torch.Tensor,
-        ww_cells: torch.Tensor,
-    ) -> torch.Tensor:
-        return _explicit_scalar_transport_vertical_interior_flux_region(
-            scalar_new_cells=scalar_new_cells,
-            ww_cells=ww_cells,
-            coef_3rd_order=coef_3rd_order_v,
-            nVertLevels=nVertLevels_v,
-            num_scalars=num_scalars_v,
-            flux_divisor=flux_divisor_v,
-        )
+        return _explicit_scalar_transport_pack_public_rows(scalar_new, cell_start_v, cell_end_v, scalar_new_patch)
 
     _explicit_scalar_transport_bound_horizontal_transport.__name__ = (
         "_explicit_scalar_transport_bound_horizontal_transport"
@@ -1171,16 +1081,9 @@ def build_explicit_scalar_transport_numeric_plan(
     _explicit_scalar_transport_bound_vertical_finish.__qualname__ = (
         "_explicit_scalar_transport_bound_vertical_finish"
     )
-    _explicit_scalar_transport_bound_vertical_interior_flux.__name__ = (
-        "_explicit_scalar_transport_bound_vertical_interior_flux"
-    )
-    _explicit_scalar_transport_bound_vertical_interior_flux.__qualname__ = (
-        "_explicit_scalar_transport_bound_vertical_interior_flux"
-    )
     section_ops = ExplicitScalarTransportSectionOps(
         horizontal_transport=_explicit_scalar_transport_bound_horizontal_transport,
         vertical_finish=_explicit_scalar_transport_bound_vertical_finish,
-        vertical_interior_flux=_explicit_scalar_transport_bound_vertical_interior_flux,
     )
 
     def _numeric_factory(
@@ -1189,12 +1092,13 @@ def build_explicit_scalar_transport_numeric_plan(
         def _explicit_scalar_transport_bound_numeric(
             scalar_old_cells: torch.Tensor,
             scalar_new: torch.Tensor,
-            scalar_tend_save_cells: torch.Tensor,
+            scalar_tend_save: torch.Tensor,
             rho_zz_old_cells: torch.Tensor,
             rho_zz_new_cells: torch.Tensor,
             uh_avg: torch.Tensor,
             ww_cells: torch.Tensor,
             horiz_flux_base: torch.Tensor,
+            coef_3rd_scale: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             return _explicit_scalar_transport_numeric_composition(
                 _section_ops=bound_section_ops,
@@ -1232,12 +1136,13 @@ def build_explicit_scalar_transport_numeric_plan(
                 cell_end=cell_end_v,
                 scalar_old_cells=scalar_old_cells,
                 scalar_new=scalar_new,
-                scalar_tend_save_cells=scalar_tend_save_cells,
+                scalar_tend_save=scalar_tend_save,
                 rho_zz_old_cells=rho_zz_old_cells,
                 rho_zz_new_cells=rho_zz_new_cells,
                 uh_avg=uh_avg,
                 ww_cells=ww_cells,
                 horiz_flux_base=horiz_flux_base,
+                coef_3rd_scale=coef_3rd_scale,
             )
 
         _explicit_scalar_transport_bound_numeric.__name__ = (
@@ -1290,14 +1195,6 @@ def compile_explicit_scalar_transport_numeric_plan(
             mode=mode,
             backend=backend,
             specialization_key=(*plan.key, "vertical_finish"),
-        ),
-        vertical_interior_flux=compile_kernel(
-            "explicit_scalar_transport_vertical_interior_flux_region",
-            plan.section_ops.vertical_interior_flux,
-            enabled="explicit_scalar_transport_vertical_interior_flux_region" in names,
-            mode=mode,
-            backend=backend,
-            specialization_key=(*plan.key, "vertical_interior_flux"),
         ),
     )
     return plan.with_section_ops(section_ops)
@@ -1360,6 +1257,7 @@ def atm_advance_scalars_work(
     _compile_backend: str = "inductor",
     _connectivity_payload: dict[str, Any] | None = None,
     _numeric_plan: ExplicitScalarTransportNumericPlan | None = None,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> dict:
     """
     Advance scalar fields using explicit time stepping with flux-form advection.
@@ -1405,6 +1303,8 @@ def atm_advance_scalars_work(
         adv_coefs: Advection coefficients
         adv_coefs_3rd: Third-order advection coefficients
         horiz_flux_arr: Horizontal flux array (updated on output)
+        coef_3rd_scale: config_coef_3rd_order scale (0-d tensor or None); multiplies coef_3rd_order and
+            adv_coefs_3rd at their uses
 
     Returns:
         Dictionary containing:
@@ -1507,6 +1407,13 @@ def atm_advance_scalars_work(
         )
     else:
         numeric_plan = _numeric_plan
+    # A plan holds its owned rows: refuse one built for other rows before any work.
+    edge_start_idx = 0 if edge_slice.start is None else edge_slice.start
+    edge_stop_idx = nEdges if edge_slice.stop is None else edge_slice.stop
+    bounds = numeric_plan.static_arguments
+    if (bounds["edge_start"], bounds["edge_end"], bounds["cell_start"], bounds["cell_end"]) != (
+            edge_start_idx, edge_stop_idx, cell_start, cell_end):
+        raise ValueError("explicit-scalar-transport plan rows differ from the call's owned rows")
 
     if compile_region_names:
         from mpas_pytorch.dynamics.compile_utils import maybe_compile_kernel
@@ -1519,33 +1426,19 @@ def atm_advance_scalars_work(
             backend=_compile_backend,
         )
 
-    scalar_new_patch, scalar_tend_patch, horiz_flux = numeric_plan.numeric_callable(
+    # scalar_new and the flux come back in their padded public layouts (the bound sections pack them).
+    # So do the saved tendency (without physics its owned rows are zero; with physics it is the input).
+    scalar_new_out, scalar_tend_save_out, horiz_flux_arr_out = numeric_plan.numeric_callable(
         scalar_old[cell_slice, :, :],
         scalar_new,
-        scalar_tend_save[cell_slice, :, :],
+        scalar_tend_save,
         rho_zz_old[cell_slice, :],
         rho_zz_new[cell_slice, :],
         uhAvg,
         wwAvg[cell_slice, :],
         horiz_flux_arr,
+        coef_3rd_scale,
     )
-    edge_start_idx = 0 if edge_slice.start is None else edge_slice.start
-    edge_stop_idx = nEdges if edge_slice.stop is None else edge_slice.stop
-    scalar_new_out = _explicit_scalar_transport_pack_public_rows(
-        scalar_new, cell_start, cell_end, scalar_new_patch
-    )
-    # With physics the patch is the input's own rows: packing rebuilt the input.
-    scalar_tend_save_out = (
-        scalar_tend_save
-        if do_physics
-        else _explicit_scalar_transport_pack_public_rows(
-            scalar_tend_save, cell_start, cell_end, scalar_tend_patch
-        )
-    )
-    horiz_flux_arr_out = _explicit_scalar_transport_pack_public_rows(
-        horiz_flux_arr, edge_start_idx, edge_stop_idx, horiz_flux
-    )
-
     return {
         "scalar_new": scalar_new_out,
         "scalar_tend_save": scalar_tend_save_out,

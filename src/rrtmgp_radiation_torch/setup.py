@@ -1,74 +1,21 @@
 # Copyright (c) 2026 IC Weather LLC. Licensed under LICENSE and PERMISSIONS.md.
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""PyTorch-native RRTMGP timestep setup surface."""
+"""Solar astronomy of ``GFS_rrtmgp_setup`` (``module_radiation_astronomy``: orbit, declination, ``coszmn``) and
+the annual solar-constant and CO2 tables it reads."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 from pathlib import Path
-from typing import Mapping
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from .reference_inputs import physics_input_dir as _physics_input_dir
 
 
-TensorOrString = torch.Tensor | str
-CON_SOLR_2008 = 1360.8
-CON_SOLR_2002 = 1366.0
-SOLAR_TABLE_EXPECTED_SHA256 = {
-    "solarconstant_noaa_an.txt": "d2177cf38b60ac4fca23524aa1d187bed58dfcd412e96a6a3c50c9cef9b71cb8",
-    "solarconstant_noaa_a0.txt": "57432b5a55ab0273e36b7aaa26ab934c1cdb943df3aa19707451d2aacd82da2d",
-}
 CZLIMT = 0.0001
-
-
-@dataclass(frozen=True)
-class RrtmgpSetupResult:
-    """Checkpoint-shaped A-boundary setup fields."""
-
-    fields: Mapping[str, TensorOrString]
-    runtime_kind: str = "torch_rrtmgp_setup_timestep"
-
-
-def _int_flag(value: bool | int, *, device: torch.device) -> torch.Tensor:
-    return torch.tensor([1 if bool(value) else 0], dtype=torch.int64, device=device)
-
-
-def _int_scalar(value: int, *, device: torch.device) -> torch.Tensor:
-    return torch.tensor([int(value)], dtype=torch.int64, device=device)
-
-
-def _float_scalar(value: float | torch.Tensor, *, device: torch.device) -> torch.Tensor:
-    if isinstance(value, torch.Tensor):
-        return value.to(dtype=torch.float64, device=device).reshape(1)
-    return torch.tensor([float(value)], dtype=torch.float64, device=device)
-
-
-def _to_int(value: TensorOrString, *, name: str) -> int:
-    if not isinstance(value, torch.Tensor):
-        raise TypeError(f"{name} must be a torch tensor")
-    return int(value.detach().to(device="cpu", dtype=torch.int64).reshape(-1)[0].item())
-
-
-def _to_float(value: TensorOrString, *, name: str) -> float:
-    if not isinstance(value, torch.Tensor):
-        raise TypeError(f"{name} must be a torch tensor")
-    if not value.dtype.is_floating_point:
-        raise TypeError(f"{name} must be floating point, got {value.dtype}")
-    return float(value.detach().to(device="cpu", dtype=torch.float64).reshape(-1)[0].item())
-
-
-def _to_real_vector(value: TensorOrString, *, name: str) -> torch.Tensor:
-    if not isinstance(value, torch.Tensor):
-        raise TypeError(f"{name} must be a torch tensor")
-    if not value.dtype.is_floating_point:
-        raise TypeError(f"{name} must be floating point, got {value.dtype}")
-    if value.dtype not in (torch.float32, torch.float64):
-        raise TypeError(f"{name} must be float32 or float64 (the working dtype), got {value.dtype}")
-    return value.reshape(-1)
 
 
 def _iw3jdn(year: int, month: int, day: int) -> int:
@@ -157,34 +104,6 @@ def load_co2_year(input_dir: str | Path, year: int, *, ictm: int = 1) -> tuple[t
     return table, (co2g1 + rate) * 1.0e-6
 
 
-def _initialized_solar_constant(
-    *,
-    isol: int,
-    year: int,
-    month: int,
-    physics_input_dir: str | Path | None = None,
-) -> float:
-    if isol == 0:
-        return CON_SOLR_2002
-    if isol == 10:
-        return CON_SOLR_2008
-    if isol == 2:
-        return _load_annual_solar_constant(
-            year,
-            filename="solarconstant_noaa_an.txt",
-            physics_input_dir=physics_input_dir,
-        )
-    if isol == 1:
-        return _load_annual_solar_constant(
-            year,
-            filename="solarconstant_noaa_a0.txt",
-            physics_input_dir=physics_input_dir,
-        )
-    if isol == 4:
-        raise NotImplementedError("monthly CMIP solar table branch isol=4 is not ported in the current RRTMGP target")
-    raise NotImplementedError(f"RRTMGP setup target does not yet support isol={isol}")
-
-
 def _solar_state(
     jdate: torch.Tensor | tuple[int, ...],
     *,
@@ -200,7 +119,7 @@ def _solar_state(
         raise ValueError("solar date and numerical state must share a device")
     vals = jdate.reshape(8).to(torch.int64)
     iyear, imon, iday, ihr, imin, isec = (vals[i] for i in (0, 1, 2, 4, 5, 6))
-    torch._assert_async(
+    torch_compat.assert_async(
         (iyear >= 1583)
         & (iyear <= 9999)
         & (imon >= 1)
@@ -245,7 +164,7 @@ def _solar_orbit(
         or jd.device != fjd.device
     ):
         raise ValueError("solar orbit requires scalar integer day/float64 fraction")
-    torch._assert_async(torch.isfinite(fjd).all(), "nonfinite solar day fraction")
+    torch_compat.assert_async(torch.isfinite(fjd).all(), "nonfinite solar day fraction")
     jd, fjd = jd.reshape(()), fjd.reshape(())
 
     cyear = 365.25
@@ -331,150 +250,3 @@ def _coszmn(
     divisor = torch.clamp_min(istsun, 1).to(dtype=xlon.dtype)
     return torch.where((istsun > 0) & (coszen != 0.0), coszen / divisor, coszen)
 
-
-def run_setup_timestep_from_host_inputs(
-    host_inputs: Mapping[str, TensorOrString],
-    *,
-    doSWclrsky: bool = True,
-    doLWclrsky: bool = True,
-    doGP_lwscat: bool = True,
-    nGauss_angles: int = 1,
-    lsswr: bool | None = None,
-    lslwr: bool | None = None,
-    isol: int | None = None,
-    deltim: float | None = None,
-    physics_input_dir: str | Path | None = None,
-    device: str | torch.device | None = None,
-) -> RrtmgpSetupResult:
-    """Compute the A-boundary setup fields from sealed host pre-call inputs.
-
-    This ports the scalar setup pieces that are scientifically relevant to the
-    checkpoint boundary: radiation call flags, solar-constant table lookup,
-    astronomy update, and column solar-zenith averaging. Aerosol/gas table
-    update side effects are validated by their downstream source-hook gates.
-    """
-
-    jdate = host_inputs["jdat"]
-    if not isinstance(jdate, torch.Tensor):
-        raise TypeError("jdat must be a torch tensor")
-    torch_device = torch.device(device) if device is not None else jdate.device
-    jdate_cpu = jdate.detach().to(device="cpu", dtype=torch.int64)
-    idate = host_inputs.get("idat", jdate)
-    if not isinstance(idate, torch.Tensor):
-        raise TypeError("idat must be a torch tensor")
-    idate_cpu = idate.detach().to(device="cpu", dtype=torch.int64)
-
-    do_sw = _to_int(host_inputs["doSWrad"], name="doSWrad") != 0
-    do_lw = _to_int(host_inputs["doLWrad"], name="doLWrad") != 0
-    lsswr_value = do_sw if lsswr is None else bool(lsswr)
-    lslwr_value = do_lw if lslwr is None else bool(lslwr)
-    con_pi = _to_float(host_inputs["con_pi"], name="con_pi")
-    solhr = _to_float(host_inputs["solhr"], name="solhr")
-    deltsw = _to_float(host_inputs["fhswr"], name="fhswr")
-    deltim_value = (
-        float(deltim) if deltim is not None
-        else _to_float(host_inputs.get("deltim", host_inputs["fhswr"]), name="deltim")
-    )
-    jvals = [int(item) for item in jdate_cpu.reshape(-1).tolist()]
-    ivals = [int(item) for item in idate_cpu.reshape(-1).tolist()]
-    if len(jvals) < 8 or len(ivals) < 8:
-        raise ValueError("idat and jdat must contain 8 NCEP date integers")
-    if do_sw:
-        isol_value = int(isol if isol is not None else 2)
-        kyear = ivals[0] if _to_int(host_inputs.get("ictm", torch.tensor([1])), name="ictm") in (0, -2) else jvals[0]
-        solc0 = _initialized_solar_constant(
-            isol=isol_value,
-            year=kyear,
-            month=jvals[1],
-            physics_input_dir=physics_input_dir,
-        )
-        r1, sollag, sindec, cosdec = _solar_state(jdate_cpu.to(device=torch_device), con_pi=con_pi)
-        solcon = torch.div(solc0, r1 * r1)
-        xlon = _to_real_vector(host_inputs["xlon"], name="xlon").to(device=torch_device)
-        sinlat = _to_real_vector(host_inputs["sinlat"], name="sinlat").to(device=torch_device)
-        coslat = _to_real_vector(host_inputs["coslat"], name="coslat").to(device=torch_device)
-        coszen = _coszmn(
-            xlon=xlon,
-            sinlat=sinlat,
-            coslat=coslat,
-            solhr=solhr,
-            sollag=sollag,
-            sindec=sindec,
-            cosdec=cosdec,
-            deltsw=deltsw,
-            deltim=deltim_value,
-            con_pi=con_pi,
-        )
-    else:
-        solcon = 0.0
-        coszen = torch.zeros_like(_to_real_vector(host_inputs["xlon"], name="xlon").to(device=torch_device))
-
-    return RrtmgpSetupResult(
-        fields={
-            "doSWrad": _int_flag(do_sw, device=torch.device("cpu")),
-            "doLWrad": _int_flag(do_lw, device=torch.device("cpu")),
-            "doSWclrsky": _int_flag(doSWclrsky, device=torch.device("cpu")),
-            "doLWclrsky": _int_flag(doLWclrsky, device=torch.device("cpu")),
-            "doGP_lwscat": _int_flag(doGP_lwscat, device=torch.device("cpu")),
-            "nGauss_angles": _int_scalar(nGauss_angles, device=torch.device("cpu")),
-            "lsswr": _int_flag(lsswr_value, device=torch.device("cpu")),
-            "lslwr": _int_flag(lslwr_value, device=torch.device("cpu")),
-            "solhr": _float_scalar(solhr, device=torch_device),
-            "solcon": _float_scalar(solcon, device=torch_device),
-            "coszen": coszen.to(dtype=torch.float64).reshape(-1),
-            "errmsg": "",
-            "errflg": _int_scalar(0, device=torch.device("cpu")),
-        },
-        runtime_kind="torch_rrtmgp_setup_timestep_from_host_inputs",
-    )
-
-
-def run_setup_timestep_from_config(
-    *,
-    doSWrad: bool,
-    doLWrad: bool,
-    doSWclrsky: bool,
-    doLWclrsky: bool,
-    doGP_lwscat: bool,
-    nGauss_angles: int,
-    lsswr: bool,
-    lslwr: bool,
-    solhr: float,
-    solcon: float,
-    coszen: float,
-    device: str | torch.device = "cpu",
-) -> RrtmgpSetupResult:
-    """Build the A-boundary fields after `GFS_rrtmgp_setup_timestep_init`.
-
-    The upstream Fortran setup routine updates solar, aerosol, gas, and ozone
-    climatology state. This target surface represents the host-visible fields
-    captured at the A boundary; external update-state provenance must be gated
-    separately before a full-chain claim.
-    """
-
-    torch_device = torch.device(device)
-    return RrtmgpSetupResult(
-        fields={
-            "doSWrad": _int_flag(doSWrad, device=torch_device),
-            "doLWrad": _int_flag(doLWrad, device=torch_device),
-            "doSWclrsky": _int_flag(doSWclrsky, device=torch_device),
-            "doLWclrsky": _int_flag(doLWclrsky, device=torch_device),
-            "doGP_lwscat": _int_flag(doGP_lwscat, device=torch_device),
-            "nGauss_angles": _int_scalar(nGauss_angles, device=torch_device),
-            "lsswr": _int_flag(lsswr, device=torch_device),
-            "lslwr": _int_flag(lslwr, device=torch_device),
-            "solhr": _float_scalar(solhr, device=torch_device),
-            "solcon": _float_scalar(solcon, device=torch_device),
-            "coszen": _float_scalar(coszen, device=torch_device),
-            "errmsg": "",
-            "errflg": _int_scalar(0, device=torch_device),
-        }
-    )
-
-
-__all__ = [
-    "RrtmgpSetupResult",
-    "SOLAR_TABLE_EXPECTED_SHA256",
-    "run_setup_timestep_from_config",
-    "run_setup_timestep_from_host_inputs",
-]

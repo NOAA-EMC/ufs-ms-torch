@@ -6,10 +6,11 @@
 from dataclasses import replace
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from gfs_surface_layer_torch.driver import RVRDM1
 
 from .containers import NativeAtmosphere, ProjectionMesh, Stateout
-from .physics_prefix import _get_prs
+from .physics_prefix import _get_prs, _zero_like
 from .photochemistry import apply_photochemistry
 from .projection import project_atmosphere, r4_tracer_contract
 from .precision import working_like
@@ -27,18 +28,20 @@ def reset_microphysics_scratch(statein, prefix, *, nn):
     work = dict(prefix.interstitial)
     for name in ("dtdt", "dudt", "dvdt", "del", "rhc", "save_tcp"):
         work[name] = torch.zeros_like(statein.tgrs)
+    # The tracer-wide zero resets are stride-0 zeros (no fills of [ncol, nlev, ntrac]; their readers write new
+    # tensors, round 8). Distinct tensor objects, as before.
     for name in ("dqdt", "save_q"):
-        work[name] = torch.zeros_like(statein.qgrs)
+        work[name] = _zero_like(statein.qgrs)
     work["del_gz"] = torch.zeros_like(statein.phii)
     clw = statein.tgrs.new_zeros((*shape, nn))
     channels = torch.arange(nn, device=clw.device)
     work["clw"] = torch.where(channels == 1, -999.9, clw)
-    work["dclw"] = torch.zeros_like(clw)
-    work["dvdftra"] = torch.zeros_like(statein.qgrs)
+    work["dclw"] = _zero_like(clw)
+    work["dvdftra"] = _zero_like(statein.qgrs)
     work["tkeh"] = torch.zeros_like(statein.phii)
     for name in ("dd_mf", "dt_mf", "cnvc", "ten_t", "ten_u", "ten_v"):
         work[name] = torch.zeros_like(statein.tgrs)
-    work["ten_q"] = torch.zeros_like(statein.qgrs)
+    work["ten_q"] = _zero_like(statein.qgrs)
     for name in ("raincd", "raincs", "cld1d"):
         work[name] = statein.tgrs.new_zeros(shape[0])
     for name in ("kbot", "ktop", "kcnv"):
@@ -98,16 +101,16 @@ def interstitial_3(statein, prefix, *, control, crtrh, rhcmax):
     ):
         if value.shape != shape or not working_like(value, q) or value.device != q.device:
             raise ValueError(f"invalid interstitial3 {name}")
-        torch._assert_async(torch.isfinite(value).all(), f"nonfinite interstitial3 {name}")
+        torch_compat.assert_async(torch.isfinite(value).all(), f"nonfinite interstitial3 {name}")
     flags, kpbl = work["otsptflag"], work["kpbl"]
     if flags.shape != (ntrac,) or flags.dtype != torch.bool or flags.device != q.device:
         raise ValueError("invalid interstitial3 tracer transport flags")
     if kpbl.shape != (ncol,) or kpbl.dtype != torch.int32 or kpbl.device != q.device:
         raise ValueError("invalid interstitial3 PBL indices")
     kk = torch.clamp_min(kpbl.to(torch.int64), 10)
-    torch._assert_async((kk <= nlev).all(), "interstitial3 PBL top exceeds model levels")
+    torch_compat.assert_async((kk <= nlev).all(), "interstitial3 PBL top exceeds model levels")
     pbl_pressure = torch.gather(statein.prslk, 1, (kk - 1)[:, None])
-    torch._assert_async(((pbl_pressure > 0.) & (pbl_pressure < 1.)).all(), "invalid interstitial3 PBL pressure")
+    torch_compat.assert_async(((pbl_pressure > 0.) & (pbl_pressure < 1.)).all(), "invalid interstitial3 PBL pressure")
     levels = torch.arange(1, nlev + 1, device=q.device)[None, :]
     bottom = crtrh[0] - (crtrh[0] - crtrh[1]) * (1.0 - statein.prslk) / (1.0 - pbl_pressure)
     top = crtrh[1] - (crtrh[1] - crtrh[2]) * (pbl_pressure - statein.prslk) / pbl_pressure
@@ -118,7 +121,7 @@ def interstitial_3(statein, prefix, *, control, crtrh, rhcmax):
     channels = torch.arange(clw.shape[2], device=q.device)
     if control["cscnv"] or control["satmedmf"] or control["trans_trac"] or control["ras"]:
         destinations = torch.cumsum(flags[1:].to(torch.int64), dim=0) + 1
-        torch._assert_async((destinations[-1] < clw.shape[2]), "interstitial3 transport exceeds clw allocation")
+        torch_compat.assert_async((destinations[-1] < clw.shape[2]), "interstitial3 transport exceeds clw allocation")
         for n in range(1, ntrac):
             mask = flags[n] & (channels == destinations[n - 1])
             clw = torch.where(mask, q[:, :, n:n+1], clw)

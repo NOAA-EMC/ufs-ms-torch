@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 import torch.autograd.forward_ad as forward_ad
 
 
@@ -62,7 +63,7 @@ def assert_all_finite(values: Mapping[str, torch.Tensor], label: str, *, exclude
         message = f"nonfinite {label} (one of: {', '.join(names)})"
         cut = flags.is_cuda and len(message) >= 255
         # Keep the assertion outside the compiled predicate, independent of compiled-assert policy.
-        torch._assert_async(flags, message[:250] + "...)" if cut else message)
+        torch_compat.assert_async(flags, message[:250] + "...)" if cut else message)
 
 
 def _exact(values):

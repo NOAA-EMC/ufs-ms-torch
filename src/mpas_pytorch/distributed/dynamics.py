@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from typing import Any
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from mpas_pytorch.profiling import profile_section, profiling_enabled
 
@@ -58,7 +59,6 @@ HALO_GROUPS = {
         ("cell", (1, 2), ("rho_pp",)),
         ("cell", (2,), ("rtheta_pp",)),
     ),
-    "u_123": (("edge", (1, 2, 3), ("u",)),),
     "u_3": (("edge", (3,), ("u",)),),
     "w,pv_edge,rho_edge": (
         ("cell", (1, 2), ("w",)),
@@ -209,7 +209,7 @@ class DynamicsHaloExchange:
                 and not any(
                     field.requires_grad
                     or torch.autograd.forward_ad.unpack_dual(field).tangent is not None
-                    or torch._C._functorch.is_functorch_wrapped_tensor(field)
+                    or torch_compat.is_functorch_wrapped(field)
                     for field in fields
                 )
             )

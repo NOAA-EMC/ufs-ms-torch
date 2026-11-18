@@ -11,29 +11,34 @@ from collections.abc import Mapping
 import math
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from gfs_surface_layer_torch.driver import CP, GRAV, RD, RVRDM1
 
 from .physics_prefix import PhysicsPrefixResult
 from .containers import Statein, static_tensor
 from .precision import WORKING_DTYPES
+from .runtime_policy import glue
 
 
 def gwd_topography(mntvar: torch.Tensor) -> dict[str, torch.Tensor]:
     """Retain the selected nmtvr=24 GFS_GWD_generic_pre column layout."""
     if mntvar.ndim != 2 or mntvar.shape[1] != 24 or mntvar.dtype not in WORKING_DTYPES:
         raise ValueError("R4 GWD pre requires float32/float64 [ncol,24] topography")
-    return {
+    columns = {
         "oc": mntvar[:, 1], "oa4": mntvar[:, 2:6], "clx": mntvar[:, 6:10],
         "theta": mntvar[:, 10], "gamma": mntvar[:, 11],
         "sigma": mntvar[:, 12], "elvmax": mntvar[:, 13],
         "varss": mntvar[:, 14], "ocss": mntvar[:, 15],
         "oa4ss": mntvar[:, 16:20], "clxss": mntvar[:, 20:24],
     }
+    # Each statistic is its own array: the interstitial carries them through the GWD, post and prefix regions,
+    # whose layout normalization would copy every strided view of mntvar again in each region.
+    return {name: value.contiguous() for name, value in columns.items()}
 
 
 def apply_gwd_pre(prefix: PhysicsPrefixResult) -> PhysicsPrefixResult:
     return replace(prefix, interstitial={
-        **prefix.interstitial, **gwd_topography(prefix.sfcprop.hprime),
+        **prefix.interstitial, **glue(gwd_topography)(prefix.sfcprop.hprime),
     })
 
 
@@ -80,7 +85,7 @@ def mountain_blocking(
     elif type(imx) is not int or imx <= 0:
         raise ValueError("GWD resolution requires a positive static integer or device scalar")
     resolution = torch.as_tensor(imx, dtype=t.dtype, device=t.device)
-    torch._assert_async(resolution > 0, "nonpositive GWD resolution")
+    torch_compat.assert_async(resolution > 0, "nonpositive GWD resolution")
     ncol, km = t.shape
     for name in ("u1", "v1", "q1", "phil", "prsl", "prslk", "del"):
         value = fields[name]
@@ -100,7 +105,7 @@ def mountain_blocking(
     cdmb = (t.new_full((), 4.0 * 192.0) / resolution) * torch.where(cdmbgwd[0] >= 0.0, cdmbgwd[0], 1.0)
     cdsigohp = torch.where(active, 0.25 * cdmb * sigma / h_safe, zero)
     onebg = 1.0 / GRAV
-    torch._assert_async((~active | (height < phil[:, -3] * onebg)).all(),
+    torch_compat.assert_async((~active | (height < phil[:, -3] * onebg)).all(),
                         "mountain top exceeds source-defined blocking stratification")
     # iwklm is the running maximum of hit levels: one exact integer max over levels.
     level_phi = phil * onebg
@@ -230,7 +235,7 @@ def gwdps(
         iwk = torch.where(prsi[:, 0] - prsi[:, k] < 5000.0, k + 1, iwk)
     kref = torch.maximum(iwk, fields["kpbl"].to(torch.int64) + 1)
     kref = torch.where(active, kref, 2)
-    torch._assert_async(((kref >= 2) & (kref <= km - 1)).all(), "invalid source GWD reference level")
+    torch_compat.assert_async(((kref >= 2) & (kref <= km - 1)).all(), "invalid source GWD reference level")
     delks = t.new_full((), 1.0) / (prsi[:, 0] - prsi.gather(1, (kref - 1)[:, None]).squeeze(1))
     ubar, vbar, roll = zero, zero, zero
     bnv2bar = (prsi[:, 0] - prsl[:, 0]) * delks * bnv2[:, 0]

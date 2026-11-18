@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.autograd.forward_ad as forward_ad
+from mpas_pytorch import _torch_compat as torch_compat
 from mpas_pytorch.atmosphere_model import run_timestep
 from mpas_pytorch.dynamics.static_payloads import DycoreStaticPayloads
 from ufs_physics_common import cost_meter
@@ -39,12 +39,10 @@ def dycore_experimental(config: dict, device: torch.device, dtype: torch.dtype |
 
 
 def native_boundary_supported(config: dict, device: torch.device | None = None) -> bool:
-    """Keep unqualified LBC and accelerator halo policies on their carried boundary."""
+    """Keep accelerator halo policies on their carried boundary."""
     from mpas_pytorch.distributed.dynamics import DynamicsHaloExchange
 
     exchanger = config.get("_halo_exchanger")
-    if config.get("config_apply_lbcs", False):
-        return False
     if exchanger is None:
         return True
     if not isinstance(exchanger, DynamicsHaloExchange):
@@ -81,7 +79,7 @@ def advance_physics_dynamics(
     """
     # Derivatives in either mode (reverse: grad mode; forward: an active dual level) need the
     # dycore's differentiable path; its no-grad path uses in-place kernels without AD rules.
-    forward_mode = forward_ad._current_level >= 0
+    forward_mode = torch_compat.forward_ad_active()
     differentiable = torch.is_grad_enabled() or forward_mode
     reference = before["u"]
     dt = config["config_dt"]
@@ -90,12 +88,12 @@ def advance_physics_dynamics(
         or not isinstance(dt, (float, int)) or isinstance(dt, bool) or dt <= 0
     ):
         raise ValueError("physics/dynamics requires a device-local timestep and static config_dt")
-    torch._assert_async(torch.isfinite(dtp) & (dtp == dt),
+    torch_compat.assert_async(torch.isfinite(dtp) & (dtp == dt),
         "selected R4 physics interval must equal the dycore timestep")
     for count in (cap_step_index, completed_dycore_steps):
         if count.shape != () or count.dtype != torch.int32 or count.device != reference.device:
             raise ValueError("dycore counters require device-local int32 scalars")
-    torch._assert_async((cap_step_index >= 1) & (completed_dycore_steps >= 0)
+    torch_compat.assert_async((cap_step_index >= 1) & (completed_dycore_steps >= 0)
         & (completed_dycore_steps < 2147483647), "invalid or overflowing dycore counter")
     synced = torch.maximum(completed_dycore_steps, torch.clamp_min(cap_step_index - 1, 0))
     # Do not publish a successful interval or increment its carry if integration fails.
@@ -113,7 +111,7 @@ def advance_physics_dynamics(
         # A partition's owned columns end before its halo rows. Only the
         # true sentinel row is interface-pressure padding.
         padding = committed["surface_pressure"][committed["rho_p"].shape[0] - 1:]
-        torch._assert_async(((padding == 0) & ~torch.signbit(padding)).all(),
+        torch_compat.assert_async(((padding == 0) & ~torch.signbit(padding)).all(),
             "native coupled phase requires positive-zero interface-pressure padding")
         step_config["_native_boundary_output"] = True
     # The previous coupled state must stay unchanged (restarts, continuations, boundary guards).
@@ -158,7 +156,7 @@ def dycore_step_config(config: dict[str, Any], mesh: dict, *, differentiable: bo
 
     Private keys stay out of the continuation identity, so one run config serves every kind of
     step. One static payload store per mesh serves every step. Differentiable steps checkpoint the
-    dycore's RK stages (``runtime_policy.set_dycore_checkpoint``). Compiled dycore regions run under
+    dycore's RK stages (``runtime_policy.dycore_checkpoint_enabled``). Compiled dycore regions run under
     derivatives only where qualified: reverse mode with ``with_dycore_compile(reverse=True)``
     (M9.3). Forward-mode steps, and reverse-mode steps of a forward-only compiled config, run the
     regions eagerly: the eager differentiable step, which is the reference. Persist the
@@ -205,7 +203,7 @@ def commit_microphysics(before,surface,statein,prefix,*,mesh,config,domain,
     if (group_states.shape != (4,) or group_states.dtype != torch.int32
         or group_states.device != before["u"].device):
         raise ValueError("selected cap requires four device-local int32 group states")
-    torch._assert_async((group_states == 2).all(),"CCPP timestep_final: invalid group state")
+    torch_compat.assert_async((group_states == 2).all(),"CCPP timestep_final: invalid group state")
     final_states = torch.ones_like(group_states)
     committed,result = commit_mpas_state(before,surface,statein,prefix.stateout,
         mesh=mesh,config=config,domain=domain,phase=CommitPhase.MICROPHYSICS,

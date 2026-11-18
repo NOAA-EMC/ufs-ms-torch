@@ -9,12 +9,10 @@ import torch
 
 from sa_sas_deep_convection_torch import recurrence_chunks as chunks
 from sa_sas_deep_convection_torch.compile import run_compile_island
-from sa_sas_deep_convection_torch.constants import EPS, EPSM1, FV, GRAV, KM
+from sa_sas_deep_convection_torch.constants import EPS, EPSM1, FV, GRAV
 from sa_sas_deep_convection_torch.segments.segment_d import _fpvs_from_table
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
 from sa_sas_deep_convection_torch.thermo import _fpvs_table_for_device
-
-CHECKPOINT_FIELDS = ("qeso", "heo", "heso", "dbyo", "hcko", "qcko", "eta", "asqecflg")
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -41,17 +39,19 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
     xlamue = state.require("xlamue")
     xlamud = state.require("xlamud")
     eta = state.require("eta")
-    qeso = state.require("qeso").clone()
-    qo = state.require("qo").clone()
-    to = state.require("to").clone()
-    po = state.require("po").clone()
-    heo = state.require("heo").clone()
-    heso = state.require("heso").clone()
-    hcko = state.require("hcko").clone()
-    qcko = state.require("qcko").clone()
-    dbyo = state.require("dbyo").clone()
-    xaa0 = state.require("xaa0").clone()
-    xpwav = state.require("xpwav").clone()
+    # The islands below write no input (they copy before any indexed store), so the state's tensors enter them as
+    # they are: copies here cost one full pass each on the compacted buffer (round 8 wave 4).
+    qeso = state.require("qeso")
+    qo = state.require("qo")
+    to = state.require("to")
+    po = state.require("po")
+    heo = state.require("heo")
+    heso = state.require("heso")
+    hcko = state.require("hcko")
+    qcko = state.require("qcko")
+    dbyo = state.require("dbyo")
+    xaa0 = state.require("xaa0")
+    xpwav = state.require("xpwav")
     ncol = cnvflg.shape[0]
     for name, tensor in {
         "cnvflg": cnvflg,
@@ -302,8 +302,9 @@ def _asqec_environment_updraft_block(
     eta_cur = eta[:, cur]
     etah = 0.5 * (eta_cur + eta[:, prev])
     dz1 = zo[:, 2:KM] - zo[:, cur]
-    # MPS forward AD needs a tensor literal when cp is a live scalar dual.
-    fv = torch.as_tensor(FV, dtype=cp.dtype, device=cp.device)
+    # MPS forward AD needs a tensor literal when cp is a live scalar dual. A device fill, not a host copy
+    # (CUDA Graph capture forbids host-to-device copies).
+    fv = torch.full((), FV, dtype=cp.dtype, device=cp.device)
     rfact = 1.0 + fv * cp * gamma * to[:, cur] / hvap
     heat = dz1 * torch.div(GRAV, cp * temperature) * xdby / (1.0 + gamma) * rfact
     moisture = dz1 * GRAV * FV * torch.maximum(torch.zeros_like(cnvflg)[:, None], qeso[:, cur] - qo[:, cur])
@@ -333,5 +334,3 @@ def _asqec_environment_updraft_block(
     return dxcrtuf, asqecflg, qo, to, po, qeso, heo, heso, hcko, qcko, dbyo, xaa0, xpwav
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

@@ -6,13 +6,12 @@
 from __future__ import annotations
 
 import torch
+from ufs_physics_common.ordered_sum import level_sum
 
 from sa_sas_deep_convection_torch.compile import run_compile_island
-from sa_sas_deep_convection_torch.constants import EPS, EPSM1, GRAV, KM, NN, NTC, NTR
-from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
+from sa_sas_deep_convection_torch.constants import EPS, EPSM1, GRAV
+from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real, tracer_layout
 from sa_sas_deep_convection_torch.thermo import NXPVS, PVS_XMAX, PVS_XMIN, _fpvs_table_for_device
-
-CHECKPOINT_FIELDS = ("new_t1", "new_u1", "new_v1", "new_q1", "new_qtr", "wet_dep", "cnvwt")
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -39,19 +38,21 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
     dellav = state.require("dellav")
     dellae = state.require("dellae")
     chem_pw = state.require("chem_pw")
-    ctro = state.require("ctro").clone()
-    ctr = state.require("ctr").clone()
-    to = state.require("to").clone()
-    qo = state.require("qo").clone()
-    uo = state.require("uo").clone()
-    vo = state.require("vo").clone()
-    qeso = state.require("qeso").clone()
-    new_t1 = state.require("new_t1").clone()
-    new_q1 = state.require("new_q1").clone()
-    new_u1 = state.require("new_u1").clone()
-    new_v1 = state.require("new_v1").clone()
-    new_qtr = state.require("new_qtr").clone()
-    wet_dep = state.require("wet_dep").clone()
+    # The islands below write no input (they copy before any indexed store), so the state's tensors enter them as
+    # they are: copies here cost one full pass each on the compacted buffer (round 8 wave 4).
+    ctro = state.require("ctro")
+    ctr = state.require("ctr")
+    to = state.require("to")
+    qo = state.require("qo")
+    uo = state.require("uo")
+    vo = state.require("vo")
+    qeso = state.require("qeso")
+    new_t1 = state.require("new_t1")
+    new_q1 = state.require("new_q1")
+    new_u1 = state.require("new_u1")
+    new_v1 = state.require("new_v1")
+    new_qtr = state.require("new_qtr")
+    wet_dep = state.require("wet_dep")
     ncol = cnvflg.shape[0]
     for name, tensor in {"cnvflg": cnvflg, "kmax": kmax, "ktcon": ktcon, "kb": kb, "xmb": xmb}.items():
         require_real(name, tensor, (ncol,))
@@ -149,7 +150,7 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
         state.require("hvap"),
         state.require("cp"),
         bool(state.config.get("hwrf_samfdeep", False)),
-        int(state.config.get("ntk", 0)),
+        tracer_layout(state).ntk,
         int(state.config.get("itc", 0)),
         int(state.config.get("ntc", 0)),
         int(state.config.get("ntr", 0)),
@@ -183,7 +184,7 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
 
 def _ordered_sum(values: torch.Tensor) -> torch.Tensor:
     """Level sum in the source's loop order: torch.sum groups terms differently, which changes the last bit."""
-    return values.cumsum(dim=1)[:, -1].clone()
+    return level_sum(values, 1)
 
 
 def _feedback_borrow_wetdep_block(
@@ -384,5 +385,3 @@ def _fpvs_from_table(temperature: torch.Tensor, table: torch.Tensor) -> torch.Te
     return table[jx - 1] + (xj - jx.to(xj.dtype)) * (table[jx] - table[jx - 1])
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

@@ -8,13 +8,10 @@ from __future__ import annotations
 import torch
 
 from sa_sas_deep_convection_torch import recurrence_chunks as chunks
-from sa_sas_deep_convection_torch.compile import masked_sum_chunk_size, run_compile_island, run_recurrence_chunk, recurrence_chunk_size, ordered_chunks_enabled
-from sa_sas_deep_convection_torch.constants import KM
+from sa_sas_deep_convection_torch.compile import run_compile_island, run_recurrence_chunk, recurrence_chunk_size, ordered_chunks_enabled
 from sa_sas_deep_convection_torch.ops import sqrt_zero_grad
 from sa_sas_deep_convection_torch.segments.segment_d import _gather_column
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
-
-CHECKPOINT_FIELDS = ("wu2", "buo", "drag", "wush", "wc", "omegaout", "omega_u", "cnvflg")
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -320,7 +317,7 @@ def _overshoot_updraft_block(
 
     average_rows = chunks.pack_profiles(zi, wu2)
     wc, sumx = torch.zeros_like(cnvflg), torch.zeros_like(cnvflg)
-    size = masked_sum_chunk_size()
+    size = recurrence_chunk_size()
     for start in range(1, KM - 1, size):
         stop = min(start + size, KM - 1)
         wc, sumx = run_recurrence_chunk("j_ordered_chunks", "velocity_average", chunks.velocity_average,
@@ -329,10 +326,6 @@ def _overshoot_updraft_block(
     wc = torch.where((cnvflg != 0.0) & (sumx != 0.0), wc / torch.where((cnvflg != 0.0) & (sumx != 0.0), sumx, torch.ones_like(sumx)), wc)
     cnvflg = torch.where((cnvflg != 0.0) & (wc < 1.0e-4), torch.zeros_like(cnvflg), cnvflg)
     return cnvflg, aa2, ktcon1, qcko, qrcko, dellal, pwo, pwavo, cnvwt, zdqca, wu2, omegaout, omega_u, wc, sumx
-
-
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}
 
 
 def _recurrence_coordinator(category, name, fn, *args):

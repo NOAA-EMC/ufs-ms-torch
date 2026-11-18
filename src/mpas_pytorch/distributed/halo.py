@@ -18,6 +18,7 @@ from math import prod
 from typing import Any, cast
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 import torch.distributed as dist
 
 from .partition import MeshPartition
@@ -259,7 +260,7 @@ class HaloTransport:
             if torch.is_grad_enabled() or any(
                 field.requires_grad
                 or torch.autograd.forward_ad.unpack_dual(field).tangent is not None
-                or torch._C._functorch.is_functorch_wrapped_tensor(field)
+                or torch_compat.is_functorch_wrapped(field)
                 for field in fields
             ):
                 raise ValueError("in-place halo writes require inference-owned buffers")
@@ -303,7 +304,7 @@ def _transfer(
         stream,
     )
     transformed = any(
-        torch._C._functorch.is_functorch_wrapped_tensor(f) for f in fields
+        torch_compat.is_functorch_wrapped(f) for f in fields
     )
     buffers = None if transformed else plan.buffers.get(key)
     if buffers is None:

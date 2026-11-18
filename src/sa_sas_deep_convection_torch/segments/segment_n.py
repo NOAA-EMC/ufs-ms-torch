@@ -8,10 +8,7 @@ from __future__ import annotations
 import torch
 
 from sa_sas_deep_convection_torch.compile import run_compile_island, run_recurrence_chunk, ordered_chunks_enabled
-from sa_sas_deep_convection_torch.constants import KM, NTR
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
-
-CHECKPOINT_FIELDS = ("q_diff", "e_diff", "flxtvd", "new_t1", "new_q1", "new_qtr", "asqecflg")
 
 
 def _limiter_ratio(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
@@ -141,17 +138,20 @@ def _tvd_moisture_block(cnvflg, ktcon, kb, jmin, eta, etad, edto, del_, q1, qo, 
     tem1_pos = q1[:, 1:] + ph_pos * (qo[:, : KM - 1] - q1[:, 1:])
     ph_neg = _limiter_ratio(q_diff[:, : KM - 1], q_diff[:, 1:])
     tem1_neg = q1[:, : KM - 1] + ph_neg * (qo[:, : KM - 1] - q1[:, : KM - 1])
-    tem1 = torch.where(tem > 0.0, tem1_pos, torch.where(tem < 0.0, tem1_neg, qo[:, : KM - 1]))
     flux = torch.where(tem > 0.0, tem * tem1_pos, torch.where(tem < 0.0, tem * tem1_neg, torch.zeros_like(tem)))
     flxtvd[:, 1:] = torch.where(level_layer_lt, flux, flxtvd[:, 1:])
+    # Deliberate change from GFS v17 (samfdeepcnv.F; Fortran patch samf_launch_exchange_20261116): upstream subtracts
+    # the double-counted exchange at jmin+1 and kb with the TVD interface value tem1, while the plumes were launched
+    # with the cell humidity qo. Pairing each sink with qo makes the subtraction remove exactly the water the plume
+    # took, so the column's water is conserved; it changes dellaq at those two levels.
     dellaq[:, 1:] = torch.where(
         top_double,
-        dellaq[:, 1:] - edto[:, None] * etad[:, : KM - 1] * tem1 * grav / (1000.0 * del_[:, 1:]),
+        dellaq[:, 1:] - edto[:, None] * etad[:, : KM - 1] * qo[:, : KM - 1] * grav / (1000.0 * del_[:, 1:]),
         dellaq[:, 1:],
     )
     dellaq[:, : KM - 1] = torch.where(
         base_double,
-        dellaq[:, : KM - 1] - eta[:, : KM - 1] * tem1 * grav / (1000.0 * del_[:, : KM - 1]),
+        dellaq[:, : KM - 1] - eta[:, : KM - 1] * qo[:, : KM - 1] * grav / (1000.0 * del_[:, : KM - 1]),
         dellaq[:, : KM - 1],
     )
     delta_q = (flxtvd[:, 1:] - flxtvd[:, : KM - 1]) * grav / (1000.0 * del_[:, : KM - 1])
@@ -199,10 +199,6 @@ def _tvd_tracer_block(cnvflg, ktcon, kb, jmin, eta, etad, edto, del_, ctr, ctro,
     delta_e = (flxtvd_e[:, 1:, :] - flxtvd_e[:, : KM - 1, :]) * grav / (1000.0 * del_[:, : KM - 1, None])
     dellae[:, : KM - 1, :] = torch.where(level_layer_le[:, :, None], dellae[:, : KM - 1, :] + delta_e, dellae[:, : KM - 1, :])
     return e_diff, flxtvd_e[:, :, NTR - 1], dellae
-
-
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}
 
 
 def _limiter_coordinator(category, name, fn, *args):

@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from gfs_surface_layer_torch.cases import SurfaceCaseConfig
 from mpas_pytorch.constants import UFS_CONSTANTS
 from rrtmgp_radiation_torch.radiation_group import RadiationConfig
@@ -236,7 +237,7 @@ def prepare_r4_physics_controls(physics_namelist: Mapping[str, Any], *,
     area = radius * radius * (UFS_CONSTANTS.PI + UFS_CONSTANTS.PI) * UFS_CONSTANTS.PI
     dxmax = torch.log(area / (max_lon * max_lat))
     dxmin = torch.log(area / (min_lon * min_lat))
-    torch._assert_async(dxmax != dxmin, "degenerate physics area scaling")
+    torch_compat.assert_async(dxmax != dxmin, "degenerate physics area scaling")
     dxinv = 1. / (dxmax - dxmin)
     radiation = RadiationScalingControl(
         dtf=dt_dycore, dtp=dt_physics, fhswr=value("fhswr", 3600.),
@@ -518,7 +519,7 @@ def prepare_r4_radiation_config(physics_namelist: Mapping[str, Any], *,
         or not isinstance(solhr,torch.Tensor) or solhr.shape != ()
         or solhr.dtype != torch.float64 or solhr.device != jdat.device):
         raise ValueError("radiation calendar requires device-local date and float64 solar hour")
-    torch._assert_async(torch.isfinite(solhr) & (solhr >= 0.) & (solhr < 24.),
+    torch_compat.assert_async(torch.isfinite(solhr) & (solhr >= 0.) & (solhr < 24.),
         "invalid radiation solar hour")
     def value(name, default):
         return _static_namelist_value(physics_namelist,name.lower(),default)
@@ -683,7 +684,7 @@ def prepare_r4_gwd_controls(physics_namelist: Mapping[str, Any],
         or geometry.ak.shape != (56,) or geometry.ak.dtype != torch.float64
         or resolution.device != geometry.ak.device):
         raise ValueError("R4 GWD setup requires device-local 55-level reference geometry")
-    torch._assert_async(resolution > 0, "nonpositive GWD reference resolution")
+    torch_compat.assert_async(resolution > 0, "nonpositive GWD reference resolution")
     coefficients = physics_namelist.get("cdmbgwd",(2.,.25,1.,1.))
     if type(coefficients) not in (list,tuple) or len(coefficients) != 4:
         raise TypeError("physics namelist cdmbgwd requires four static values")
@@ -785,7 +786,7 @@ def initialize_reference_geometry(
     ):
         raise ValueError("invalid native reference geometry operands")
     area, pressure = area_cell[:n], prsi[:n]
-    torch._assert_async(
+    torch_compat.assert_async(
         (torch.isfinite(area) & (area > 0.0)).all() & torch.isfinite(pressure).all(),
         "invalid native reference geometry inputs",
     )
@@ -795,7 +796,7 @@ def initialize_reference_geometry(
     )
     global_area = totals[0]
     ak = totals[1:] / global_area
-    torch._assert_async(
+    torch_compat.assert_async(
         (ak > 0.0).all() & (ak[1:] < ak[:-1]).all(),
         "nonpositive or nondecreasing reference interface pressure",
     )

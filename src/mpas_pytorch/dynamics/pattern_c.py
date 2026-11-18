@@ -24,14 +24,10 @@ from mpas_pytorch.dynamics.stencil_ops import (
     _replace_rows,
     _slot_batches,
     _slot_gather_batch,
-    _static_connectivity_cache_allowed,
     _static_mask_all_true,
-    _tensor_version_cache_key,
     gather_rows,
     sum_fortran_order,
 )
-
-_PATTERN_C_CONNECTIVITY_CACHE: dict[tuple[object, ...], dict[str, Any]] = {}
 
 
 def _move_pattern_c_payload_value(value: Any, device: torch.device) -> Any:
@@ -115,10 +111,6 @@ def _long_index(index: torch.Tensor) -> torch.Tensor:
 
 def _safe_zero_invalid(indices0: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     return _long_index(torch.where(valid, indices0, torch.zeros_like(indices0)))
-
-
-def _pattern_c_tensor_cache_key(tensor: torch.Tensor) -> tuple[object, ...] | None:
-    return _tensor_version_cache_key(tensor)
 
 
 def _build_pattern_c_connectivity_payload(
@@ -534,110 +526,6 @@ def _compute_pattern_c_flux_rows(
             (edge_count, scalar_field.shape[1], scalar_field.shape[2])
         )
     return horiz_flux
-
-
-def _pattern_c_connectivity_payload_cache_key(
-    **kwargs: object,
-) -> tuple[object, ...] | None:
-    """Return the mutation-sensitive cache key for a Pattern C static payload."""
-    tensors = (
-        kwargs["n_adv_cells_for_edge"],
-        kwargs["adv_cells_for_edge"],
-        kwargs["adv_coefs"],
-        kwargs["adv_coefs_3rd"],
-    )
-    if not _static_connectivity_cache_allowed(tensors):
-        return None
-
-    tensor_keys: list[tuple[object, ...]] = []
-    for tensor in tensors:
-        if isinstance(tensor, torch.Tensor):
-            tensor_key = _pattern_c_tensor_cache_key(tensor)
-            if tensor_key is None:
-                return None
-            tensor_keys.append(tensor_key)
-
-    scalar_field = kwargs["scalar_field"]
-    if not isinstance(scalar_field, torch.Tensor):
-        return None
-
-    return (
-        str(scalar_field.device),
-        str(scalar_field.dtype),
-        kwargs["edge_start"],
-        kwargs["edge_end"],
-        kwargs["n_adv_cells_max"],
-        *tensor_keys,
-    )
-
-
-def _pattern_c_connectivity_payload(**kwargs: object) -> dict[str, Any]:
-    """Return cached Pattern C topology when topology is static."""
-    key = _pattern_c_connectivity_payload_cache_key(**kwargs)
-    if key is None:
-        return _build_pattern_c_connectivity_payload(**kwargs)  # type: ignore[arg-type]
-    cached = _PATTERN_C_CONNECTIVITY_CACHE.get(key)
-    if cached is not None:
-        return cached
-    payload = _build_pattern_c_connectivity_payload(**kwargs)  # type: ignore[arg-type]
-    if len(_PATTERN_C_CONNECTIVITY_CACHE) >= 8:
-        _PATTERN_C_CONNECTIVITY_CACHE.pop(next(iter(_PATTERN_C_CONNECTIVITY_CACHE)))
-    _PATTERN_C_CONNECTIVITY_CACHE[key] = payload
-    return payload
-
-
-def compute_pattern_c_flux(
-    scalar_field: torch.Tensor,
-    uh_avg: torch.Tensor,
-    n_adv_cells_for_edge: torch.Tensor,
-    adv_cells_for_edge: torch.Tensor,
-    adv_coefs: torch.Tensor,
-    adv_coefs_3rd: torch.Tensor,
-    edge_start: int,
-    edge_end: int,
-    n_adv_cells_max: int,
-    one: torch.Tensor,
-    _connectivity_payload: Mapping[str, Any] | None = None,
-) -> tuple[slice, torch.Tensor]:
-    """
-    Compute Pattern C horizontal scalar flux on edge range [edge_start, edge_end].
-
-    Args:
-        scalar_field: (nCells+1, nVertLevels, nScalars)
-        uh_avg: (nEdges+1, nVertLevels)
-        n_adv_cells_for_edge: (nEdges+1,)
-        adv_cells_for_edge: (nEdges+1, nAdvCellsMax), Fortran 1-based indices
-        adv_coefs: (nEdges+1, nAdvCellsMax)
-        adv_coefs_3rd: (nEdges+1, nAdvCellsMax)
-        edge_start: Fortran 1-based start edge (inclusive)
-        edge_end: Fortran 1-based end edge (inclusive)
-        n_adv_cells_max: maximum advection-cell stencil width
-        one: scalar tensor with the target dtype/device
-
-    Returns:
-        (edge_slice, horiz_flux) where horiz_flux has shape
-        (edge_count, nVertLevels, nScalars).
-    """
-    payload = (
-        _connectivity_payload
-        if _connectivity_payload is not None
-        else _pattern_c_connectivity_payload(
-            scalar_field=scalar_field,
-            n_adv_cells_for_edge=n_adv_cells_for_edge,
-            adv_cells_for_edge=adv_cells_for_edge,
-            adv_coefs=adv_coefs,
-            adv_coefs_3rd=adv_coefs_3rd,
-            edge_start=edge_start,
-            edge_end=edge_end,
-            n_adv_cells_max=n_adv_cells_max,
-        )
-    )
-    return compute_pattern_c_flux_from_payload(
-        scalar_field=scalar_field,
-        uh_avg=uh_avg,
-        one=one,
-        connectivity_payload=payload,
-    )
 
 
 def compute_pattern_c_flux_from_payload(

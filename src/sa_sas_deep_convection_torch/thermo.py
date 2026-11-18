@@ -67,19 +67,6 @@ def _fpvs_table_cpu() -> torch.Tensor:
 _FPVS_TABLE_CPU = _fpvs_table_cpu()
 
 
-def _fpvsx(temperature: torch.Tensor) -> torch.Tensor:
-    tr = TTP / temperature
-    tice = TTP - 20.0
-    xponal = -(CVAP - CLIQ) / RV
-    xponbl = -(CVAP - CLIQ) / RV + HVAP / (RV * TTP)
-    xponai = -(CVAP - CSOL) / RV
-    xponbi = -(CVAP - CSOL) / RV + (HVAP + HFUS) / (RV * TTP)
-    pvl = PSAT * torch.pow(tr, xponal) * torch.exp(torch.as_tensor(xponbl, dtype=temperature.dtype, device=temperature.device) * (1.0 - tr))
-    pvi = PSAT * torch.pow(tr, xponai) * torch.exp(torch.as_tensor(xponbi, dtype=temperature.dtype, device=temperature.device) * (1.0 - tr))
-    weight = (temperature - tice) / 20.0
-    return torch.where(temperature >= TTP, pvl, torch.where(temperature < tice, pvi, weight * pvl + (1.0 - weight) * pvi))
-
-
 def fpvs(temperature: torch.Tensor) -> torch.Tensor:
     """Match ``funcphys.fpvs`` table lookup in the working dtype (float64 parity, or float32)."""
 

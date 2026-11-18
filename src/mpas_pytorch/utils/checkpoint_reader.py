@@ -20,7 +20,6 @@ import torch
 
 from mpas_pytorch.constants import DTYPE
 from mpas_pytorch.exceptions import MpasConfigError
-from mpas_pytorch.mesh import MESHState
 from mpas_pytorch.precision import resolve_dtype
 
 CONNECTIVITY_INDEX_VARS = frozenset(
@@ -268,51 +267,6 @@ class CheckpointReader:
                 stacklevel=2,
             )
 
-    def load_variables(
-        self, var_names: list[str], dtype: torch.dtype | None = None
-    ) -> dict[str, Any]:
-        """
-        Load specific variables by name.
-
-        Args:
-            var_names: List of variable names to load
-            dtype: Override dtype for floating-point variables
-
-        Returns:
-            Dictionary of requested variables as tensors
-
-        Raises:
-            KeyError: If any variable name is not found
-            RuntimeError: If dataset is not open
-        """
-        dataset = self._ensure_open()
-
-        data = {}
-        for name in var_names:
-            if name not in dataset.variables:
-                available = list(dataset.variables.keys())
-                raise KeyError(
-                    f"Variable '{name}' not found in checkpoint.\n"
-                    f"Available variables: {available}"
-                )
-
-            var = dataset.variables[name]
-            arr = var[:]
-            self._validate_raw_array(arr, name, dtype=dtype)
-            if self._is_string_dtype(arr.dtype):
-                raise TypeError(
-                    f"Variable '{name}' has non-numeric dtype {arr.dtype} and "
-                    "cannot be converted to torch.Tensor"
-                )
-            tensor = self._numpy_to_torch(arr, name, dtype=dtype)
-
-            if dtype is not None and tensor.dtype.is_floating_point:
-                tensor = tensor.to(dtype)
-
-            data[name] = tensor
-
-        return data
-
     def get_variable_info(self, name: str) -> VariableInfo:
         """
         Get metadata about a specific variable.
@@ -360,16 +314,6 @@ class CheckpointReader:
             has_nan=has_nan,
             has_inf=has_inf,
         )
-
-    def list_variables(self) -> list[str]:
-        """
-        List all variable names in checkpoint.
-
-        Returns:
-            List of variable names
-        """
-        dataset = self._ensure_open()
-        return list(dataset.variables.keys())
 
     def describe(self, verbose: bool = True) -> dict[str, VariableInfo]:
         """
@@ -572,258 +516,6 @@ def validate_checkpoint(filepath: str, verbose: bool = True) -> bool:
 # Mesh loading functions
 
 
-def _convert_fortran_index_array(
-    arr: torch.Tensor,
-    n_slice: int,
-    max_valid_1based: int,
-    name: str,
-    validate: bool = True,
-) -> torch.Tensor:
-    """
-    Convert Fortran 1-based connectivity array to 0-based indexing.
-
-    Fortran checkpoint arrays have:
-    - Shape (N+1, ...) where index 0 through N-1 is valid data, index N is padding
-    - Values are 1-indexed (1 to max_valid_1based)
-    - Sentinel values (0 or max_valid_1based+1) indicate "no neighbor"
-
-    PyTorch arrays should have:
-    - Shape (N, ...) with valid data only
-    - Values are 0-indexed (0 to max_valid_1based-1)
-    - -1 indicates "no neighbor"
-
-    Args:
-        arr: Fortran array with shape (N+1, ...)
-        n_slice: Number of entries to keep (N), removes padding row
-        max_valid_1based: Maximum valid 1-based index in the data
-            (e.g., nCells for cell indices, nEdges for edge indices)
-        name: Variable name for error messages
-        validate: If True (default), validate that converted indices are within
-            valid bounds [0, max_valid_1based-1]. Set to False to skip validation
-            (not recommended for production use).
-
-    Returns:
-        PyTorch array with shape (N, ...) and 0-based indexing
-
-    Raises:
-        ValueError: If validate=True and indices are out of valid bounds.
-    """
-    # Slice to remove padding row at the end
-    sliced = arr[:n_slice]
-
-    # Identify sentinel values:
-    # - 0 means "no neighbor" (becomes -1)
-    # - max_valid_1based + 1 means "no neighbor" (also becomes -1)
-    sentinel_value = max_valid_1based + 1
-
-    # Create mask for sentinel values
-    is_sentinel = (sliced == 0) | (sliced == sentinel_value)
-
-    # Convert 1-based to 0-based indexing
-    # Valid values: 1 -> 0, 2 -> 1, ..., max_valid_1based -> max_valid_1based-1
-    converted = sliced - 1
-
-    # Set sentinel positions to -1
-    converted = torch.where(
-        is_sentinel,
-        torch.tensor(-1, dtype=converted.dtype, device=converted.device),
-        converted,
-    )
-
-    # Validate index bounds (after conversion)
-    if validate:
-        non_sentinel = converted[converted >= 0]
-        if len(non_sentinel) > 0:
-            min_idx = non_sentinel.min().item()
-            max_idx = non_sentinel.max().item()
-            if min_idx < 0:
-                raise ValueError(
-                    f"{name}: invalid negative index {min_idx} found (non-sentinel)"
-                )
-            if max_idx >= max_valid_1based:
-                raise ValueError(
-                    f"{name}: index {max_idx} out of bounds [0, {max_valid_1based - 1}]. "
-                    f"This may indicate corrupt checkpoint data or wrong n_slice value."
-                )
-
-    return converted
-
-
-def _slice_padded_array(arr: torch.Tensor, n_valid: int, name: str) -> torch.Tensor:
-    """
-    Slice Fortran array to remove padding row.
-
-    Fortran checkpoint arrays have shape (N+1, ...) where the last row is padding.
-    This function slices to (N, ...).
-
-    Args:
-        arr: Fortran array with shape (N+1, ...)
-        n_valid: Number of valid entries (N)
-        name: Variable name for error messages
-
-    Returns:
-        Array with shape (N, ...) containing valid data only
-    """
-    return arr[:n_valid]
-
-
-def load_mesh_from_checkpoints(
-    dim_path: str,
-    conn_path: str,
-    geom_path: str,
-    *,
-    dtype: torch.dtype = DTYPE,
-) -> MESHState:
-    """
-    Load a complete mesh from MPAS NetCDF component files.
-
-    This function loads mesh dimensions, connectivity arrays, and geometry/metric
-    arrays from three separate MPAS NetCDF files.
-
-    IMPORTANT - RETURNS 0-BASED INDEXED ARRAYS:
-        This function returns a MESHState with 0-based indexed connectivity arrays
-        suitable for Pythonic array access. However, dynamics kernels (solve_diagnostics,
-        acoustic_step, recover_large_step, etc.) expect 1-based Fortran-style arrays
-        with +1 padding.
-
-        For dynamics kernels, use load_checkpoint() directly which preserves the
-        original Fortran array format, or apply manual conversion.
-
-        See MESHState docstring for detailed indexing convention documentation.
-
-    Index Conversion:
-        Fortran uses 1-based indexing with 0 for "no neighbor".
-        PyTorch uses 0-based indexing with -1 for "no neighbor".
-        All connectivity arrays are converted appropriately.
-
-    Array Slicing:
-        Fortran checkpoint arrays have shape (N+1, ...) where the last entry
-        is zero-padding. Arrays are sliced to (N, ...) containing valid data only.
-
-    Args:
-        dim_path: Path to mesh_dimensions.nc (contains nCells, nEdges, etc.)
-        conn_path: Path to mesh_connectivity.nc (contains cellsOnEdge, etc.)
-        geom_path: Path to mesh_geometry.nc (contains areaCell, dvEdge, etc.)
-
-    Returns:
-        MESHState with all connectivity and geometry arrays populated.
-        Connectivity arrays use 0-based indexing with -1 for missing neighbors.
-        Arrays have shape (N, ...) without padding rows.
-        All floating-point arrays use the selected dtype (default float64).
-
-    Raises:
-        FileNotFoundError: If any checkpoint file does not exist
-        KeyError: If required variables are missing from checkpoint files
-
-    Example:
-        mesh = load_mesh_from_checkpoints(
-            dim_path='mesh_dimensions.nc',
-            conn_path='mesh_connectivity.nc',
-            geom_path='mesh_geometry.nc',
-        )
-        mesh.validate()  # Verify shapes and index ranges
-    """
-    # Load dimensions
-    dims = load_checkpoint(dim_path, dtype=dtype)
-    nCells = int(dims["nCells"].item())
-    nEdges = int(dims["nEdges"].item())
-    nVertices = int(dims["nVertices"].item())
-    maxEdges = int(dims["maxEdges"].item())
-    vertexDegree = int(dims["vertexDegree"].item())
-    nVertLevels = int(dims["nVertLevels"].item())
-    maxEdges2 = int(dims["maxEdges2"].item())
-
-    # Load connectivity arrays (need index conversion)
-    conn = load_checkpoint(conn_path, dtype=dtype)
-
-    # Convert connectivity arrays from Fortran 1-based to PyTorch 0-based
-    # Arrays have shape (N+1, ...) in checkpoint, need slicing and index conversion
-    # Arguments: (array, n_slice, max_valid_1based, name)
-    # - n_slice: number of rows to keep (removes padding row)
-    # - max_valid_1based: max valid index value (for detecting sentinels)
-
-    # cellsOnEdge: indexed by edges, contains cell indices
-    cellsOnEdge = _convert_fortran_index_array(
-        conn["cellsOnEdge"], nEdges, nCells, "cellsOnEdge"
-    )
-    # edgesOnCell: indexed by cells, contains edge indices
-    edgesOnCell = _convert_fortran_index_array(
-        conn["edgesOnCell"], nCells, nEdges, "edgesOnCell"
-    )
-    # cellsOnCell: indexed by cells, contains cell indices
-    cellsOnCell = _convert_fortran_index_array(
-        conn["cellsOnCell"], nCells, nCells, "cellsOnCell"
-    )
-    # verticesOnCell: indexed by cells, contains vertex indices
-    verticesOnCell = _convert_fortran_index_array(
-        conn["verticesOnCell"], nCells, nVertices, "verticesOnCell"
-    )
-    # verticesOnEdge: indexed by edges, contains vertex indices
-    verticesOnEdge = _convert_fortran_index_array(
-        conn["verticesOnEdge"], nEdges, nVertices, "verticesOnEdge"
-    )
-    # edgesOnVertex: indexed by vertices, contains edge indices
-    edgesOnVertex = _convert_fortran_index_array(
-        conn["edgesOnVertex"], nVertices, nEdges, "edgesOnVertex"
-    )
-    # cellsOnVertex: indexed by vertices, contains cell indices
-    cellsOnVertex = _convert_fortran_index_array(
-        conn["cellsOnVertex"], nVertices, nCells, "cellsOnVertex"
-    )
-
-    # nEdgesOnCell doesn't need index conversion (it's a count, not an index)
-    # But still needs slicing to remove padding
-    nEdgesOnCell = _slice_padded_array(conn["nEdgesOnCell"], nCells, "nEdgesOnCell")
-
-    # Load geometry/metric arrays (need slicing but no index conversion)
-    geom = load_checkpoint(geom_path, dtype=dtype)
-
-    dvEdge = _slice_padded_array(geom["dvEdge"], nEdges, "dvEdge")
-    dcEdge = _slice_padded_array(geom["dcEdge"], nEdges, "dcEdge")
-    areaCell = _slice_padded_array(geom["areaCell"], nCells, "areaCell")
-    areaTriangle = _slice_padded_array(geom["areaTriangle"], nVertices, "areaTriangle")
-    fEdge = _slice_padded_array(geom["fEdge"], nEdges, "fEdge")
-    fVertex = _slice_padded_array(geom["fVertex"], nVertices, "fVertex")
-    invAreaCell = _slice_padded_array(geom["invAreaCell"], nCells, "invAreaCell")
-    weightsOnEdge = _slice_padded_array(geom["weightsOnEdge"], nEdges, "weightsOnEdge")
-    kiteAreasOnVertex = _slice_padded_array(
-        geom["kiteAreasOnVertex"], nVertices, "kiteAreasOnVertex"
-    )
-
-    # Construct and return MESHState
-    return MESHState(
-        # Dimensions
-        nCells=nCells,
-        nVertices=nVertices,
-        nEdges=nEdges,
-        maxEdges=maxEdges,
-        vertexDegree=vertexDegree,
-        nVertLevels=nVertLevels,
-        maxEdges2=maxEdges2,
-        # Connectivity (0-indexed, -1 for missing)
-        cellsOnCell=cellsOnCell,
-        edgesOnCell=edgesOnCell,
-        verticesOnCell=verticesOnCell,
-        cellsOnEdge=cellsOnEdge,
-        verticesOnEdge=verticesOnEdge,
-        edgesOnVertex=edgesOnVertex,
-        cellsOnVertex=cellsOnVertex,
-        nEdgesOnCell=nEdgesOnCell,
-        # Metric arrays
-        dvEdge=dvEdge,
-        dcEdge=dcEdge,
-        areaCell=areaCell,
-        areaTriangle=areaTriangle,
-        # Physics arrays
-        fEdge=fEdge,
-        fVertex=fVertex,
-        # Additional metric arrays
-        weightsOnEdge=weightsOnEdge,
-        kiteAreasOnVertex=kiteAreasOnVertex,
-        invAreaCell=invAreaCell,
-    )
-
-
 def load_mesh_for_kernels(
     dim_path: str,
     conn_path: str,
@@ -839,9 +531,8 @@ def load_mesh_for_kernels(
     - mesh_connectivity.nc
     - mesh_geometry.nc
 
-    Unlike load_mesh_from_checkpoints(), this function does NOT convert indices
-    to 0-based. Use it when passing mesh data directly into dynamics kernels
-    or time integration routines that expect 1-based+padded arrays.
+    The arrays keep their 1-based+padded indexing, the form the dynamics
+    kernels and time integration routines read.
 
     Args:
         dim_path: Path to mesh_dimensions.nc
@@ -860,48 +551,6 @@ def load_mesh_for_kernels(
     mesh.update(conn)
     mesh.update(geom)
     return mesh
-
-
-def load_mesh(filepath: str) -> MESHState:
-    """
-    Load MPAS mesh from NetCDF file.
-
-    NOTE: This function is not implemented. Use load_mesh_from_checkpoints() instead.
-
-    Raises:
-        NotImplementedError: Always - use load_mesh_from_checkpoints() instead.
-    """
-    raise NotImplementedError(
-        "load_mesh() is not implemented.\n"
-        "Use load_mesh_from_checkpoints() for MPAS NetCDF component files:\n\n"
-        "    from mpas_pytorch.utils import load_mesh_from_checkpoints\n"
-        "    mesh = load_mesh_from_checkpoints(\n"
-        "        dim_path='mesh_dimensions.nc',\n"
-        "        conn_path='mesh_connectivity.nc',\n"
-        "        geom_path='mesh_geometry.nc',\n"
-        "    )"
-    )
-
-
-def load_state(filepath: str, mesh: MESHState) -> dict[str, Any]:
-    """
-    Load state variables from NetCDF checkpoint.
-
-    NOTE: This function is not implemented.
-    Use load_checkpoint() + DycoreState for state loading.
-
-    Raises:
-        NotImplementedError: Always - use alternative approach.
-    """
-    raise NotImplementedError(
-        "load_state() is not yet implemented.\n"
-        "Use load_checkpoint() for general checkpoint access:\n\n"
-        "    from mpas_pytorch.utils import load_checkpoint\n"
-        "    data = load_checkpoint('checkpoint.nc')\n\n"
-        "Or use load_state_from_checkpoint() for DycoreState:\n\n"
-        "    from mpas_pytorch.state import load_state_from_checkpoint\n"
-        "    state = load_state_from_checkpoint('checkpoint.nc')"
-    )
 
 
 def save_checkpoint(

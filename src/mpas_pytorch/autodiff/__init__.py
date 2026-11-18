@@ -8,7 +8,6 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any
 
 import torch
 
@@ -16,19 +15,7 @@ _GRAD_MODE_DEPTH: ContextVar[int] = ContextVar("_GRAD_MODE_DEPTH", default=0)
 
 
 def _compile_active() -> bool:
-    try:
-        compiler: Any | None = torch.compiler
-    except AttributeError:
-        compiler = None
-    if compiler is not None and hasattr(compiler, "is_compiling"):
-        return bool(compiler.is_compiling())
-    try:
-        dynamo: Any | None = torch._dynamo
-    except AttributeError:
-        dynamo = None
-    if dynamo is not None and hasattr(dynamo, "is_compiling"):
-        return bool(dynamo.is_compiling())
-    return False
+    return torch.compiler.is_compiling()
 
 
 def is_grad_mode() -> bool:

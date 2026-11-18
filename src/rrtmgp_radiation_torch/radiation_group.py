@@ -53,6 +53,7 @@ from typing import Any, Mapping
 
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from tempo_torch import mp_tempo as tempo_mp_tempo
 from tempo_torch import torch_native as tempo_native
 
@@ -116,7 +117,7 @@ from .shortwave import _increment_shortwave_same_spectral_kernel, compute_shortw
 from .tables import RrtmgpTableBundle, load_rrtmgp_tables
 from ufs_physics_common.compaction import run_compacted
 from .diagnostics import radiation_surface, cloud_diagnostics, radiation_fluxr
-from .merra2 import _aerosol_preparation, merra2_aer_nm, merra2_aod550, merra2_lw_optics, merra2_sw_optics
+from .merra2 import NBDLW, NBDSW, _aerosol_preparation, merra2_aer_nm, merra2_aod550, merra2_band_optics, merra2_sw_optics
 
 # --- physical constants (physcons.F90 / GFS_rrtmgp_pre / rte-rrtmgp v1.7) -------
 CON_G = 9.80665
@@ -132,11 +133,10 @@ EPS_PRE = 1.0e-6  # GFS_rrtmgp_pre: eps
 ONEMINUS = 1.0 - EPS_PRE
 FTINY = 1.0e-12
 WP_EPS = 2.220446049250313e-16  # epsilon(1._wp)
-OPTICS_EPS = 3.0 * 2.2250738585072014e-308  # mo_optical_props_kernels: 3*tiny (float64; see _optics_eps)
 
 
 def _optics_eps(dtype: torch.dtype) -> float:
-    """``3*tiny(1._wp)`` of the working dtype (OPTICS_EPS in float64; float32's tiny in float32)."""
+    """``3*tiny(1._wp)`` (``mo_optical_props_kernels``) of the working dtype."""
     return 3.0 * torch.finfo(dtype).tiny
 PI_RTE = math.acos(-1.0)
 LW_TAU_THRESH = math.sqrt(math.sqrt(WP_EPS))
@@ -262,80 +262,6 @@ class RadiationConfig:
     merra2_optics: Any = None
     aer_jdat: torch.Tensor | None = None
 
-    @staticmethod
-    def from_mapping(values: Mapping[str, Any]) -> "RadiationConfig":
-        def _int(name: str) -> int:
-            return int(values[name])
-
-        def _bool(name: str) -> bool:
-            return bool(int(values[name]))
-
-        def _float(name: str) -> float:
-            return float(values[name])
-
-        jdat = tuple(int(v) for v in values["jdat"])
-        idat = tuple(int(v) for v in values.get("idat", jdat))
-        result = RadiationConfig(
-            imp_physics=_int("imp_physics"),
-            ntcw=_int("ntcw"),
-            ntiw=_int("ntiw"),
-            ntrw=_int("ntrw"),
-            ntsw=_int("ntsw"),
-            ntgl=_int("ntgl"),
-            ntinc=_int("ntinc"),
-            ntoz=_int("ntoz"),
-            ntrac=_int("ntrac"),
-            nleffr=_int("nleffr"),
-            nieffr=_int("nieffr"),
-            nseffr=_int("nseffr"),
-            lmfshal=_bool("lmfshal"),
-            lmfdeep2=_bool("lmfdeep2"),
-            imfdeepcnv=_int("imfdeepcnv"),
-            imfdeepcnv_samf=_int("imfdeepcnv_samf"),
-            imfdeepcnv_gf=_int("imfdeepcnv_gf"),
-            do_mynnedmf=_bool("do_mynnedmf"),
-            ltaerosol=_bool("ltaerosol"),
-            lgfdlmprad=_bool("lgfdlmprad"),
-            doGP_smearclds=_bool("doGP_smearclds"),
-            ico2=_int("ico2"),
-            iovr=_int("iovr"),
-            iovr_convcld=_int("iovr_convcld"),
-            idcor=_int("idcor"),
-            isubc_sw=_int("isubc_sw"),
-            isubc_lw=_int("isubc_lw"),
-            iaerflg=_int("iaerflg"),
-            swhtr=_bool("swhtr"),
-            lwhtr=_bool("lwhtr"),
-            doGP_lwscat=_bool("doGP_lwscat"),
-            nGauss_angles=_int("rrtmgp_nGauss_ang"),
-            nrghice=_int("rrtmgp_nrghice"),
-            tend_opt_lwrad=_int("tend_opt_lwrad"),
-            tend_opt_swrad=_int("tend_opt_swrad"),
-            lsswr=_bool("lsswr"),
-            lslwr=_bool("lslwr"),
-            fhswr=_float("fhswr"),
-            fhlwr=_float("fhlwr"),
-            dtp=_float("dtp"),
-            dtf=float(values.get("dtf", values["dtp"])),
-            solhr=_float("solhr"),
-            solcon=_float("solcon"),
-            jdat=jdat,
-            co2_year=idat[0],
-            co2_month=idat[1],
-            slag=None if values.get("slag") is None else float(values["slag"]),
-            sdec=None if values.get("sdec") is None else float(values["sdec"]),
-            cdec=None if values.get("cdec") is None else float(values["cdec"]),
-            rrtmgp_sw_phys_blksz=int(values.get("rrtmgp_sw_phys_blksz", 1)),
-            rrtmgp_lw_phys_blksz=int(values.get("rrtmgp_lw_phys_blksz", 1)),
-            use_LW_jacobian=bool(int(values.get("use_LW_jacobian", 0))),
-        )
-        integers = ('ialb', 'iems', 'lsm', 'lndp_type', 'kb', 'kd', 'kt', 'isol', 'iaermdl')
-        logicals = ('frac_grid', 'cplice', 'use_cice_alb', 'lssav')
-        reals = ('min_seaice', 'min_lakeice')
-        return replace(result, **{k: int(values[k]) for k in integers if k in values},
-                       **{k: bool(int(values[k])) for k in logicals if k in values},
-                       **{k: float(values[k]) for k in reals if k in values})
-
     def require_supported(self) -> None:
         """Fail closed outside the ported oracle configuration."""
 
@@ -378,7 +304,6 @@ class RadiationConfig:
 # Mersenne Twister (GFS ``Radiation/mersenne_twister.f``)
 # ---------------------------------------------------------------------------
 _MT_N = 624
-_MT_M = 397
 _MASK32 = 0xFFFFFFFF
 _MT_UPPER = 0x80000000
 _MT_LOWER = 0x7FFFFFFF
@@ -407,11 +332,22 @@ def _mulmod32(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return (a * lo + (((a * hi) & 0xFFFF) << 16)) & _MASK32
 
 
-def _mt_mix(cur: torch.Tensor, nxt: torch.Tensor) -> torch.Tensor:
-    """``(y >> 1) ^ mag01(y & 1)`` with ``y`` the upper bit of ``cur`` and the lower bits of ``nxt``."""
+# The generator state is held as int32 bit patterns of the unsigned words (half the bytes of int64): the twist has
+# only and/or/xor and right shifts, the latter made logical by masking off the sign extension. _unsigned widens.
+_MT_UPPER32 = _MT_UPPER - (1 << 32)
+_MT_MATA32 = _MT_MATA - (1 << 32)
 
-    y = (cur & _MT_UPPER) | (nxt & _MT_LOWER)
-    return (y >> 1) ^ ((y & 1) * _MT_MATA)
+
+def _unsigned(words: torch.Tensor) -> torch.Tensor:
+    """int32 bit patterns of unsigned 32-bit words as their int64 values."""
+    return words.to(torch.int64) & _MASK32
+
+
+def _mt_mix(cur: torch.Tensor, nxt: torch.Tensor) -> torch.Tensor:
+    """``(y >> 1) ^ mag01(y & 1)`` with ``y`` the upper bit of ``cur`` and the lower bits of ``nxt`` (int32 words)."""
+
+    y = (cur & _MT_UPPER32) | (nxt & _MT_LOWER)
+    return ((y >> 1) & _MT_LOWER) ^ ((y & 1) * _MT_MATA32)
 
 
 def _mt_twist(mt: torch.Tensor) -> torch.Tensor:
@@ -420,13 +356,20 @@ def _mt_twist(mt: torch.Tensor) -> torch.Tensor:
     ``mt(kk) = mt(kk+m) ^ mix(mt(kk), mt(kk+1))``: the mix terms of ``kk = 0 .. n-2`` read only the
     old state, so they are formed at once; the four XOR slices then follow the source order
     (``kk >= n-m`` reads new words). Integer XOR is exact, so the words equal the per-slice form.
+
+    The slices after the first read ``new0`` and the mix terms, not ``new1``: XOR is exact and associative, so
+    ``new0[:169] ^ mix[227:396]`` is ``new1[:169]``. Read by three slices, ``new1`` (five reads of ``mt``) was stored
+    by a kernel of its own and read back (Inductor's reuse rule; r8g frame 469, ``triton_poi_fused_bitwise_xor_0``,
+    5.5 ms per 60 km radiation step on the RTX PRO 6000, round 8); now each slice forms its words in the one kernel
+    that writes the state.
     """
 
     mix = _mt_mix(mt[:, 0:623], mt[:, 1:624])
     new0 = mt[:, 397:624] ^ mix[:, 0:227]  # kk = 0 .. n-m-1, old mt(kk+m)
     new1 = new0 ^ mix[:, 227:454]  # kk = 227 .. 453, new mt(kk-227)
-    new2 = new1[:, 0:169] ^ mix[:, 454:623]  # kk = 454 .. 622
-    new3 = new1[:, 169:170] ^ _mt_mix(mt[:, 623:624], new0[:, 0:1])  # kk = n-1, new mt(0), new mt(m-1)
+    new2 = new0[:, 0:169] ^ mix[:, 227:396] ^ mix[:, 454:623]  # kk = 454 .. 622: new1[:, 0:169] ^ mix
+    # kk = n-1: new mt(m-1) = new1[:, 169:170] and new mt(0)
+    new3 = new0[:, 169:170] ^ mix[:, 396:397] ^ _mt_mix(mt[:, 623:624], new0[:, 0:1])
     return torch.cat((new0, new1, new2, new3), dim=1)
 
 
@@ -437,12 +380,17 @@ def _mt_temper(y: torch.Tensor) -> torch.Tensor:
     return y ^ (y >> 18)
 
 
-def gfs_mersenne_twister_words(seeds: torch.Tensor, count: int) -> torch.Tensor:
-    """Unsigned source words in int64; keep the 69069 fill and seed-zero substitution."""
+def _mt_seed_state(seeds: torch.Tensor) -> torch.Tensor:
+    """The generator state of each seed (``random_setseed``: seed 0 is 4357, then the 69069 fill), int32 words."""
     seed = seeds.to(dtype=torch.int64).reshape(-1)
     seed = torch.where(seed == 0, torch.full_like(seed, _MT_DEFAULT_SEED), seed) & _MASK32
     powers = static_tensor(_MT_SEED_POWERS, dtype=torch.int64, device=seed.device)
-    state = _mulmod32(seed.unsqueeze(1), powers.unsqueeze(0))
+    return _mulmod32(seed.unsqueeze(1), powers.unsqueeze(0)).to(torch.int32)
+
+
+def gfs_mersenne_twister_words(seeds: torch.Tensor, count: int) -> torch.Tensor:
+    """The first ``count`` unsigned source words of each seed's stream, int64 ``[nseed, count]``."""
+    state = _mt_seed_state(seeds)
     # The twist is serial over blocks; tempering is word by word, so it runs once on the words read.
     blocks = []
     for _ in range((int(count) + _MT_N - 1) // _MT_N):
@@ -451,7 +399,7 @@ def gfs_mersenne_twister_words(seeds: torch.Tensor, count: int) -> torch.Tensor:
     del state
     words = torch.cat(blocks, dim=1)[:, : int(count)]
     del blocks
-    return _mt_temper(words)
+    return _mt_temper(_unsigned(words))
 
 
 def gfs_mersenne_twister_uniform(seeds: torch.Tensor, count: int) -> torch.Tensor:
@@ -459,26 +407,8 @@ def gfs_mersenne_twister_uniform(seeds: torch.Tensor, count: int) -> torch.Tenso
     return gfs_mersenne_twister_words(seeds, count).to(dtype=torch.float64) / _MT_DENOM
 
 
-def mcica_randoms_maxrand(seeds: torch.Tensor, *, ngpt: int, nlay: int) -> torch.Tensor:
-    """``rng3D(:,iLay,col)`` for ``iovr /= iovr_max``: one ``ngpt`` draw per layer, layer 1 first."""
-
-    stream = gfs_mersenne_twister_uniform(seeds, ngpt * nlay)
-    ncol = stream.shape[0]
-    return stream.reshape(ncol, nlay, ngpt).permute(2, 1, 0).contiguous()
-
-
-def _mcica_draws(seeds: torch.Tensor, *, ngpt: int, nlay: int, dtype: torch.dtype) -> torch.Tensor:
-    if dtype == torch.float64:
-        return mcica_randoms_maxrand(seeds, ngpt=ngpt, nlay=nlay)
-    if dtype != torch.float32:
-        raise TypeError("McICA physical thresholds must be FP32 or FP64")
-    words = gfs_mersenne_twister_words(seeds, ngpt * nlay)
-    return words.reshape(-1, nlay, ngpt).permute(2, 1, 0).contiguous()
-
-
-def _uniform_greater(draws: torch.Tensor, threshold: torch.Tensor) -> torch.Tensor:
-    if draws.dtype != torch.int64:
-        return draws > threshold
+def _uniform_cut(threshold: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """The threshold side of ``u > t`` for integer words (``_greater_than_cut``): ``(cutoff, negative, below_one)``."""
     if threshold.dtype != torch.float32:
         raise TypeError("integer McICA predicates require FP32 thresholds")
     # floor(t*(2**32-1)) without rounding the uniforms or using device FP64.
@@ -495,67 +425,167 @@ def _uniform_greater(draws: torch.Tensor, threshold: torch.Tensor) -> torch.Tens
     # exclude -0 explicitly. The final comparison still excludes either NaN.
     bits = threshold.view(torch.int32)
     negative = (bits < 0) & (bits != -2147483648)
-    return ((draws > cutoff) | negative) & (threshold < 1.0)
+    return cutoff, negative, threshold < 1.0
 
 
-def _uniform_less_equal(draws: torch.Tensor, threshold: torch.Tensor) -> torch.Tensor:
+def _greater_than_cut(draws: torch.Tensor, cut: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """``draws > threshold`` for source uniforms (``cut = (threshold,)``) or integer words (``cut = _uniform_cut``)."""
     if draws.dtype != torch.int64:
-        return draws <= threshold
-    return ~_uniform_greater(draws, threshold) & ~torch.isnan(threshold)
+        return draws > cut[0]
+    cutoff, negative, below_one = cut
+    return ((draws > cutoff) | negative) & below_one
 
 
-def sampled_mask_maxrand(randoms: torch.Tensor, cld_frac: torch.Tensor) -> torch.Tensor:
-    """``rrtmgp_sampling::sampled_mask`` without overlap parameter (maximum-random)."""
+def _less_equal_cut(draws: torch.Tensor, cut: tuple[torch.Tensor, ...], nan: torch.Tensor) -> torch.Tensor:
+    """``draws <= threshold`` for source uniforms (``cut = (threshold,)``) or integer words (``cut = _uniform_cut``;
+    ``nan``: where the threshold is NaN, which no draw is at or below)."""
+    if draws.dtype != torch.int64:
+        return draws <= cut[0]
+    return ~_greater_than_cut(draws, cut) & ~nan
 
+
+def _mcica_cuts(cld_frac, overlap_param, *, iovr: int, integer: bool, column_cloudy=None):
+    """Per-layer operands of the mask predicates, every layer at once (``[nlay, ncol]`` each): the cut of the
+    threshold ``1 - cld_frac``, and per overlap rule its layer flags (maximum-random: where a cloudy run opens, layer
+    0 set so that its own draw is carried; decorrelation: the cut of the bound ``overlap(l-1)``, its NaN flag, the
+    first-cloudy-layer and in-run flags). ``column_cloudy`` (``[ncol]``): the flags that set mask elements also
+    require it (``mcica_cloud_mask``)."""
     nlay = cld_frac.shape[0]
+    threshold = 1.0 - cld_frac
+    cut = _uniform_cut(threshold) if integer else (threshold,)
     cloudy = cld_frac > 0.0
-    layer = torch.arange(nlay, device=cld_frac.device).unsqueeze(1)
-    previous = (layer[:, 0] - 1).clamp_min(0)
-    reset = cloudy & ~cloudy.index_select(0, previous)
-    # A cloudy run keeps its first layer's draw. Before the first run the
-    # source keeps layer zero's draw, so zero also initializes the prefix.
-    owner = torch.cummax(torch.where(reset, layer, torch.zeros_like(layer)), dim=0).values
-    local = randoms.gather(1, owner.unsqueeze(0).expand(randoms.shape[0], -1, -1))
-    return cloudy.unsqueeze(0) & _uniform_greater(local, (1.0 - cld_frac).unsqueeze(0))
-
-
-def sampled_mask_dcorr(randoms: torch.Tensor, cld_frac: torch.Tensor, overlap_param: torch.Tensor) -> torch.Tensor:
-    """``rrtmgp_sampling::sampled_mask`` with ``overlap_param`` and ``randoms2`` (``iovr_dcorr``).
-
-    The mains draw ``randoms2`` by reseeding with the same seed and taking ``ngpt*nlay`` numbers
-    in one call; the generator stream is the same as the per-layer draws of ``randoms``, so
-    ``randoms2 == randoms``. In the source the last block overrides the second for every layer
-    after the first cloudy one: layer ``l`` (first < l <= last cloudy layer) is cloudy where
-    ``r(l-1) > 1 - cf(l)`` if ``r(l) <= overlap(l-1)``, else where ``r(l) > 1 - cf(l)``; the first
-    cloudy layer uses its own draw; layers outside are clear.
-    """
-
-    nlay = cld_frac.shape[0]
-    cloudy = cld_frac > 0.0
-    layer = torch.arange(nlay, device=cld_frac.device).unsqueeze(1)
+    level = torch.arange(nlay, device=cld_frac.device).unsqueeze(1)
+    previous = (level[:, 0] - 1).clamp_min(0)
+    keep = (lambda flags: flags) if column_cloudy is None else (lambda flags: flags & column_cloudy.unsqueeze(0))
+    if iovr != 3:
+        reset = (cloudy & ~cloudy.index_select(0, previous)) | (level == 0)
+        return cut, (keep(cloudy), reset)
+    bound = overlap_param.index_select(0, previous)
+    bound_cut = _uniform_cut(bound) if integer else (bound,)
     first = torch.argmax(cloudy.to(torch.int8), dim=0).unsqueeze(0)
     last = (nlay - 1 - torch.argmax(cloudy.flip(0).to(torch.int8), dim=0)).unsqueeze(0)
-    threshold = (1.0 - cld_frac).unsqueeze(0)
-    own = _uniform_greater(randoms, threshold)
-    previous = (layer[:, 0] - 1).clamp_min(0)
-    below = _uniform_greater(randoms.index_select(1, previous), threshold)
-    use_below = _uniform_less_equal(randoms, overlap_param.index_select(0, previous).unsqueeze(0))
+    at_first = keep((level == first) & cloudy.any(0))
+    between = keep((level > first) & (level <= last) & cloudy.any(0))
+    return cut, (bound_cut, torch.isnan(bound), at_first, between)
+
+
+def _joined_words(words):
+    """A layer's ``[ncol, ngpt]`` words, given whole or as the pieces of the two twist blocks it spans
+    (``mcica_cloud_mask``), joined where the layer region reads them."""
+    return torch.cat(words, dim=1) if isinstance(words, tuple) else words
+
+
+def _mcica_layer_maxrand(draws, local, cut, cloudy, reset):
+    """One layer of the maximum-random mask, ``[ncol, ngpt]`` words (int32 bit patterns of the generator state,
+    tempered here, or FP64 uniforms; ``_joined_words``): the draw that opened the cloudy run is carried."""
+    draws, local = _joined_words(draws), _joined_words(local)
+    local = torch.where(reset.unsqueeze(1), draws, local)
+    values = _mt_temper(_unsigned(local)) if local.dtype == torch.int32 else local
+    cut = tuple(x.unsqueeze(1) for x in cut)
+    return (cloudy.unsqueeze(1) & _greater_than_cut(values, cut)).t().contiguous(), local
+
+
+def _mcica_layer_dcorr(draws, above, cut, bound_cut, bound_nan, at_first, between):
+    """One layer of the decorrelation-length mask (``rrtmgp_sampling::sampled_mask`` with ``overlap_param``),
+    ``[ncol, ngpt]`` words of this layer (``draws``) and of the layer above (``above``): int32 bit patterns of the
+    generator state, tempered here, or FP64 uniforms (``_joined_words``)."""
+    draws, above = _joined_words(draws), _joined_words(above)
+    if draws.dtype == torch.int32:
+        draws, above = _mt_temper(_unsigned(draws)), _mt_temper(_unsigned(above))
+    cut = tuple(x.unsqueeze(1) for x in cut)
+    own = _greater_than_cut(draws, cut)
+    below = _greater_than_cut(above, cut)
+    use_below = _less_equal_cut(draws, tuple(x.unsqueeze(1) for x in bound_cut), bound_nan.unsqueeze(1))
     inner = torch.where(use_below, below, own)
-    at_first = (layer == first).unsqueeze(0) & own
-    between = ((layer > first) & (layer <= last)).unsqueeze(0) & inner
-    return (at_first | between) & cloudy.any(0).reshape(1, 1, -1)
+    return ((at_first.unsqueeze(1) & own) | (between.unsqueeze(1) & inner)).t().contiguous()
 
 
-def sampled_mask(randoms: torch.Tensor, cld_frac: torch.Tensor, config: RadiationConfig,
-                 overlap_param: torch.Tensor | None) -> torch.Tensor:
-    if config.iovr == 3:
-        return sampled_mask_dcorr(randoms, cld_frac, overlap_param)
-    return sampled_mask_maxrand(randoms, cld_frac)
+def mcica_cloud_mask(seeds: torch.Tensor, cld_frac: torch.Tensor, overlap_param: torch.Tensor | None, *, ngpt: int,
+                     iovr: int, region=None, column_cloudy: torch.Tensor | None = None) -> torch.Tensor:
+    """McICA cloud mask ``[ngpt, nlay, ncol]`` (``sampled_mask`` of the draws) without the draws of the whole column.
+
+    The source draws ``ngpt * nlay`` numbers per column from its Mersenne Twister, layer by layer (``rng3D(:, iLay,
+    col)``), and compares them with the layer's cloud fraction. Here the generator is twisted one block at a time and
+    each layer's ``ngpt`` words are compared as soon as they exist; the overlap rules need only the layer above
+    (decorrelation: ``r(l-1)``; maximum-random: the draw that opened the current cloudy run, carried). The same words
+    and the same predicates give the same mask bit for bit. No word array of the column exists (``ngpt * nlay``
+    int64 per column, 9 GB at 60 km for LW), and with ``region`` the twist and each layer are their own regions, so
+    spent twist blocks are released (one region over all layers kept every block until its last kernel: 1.1 GiB at
+    x1.10242, round 7). FP32 compares the integer words, FP64 the source uniforms (words / (2**32 - 1)). Tempering
+    is word by word, so FP32 tempers each layer's words in its layer region, as it reads them: the twist region writes
+    the state only (writing the tempered block as well cost 409 MB per LW twist at 60 km, round 8).
+    ``column_cloudy`` (``[ncol]``): the mask ANDed with it, as each layer is formed (an AND of the whole mask
+    afterwards read and wrote it again: 3.2 ms per 60 km radiation step on the RTX PRO 6000, LW and SW, round 8).
+    """
+    nlay, ncol = cld_frac.shape
+    if cld_frac.dtype not in (torch.float32, torch.float64):
+        raise TypeError("McICA physical thresholds must be FP32 or FP64")
+    integer = cld_frac.dtype == torch.float32
+    call = (lambda fn: fn) if region is None else region
+    state = call(_mt_seed_state)(seeds)
+    cut, flags = call(_mcica_cuts)(cld_frac, overlap_param, iovr=iovr, integer=integer, column_cloudy=column_cloudy)
+    made, blocks = 0, {}  # twisted blocks made so far; the ones still to be read, by index
+
+    def layer_draws(lay):
+        nonlocal state, made
+        start, stop = lay * ngpt, (lay + 1) * ngpt  # the layer's words in the column's stream
+        while made * _MT_N < stop:
+            state = blocks[made] = call(_mt_twist)(state)
+            made += 1
+        last = (stop - 1) // _MT_N
+        pieces = [blocks[b][:, max(start - b * _MT_N, 0):stop - b * _MT_N] for b in range(start // _MT_N, last + 1)]
+        for b in [b for b in blocks if b < last]:
+            del blocks[b]
+        if len(pieces) == 1:
+            words = pieces[0]  # [ncol, ngpt] int32 state words
+        elif integer:
+            # A layer spanning two twist blocks: its layer region joins the two pieces as it reads them (an eager
+            # join wrote and read the layer's words again: 18 CatArrayBatchedCopy kernels, 1.93 ms per 60 km
+            # radiation step on the RTX PRO 6000, LW and SW, round 8 w3t).
+            return tuple(pieces)
+        else:
+            words = torch.cat(pieces, dim=1)
+        return words if integer else _mt_temper(_unsigned(words)).to(dtype=torch.float64) / _MT_DENOM
+
+    rows = []
+    if iovr == 3:  # the decorrelation-length overlap (rrtmgp_sampling::sampled_mask with overlap_param)
+        bound_cut, bound_nan, at_first, between = flags
+        above = None
+        for lay in range(nlay):
+            draws = layer_draws(lay)
+            rows.append(call(_mcica_layer_dcorr)(draws, draws if above is None else above, tuple(x[lay] for x in cut),
+                                                 tuple(x[lay] for x in bound_cut), bound_nan[lay], at_first[lay],
+                                                 between[lay]))
+            above = draws
+    else:  # maximum-random (sampled_mask without overlap_param)
+        cloudy, reset = flags
+        local = None
+        for lay in range(nlay):
+            draws = layer_draws(lay)
+            row, local = call(_mcica_layer_maxrand)(draws, draws if local is None else local,
+                                                    tuple(x[lay] for x in cut), cloudy[lay], reset[lay])
+            rows.append(row)
+    return torch.stack(rows, dim=1)
 
 
 # ---------------------------------------------------------------------------
 # small shared helpers
 # ---------------------------------------------------------------------------
+def _level_major_bands(values: torch.Tensor) -> torch.Tensor:
+    """A band array computed as ``[nlay, nband, ncol]`` (``band_axis=1`` of its producer), written level-major and
+    returned as its transposed view ``[nband, nlay, ncol]``: the band solves read its band rows column-innermost, and
+    the compiled producer reads each layer's rows once for all bands. Computed band-major and transposed here, the
+    producer's kernel ran band-outermost and read its per-layer inputs once per band from memory (r8g: LW cloud band
+    optics 6.96 ms and a transposing copy 0.78 ms, LW aerosol 7.45 ms per 60 km radiation step, against 1.77 ms for
+    the cloud kernel that read them once; round 8)."""
+    return values.contiguous().transpose(0, 1)
+
+
+def _column_innermost(values: torch.Tensor) -> torch.Tensor:
+    """``values``, copied contiguous unless its column (last) axis already has unit stride."""
+    return values if values.stride(-1) == 1 else values.contiguous()
+
+
 def _band_to_gpt(values: torch.Tensor, gpt_to_band: torch.Tensor) -> torch.Tensor:
     return values.index_select(0, gpt_to_band.to(device=values.device, dtype=torch.int64))
 
@@ -632,6 +662,15 @@ def table_metadata(bundle: RrtmgpTableBundle) -> dict[str, Any]:
         "sw_band_lims_gpt": [tuple(int(v) for v in row) for row in host(sw_gas_table.band_lims_gpt)],
         "lw_band_lims_gpt": [tuple(int(v) for v in row) for row in host(lw_gas_table.band_lims_gpt)],
     }
+    # Each band's g-points share one (lower, upper) flavor pair: (first g-point, end, lower, upper),
+    # 0-based, covering every g-point in order (the banded LW major interpolation).
+    lw_flavor = host(lw_gas_table.gpoint_flavor)
+    bands = tuple((lo - 1, hi, int(lw_flavor[0][lo - 1]), int(lw_flavor[1][lo - 1]))
+                  for lo, hi in meta["lw_band_lims_gpt"])
+    if ([b[0] for b in bands] != [0] + [b[1] for b in bands[:-1]] or bands[-1][1] != len(lw_flavor[0])
+            or any(lw_flavor[i][g] != b[2 + i] for b in bands for g in range(b[0], b[1]) for i in range(2))):
+        raise ValueError("LW g-points do not form contiguous bands of one flavor pair")
+    meta["lw_band_flavors"] = bands
 
     # The callback runs while the bundle is freed, before its id can go to another object.
     _TABLE_METADATA_CACHE[key] = (weakref.ref(bundle, lambda _: _TABLE_METADATA_CACHE.pop(key, None)), meta)
@@ -779,7 +818,7 @@ def _data_year_index(config: RadiationConfig, nyear: int, device) -> tuple[torch
     jdat = config.jdat if isinstance(config.jdat, torch.Tensor) else torch.tensor(config.jdat, device=device)
     date = jdat.to(device=device, dtype=torch.int64)
     index = date[0] - config.data_year0
-    torch._assert_async((index >= 0) & (index < nyear), "radiation date outside the prepared data years")
+    torch_compat.assert_async((index >= 0) & (index < nyear), "radiation date outside the prepared data years")
     return index, date[1]
 
 
@@ -805,7 +844,7 @@ def _co2_from_tables(p_lev: torch.Tensor, xlon: torch.Tensor, xlat: torch.Tensor
     ilat = torch.clamp(torch.trunc(xlat1 * tmp + 1).to(torch.int64), 1, 12)
     flat = (month - 1) * 288 + (ilat - 1) * 24 + (ilon - 1)
     # The clamp keeps ilon/ilat in range; the check still catches a month outside 1..12.
-    torch._assert_async((flat >= 0).all() & (flat < 12 * 288).all(), "CO2 table index outside the source array")
+    torch_compat.assert_async((flat >= 0).all() & (flat < 12 * 288).all(), "CO2 table index outside the source array")
     column = monthly.index_select(0, year.reshape(1))[0].reshape(-1)[flat]
     upper = (p_lev / 100.0)[1:] >= 788.0
     return torch.where(upper, column.unsqueeze(0), (glb.index_select(0, year.reshape(1))[0] + 0.0).expand_as(column).unsqueeze(0))
@@ -866,15 +905,19 @@ def cld_frac_xu_randall(
     cond_cfrac_on_rh: bool,
     lam: float = 0.5,
     factor: float = 1.0,
+    alpha_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``module_radiation_clouds::cld_frac_XuRandall`` (p in hPa)."""
+    """``module_radiation_clouds::cld_frac_XuRandall`` (p in hPa).
+
+    ``alpha_scale`` (a 0-d tensor; None: no op) multiplies ``alpha`` (the trainable ``rad.alpha0`` scale).
+    """
 
     clwt = 1.0e-6 * (p_lay_hpa * 0.001)
     clwm = clwt * factor
     onemrh = torch.clamp_min(1.0 - relhum, 1.0e-10)
     # A real Fortran exponent uses pow, not the scalar-exponent sqrt shortcut.
     power = torch.pow(onemrh * qs_lay, torch.full_like(qs_lay, lam))
-    tem1 = torch.div(alpha, torch.clamp(power, min=0.0001, max=1.0))
+    tem1 = torch.div(alpha if alpha_scale is None else alpha * alpha_scale, torch.clamp(power, min=0.0001, max=1.0))
     tem2 = torch.clamp(tem1 * (cld_mr - clwm), min=0.0, max=50.0)
     tem3 = torch.sqrt(torch.sqrt(relhum))
     frac = torch.clamp_min(tem3 * (1.0 - torch.exp(-tem2)), 0.0)
@@ -893,11 +936,15 @@ def cmp_reff_tempo(
     qs: torch.Tensor,
     ni: torch.Tensor,
     lsmask: torch.Tensor,
+    nt_c_land_scale: torch.Tensor | None = None,
+    nt_c_ocean_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``GFS_rrtmgp_cloud_mp::cmp_reff_TEMPO`` for ``ltaerosol=F`` (microns).
 
     Uses the TEMPO port's ``*_check_and_update`` and ``effective_radius``
     kernels; requires the CCPP host-constant profile of the TEMPO port.
+    ``nt_c_land_scale`` and ``nt_c_ocean_scale`` (0-d tensors; None: no op) multiply the constant cloud
+    number of the land rows (``Nt_c_l``) and of the other rows (``Nt_c_o``); ``nu_c`` follows the scaled number.
     """
 
     tempo_mp_tempo.require_host_constants(False)
@@ -913,6 +960,11 @@ def cmp_reff_tempo(
     zeros = torch.zeros_like(rho_c)
     land = torch.round(lsmask).to(dtype=torch.int64)
     ncsave = tempo_native.get_constant_cloud_number(shape=tuple(rho_c.shape), reference=rho_c, land=land)
+    if nt_c_land_scale is not None or nt_c_ocean_scale is not None:
+        one = torch.ones((), dtype=rho_c.dtype, device=rho_c.device)
+        # The rows of get_constant_cloud_number: land == 1 takes Nt_c_l, every other row Nt_c_o.
+        ncsave = ncsave * torch.where(land[:, None] == 1, one if nt_c_land_scale is None else nt_c_land_scale,
+                                      one if nt_c_ocean_scale is None else nt_c_ocean_scale)
     cloud = tempo_native.cloud_check_and_update(
         rho=rho_c, qc1d=qc1d, nc=zeros, qcten=zeros, ncten=zeros, dt=1.0, odt=1.0, ncsave=ncsave
     )
@@ -944,13 +996,20 @@ def run_rrtmgp_cloud_mp(
     config: RadiationConfig,
     *,
     tables: RrtmgpTableBundle,
+    scales: Mapping[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Port ``GFS_rrtmgp_cloud_mp_run`` for the Thompson/TEMPO microphysics branch.
 
     ``imp_physics`` other than Thompson (8), GFDL (11) or TEMPO (88) is the
     oracle's ``else`` error; GFDL and Thompson are not ported in this lineage
     (Thompson needs ``cmp_reff_Thompson``) and raise as well.
+
+    ``scales`` holds trainable 0-d tensor scales by name (an absent name is no op): ``reliq_conv`` and
+    ``reice_conv`` multiply the SAMF cloud radii ``RELIQ_DEF`` and ``REICE_DEF``, ``alpha0`` the grid-scale
+    Xu-Randall ``alpha0`` (not the SAMF one, whose cloud fraction is output only), and ``nt_c_land`` and
+    ``nt_c_ocean`` the TEMPO cloud numbers of ``cmp_reff_tempo``.
     """
+    scales = scales or {}
 
     if config.imp_physics not in (IMP_PHYSICS_THOMPSON, IMP_PHYSICS_GFDL, IMP_PHYSICS_TEMPO):
         raise RadiationConfigError("ERROR: GFS_rrtmgp_cloud_mp has no cloud coupling for this MP choice")
@@ -981,8 +1040,14 @@ def run_rrtmgp_cloud_mp(
     cnv_frac = cld_frac_xu_randall(p_hpa, qs_lay, relhum, cnvw, 200.0, cond_cfrac_on_rh=False)
     cld_cnv_lwp = torch.where(cnv_active, cnv_lwp, state["cld_cnv_lwp_prev"])
     cld_cnv_iwp = torch.where(cnv_active, cnv_iwp, state["cld_cnv_iwp_prev"])
-    cld_cnv_reliq = torch.where(cnv_active, torch.full_like(cnvw, RELIQ_DEF), state["cld_cnv_reliq_prev"])
-    cld_cnv_reice = torch.where(cnv_active, torch.full_like(cnvw, REICE_DEF), state["cld_cnv_reice_prev"])
+    cnv_reliq = torch.full_like(cnvw, RELIQ_DEF)
+    cnv_reice = torch.full_like(cnvw, REICE_DEF)
+    if "reliq_conv" in scales:
+        cnv_reliq = cnv_reliq * scales["reliq_conv"]
+    if "reice_conv" in scales:
+        cnv_reice = cnv_reice * scales["reice_conv"]
+    cld_cnv_reliq = torch.where(cnv_active, cnv_reliq, state["cld_cnv_reliq_prev"])
+    cld_cnv_reice = torch.where(cnv_active, cnv_reice, state["cld_cnv_reice_prev"])
     cld_cnv_frac = torch.where(cnv_active, cnv_frac, state["cld_cnv_frac_prev"])
 
     # cmp_reff_TEMPO
@@ -995,6 +1060,8 @@ def run_rrtmgp_cloud_mp(
         qs=_tracer(gq0, config.ntsw),
         ni=_tracer(gq0, config.ntinc),
         lsmask=state["slmsk"],
+        nt_c_land_scale=scales["nt_c_land"] if "nt_c_land" in scales else None,
+        nt_c_ocean_scale=scales["nt_c_ocean"] if "nt_c_ocean" in scales else None,
     )
 
     # cloud_mp_thompson (alpha0 = 100, or 200 with lmfdeep2; cond_cfrac_onRH present)
@@ -1010,7 +1077,8 @@ def run_rrtmgp_cloud_mp(
     rwp = torch.clamp_min(qr * tem0 * delta_p_hpa, 0.0)
     swp = torch.clamp_min(qsn * tem0 * delta_p_hpa, 0.0)
     cld_mr = qc + qi + qr + qsn
-    frac = cld_frac_xu_randall(p_hpa, qs_lay, relhum, cld_mr, alpha0, cond_cfrac_on_rh=True)
+    frac = cld_frac_xu_randall(p_hpa, qs_lay, relhum, cld_mr, alpha0, cond_cfrac_on_rh=True,
+                               alpha_scale=scales["alpha0"] if "alpha0" in scales else None)
     top = (torch.arange(nlay, device=p_lay.device) == nlay - 1).unsqueeze(1)  # no host scalar write (graph capture)
     zero = torch.zeros_like(lwp)
     cld_lwp = torch.where(top, zero, lwp)
@@ -1113,13 +1181,17 @@ def run_rrtmgp_cloud_overlap(
     config: RadiationConfig,
     *,
     pre: Mapping[str, torch.Tensor] | None = None,
+    decorr_scale: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """``GFS_rrtmgp_cloud_overlap_run`` (Hogan length; ``iovr`` 1 or 3, convective maximum-random).
 
     For ``iovr = iovr_dcorr`` (3), ``get_alpha_exper``: layer 1 (surface) 0, above it
     ``exp(-(deltaZc*0.001)/de_lgth)``; the precipitation parameter is the same array.
+    ``decorr_scale`` (a 0-d tensor; None: no op) multiplies the Hogan length after its 0.6 km floor.
     """
     de_lgth = compute_hogan_decorrelation_length(state["xlat"], torch.full((), CON_PI, dtype=state["xlat"].dtype, device=state["xlat"].device))
+    if decorr_scale is not None:
+        de_lgth = de_lgth * decorr_scale
     zeros = torch.zeros_like(cloud["cld_frac"])
     overlap = zeros
     if config.iovr == 3:
@@ -1183,12 +1255,12 @@ def _longwave_planck_byband_tensor(totplnk, temp_ref, tlay, tlev, tsfc):
     return sfc, lay, lev
 
 
-def _prepare_longwave_gas_v17(table, pre, *, coordinates=None, region=None):
+def _prepare_longwave_gas_v17(table, pre, *, coordinates=None, region=None, major_weights=True):
     """Live call-local preparation shared by spectral consumers, never a state cache."""
     call = (lambda fn: fn) if region is None else region
     col_gas = call(_longwave_gas_columns_tensor)(pre, table.gas_names)
     plan = call(_build_interpolation_plan)(table, play=pre["p_lay"], tlay=pre["t_lay"],
-                                          col_gas=col_gas, coordinates=coordinates)
+                                          col_gas=col_gas, coordinates=coordinates, major_weights=major_weights)
     planck = call(_longwave_planck_byband_tensor)(
         table.totplnk, table.temp_ref, pre["t_lay"], pre["t_lev"], pre["tsfg"])
     return _LongwaveGasPreparation(col_gas, plan, planck)
@@ -1213,8 +1285,15 @@ def _longwave_spectral_view(table, gpt_range):
 
 
 def _longwave_absorption_v17(table: ReducedGasOpticsTable, pre: Mapping[str, torch.Tensor],
-                             *, coordinates=None, preparation=None, gpt_range=None) -> tuple[torch.Tensor, torch.Tensor]:
+                             *, coordinates=None, preparation=None, gpt_range=None,
+                             band_flavors=None, inference=False) -> tuple[torch.Tensor, torch.Tensor]:
+    """LW absorption optical depth (major plus minor gases, floored at 0) and Planck fraction by g-point.
+
+    A preparation without major weights (``fmajor``: the inference plan) is interpolated level-major when this
+    region is compiled, and band by band in eager (``_interp3d_lw_major_planck``); the minor gases then update the
+    absorption in that layout. ``inference``: no derivative is formed (``_derivative_free``)."""
     play, tlay, plev = pre["p_lay"], pre["t_lay"], pre["p_lev"]
+    level_major = False
     if preparation is None:
         vmr = _vmr_stack(pre, table.gas_names)
         col_dry = _col_dry_v17(plev, pre["vmr_h2o"])
@@ -1225,13 +1304,17 @@ def _longwave_absorption_v17(table: ReducedGasOpticsTable, pre: Mapping[str, tor
     else:
         col_gas = preparation.col_gas
         plan = replace(preparation.plan, flavor=table.gpoint_flavor.to(device=play.device, dtype=torch.int64))
-        tau, pfrac = _interp3d_lw_major_planck(table, plan, gpt_range=gpt_range)
+        level_major = plan.fmajor is None and torch.compiler.is_compiling()
+        tau, pfrac = _interp3d_lw_major_planck(table, plan, gpt_range=gpt_range, band_flavors=band_flavors,
+                                               fpress=None if coordinates is None else coordinates[4],
+                                               level_major=level_major, inference=inference)
+    # clamp_min(tau, 0) inside the join: one spectral array fewer in the compiled region, in place in eager
     tau = _accumulate_minor_tau(
         table, plan, play=play, tlay=tlay, col_gas=col_gas, dtype=tau.dtype, device=tau.device,
-        initial_tau=tau,
+        initial_tau=tau, floor=0.0, level_major=level_major, inference=inference,
     )
     del plan, col_gas
-    return torch.clamp_min(tau, 0.0), pfrac
+    return tau, pfrac
 
 
 def _longwave_sources_tensor(pfrac, totplnk, temp_ref, bands, tlay, tlev, tsfc, *, planck_by_band=None):
@@ -1255,27 +1338,42 @@ def _longwave_sources_tensor(pfrac, totplnk, temp_ref, bands, tlay, tlev, tsfc, 
     return {"lay_source": lay_source, "lev_source": lev_source, "sfc_source": sfc_source}
 
 
+def _longwave_surface_source(pfrac_sfc, bands, sfc_planck):
+    """``sfc_source`` of ``_longwave_sources_tensor`` from its operands only: the surface layer's Planck fraction
+    (``pfrac[:, 0, :]``) and the surface table (``planck_by_band[0]``). A compiled region's layout normalization
+    copies a strided view it is passed: it copied the layer and level tables this does not read (1.6 ms per 60 km
+    radiation step on the RTX PRO 6000, round 8)."""
+    return pfrac_sfc * sfc_planck.index_select(1, bands).transpose(0, 1)
+
+
 def longwave_gas_optics_v17(table: ReducedGasOpticsTable, pre: Mapping[str, torch.Tensor],
-                          *, coordinates=None, region=None, preparation=None, gpt_range=None) -> dict[str, torch.Tensor]:
+                          *, coordinates=None, region=None, preparation=None, gpt_range=None,
+                          sources=True, band_flavors=None, inference=False) -> dict[str, torch.Tensor]:
+    """Gas optical depth ``tau`` and the layer, level and surface Planck sources by g-point.
+
+    ``sources=False`` (needs ``preparation``) returns the Planck fraction ``pfrac`` and the surface source instead
+    of the layer and level sources: the banded all-sky solve forms those per band from ``pfrac`` and the band Planck
+    tables. ``band_flavors``: each band's g-points and flavor pair (``table_metadata``), for the banded eager
+    interpolation of an inference preparation; ``inference``: no derivative is formed (``_derivative_free``)."""
+    if not sources and preparation is None:
+        raise ValueError("sources=False returns the Planck fraction of a preparation: pass preparation")
     call = (lambda fn: fn) if region is None else region
     if gpt_range is not None:
         if preparation is None:
             preparation = _prepare_longwave_gas_v17(table, pre, coordinates=coordinates, region=region)
         table = _longwave_spectral_view(table, gpt_range)
     # Finish pfrac before Planck sources: otherwise fusion retains two full partial sums.
-    if preparation is None:
-        tau, pfrac = call(_longwave_absorption_v17)(table, pre, coordinates=coordinates)
-    else:
-        tau, pfrac = call(_longwave_absorption_v17)(table, pre, coordinates=coordinates,
-                                                  preparation=preparation, gpt_range=gpt_range)
-    bands = table.gpt_to_band.to(device=tau.device, dtype=torch.int64)
-    if preparation is not None:
-        return {"tau": tau, **call(_longwave_sources_tensor)(
-            pfrac, table.totplnk, table.temp_ref, bands, pre["t_lay"], pre["t_lev"], pre["tsfg"],
-            planck_by_band=preparation.planck_by_band)}
-    sources = call(_longwave_sources_tensor)(
-        pfrac, table.totplnk, table.temp_ref, bands, pre["t_lay"], pre["t_lev"], pre["tsfg"])
-    return {"tau": tau, **sources}
+    tau, pfrac = call(_longwave_absorption_v17)(table, pre, coordinates=coordinates, preparation=preparation,
+                                              gpt_range=gpt_range, band_flavors=band_flavors, inference=inference)
+    gpt_bands = table.gpt_to_band.to(device=tau.device, dtype=torch.int64)
+    if not sources:
+        return {"tau": tau, "pfrac": pfrac,
+                "sfc_source": call(_longwave_surface_source)(pfrac[:, 0, :], gpt_bands,
+                                                                  preparation.planck_by_band[0])}
+    planck_by_band = None if preparation is None else preparation.planck_by_band
+    return {"tau": tau, **call(_longwave_sources_tensor)(
+        pfrac, table.totplnk, table.temp_ref, gpt_bands, pre["t_lay"], pre["t_lev"], pre["tsfg"],
+        planck_by_band=planck_by_band)}
 
 
 @dataclass(frozen=True)
@@ -1290,17 +1388,22 @@ def _shortwave_gas_columns_tensor(pre, gas_names):
     return _vmr_stack(pre, gas_names) * col_dry.unsqueeze(0), col_dry
 
 
-def _prepare_shortwave_gas_v17(table, pre, *, coordinates=None, region=None):
+def _prepare_shortwave_gas_v17(table, pre, *, coordinates=None, region=None, major_weights=True):
     call = (lambda fn: fn) if region is None else region
     col_gas, col_dry = call(_shortwave_gas_columns_tensor)(pre, table.gas_names)
     plan = call(_build_interpolation_plan)(table, play=pre["p_lay"], tlay=pre["t_lay"],
-                                          col_gas=col_gas, coordinates=coordinates)
+                                          col_gas=col_gas, coordinates=coordinates, major_weights=major_weights)
     return _ShortwaveGasPreparation(col_gas, col_dry, plan)
 
 
 def shortwave_gas_optics_v17(table: ReducedGasOpticsTable, pre: Mapping[str, torch.Tensor],
-                           *, coordinates=None, preparation=None) -> dict[str, torch.Tensor]:
+                           *, coordinates=None, preparation=None, level_major=False,
+                           inference=False) -> dict[str, torch.Tensor]:
     """SW gas and Rayleigh optics (``g`` zero).
+
+    ``level_major`` (an inference preparation, no ``fmajor``, in a compiled region): the spectra are computed in
+    level-major buffers and returned as ``[ngpt, nlay, ncol]`` transposed views. ``inference``: no derivative is
+    formed (``_derivative_free``).
 
     The zero fields here, of the McICA cloud fields and of ``tau_safe`` stay full ``zeros_like`` /
     ``ones_like`` tensors: with scalar or broadcast zeros the whole-group compiled VJP missed eager
@@ -1311,21 +1414,27 @@ def shortwave_gas_optics_v17(table: ReducedGasOpticsTable, pre: Mapping[str, tor
     """
     play, tlay = pre["p_lay"], pre["t_lay"]
     if preparation is None:
+        if level_major:
+            raise ValueError("level_major needs an inference preparation")
         col_gas, col_dry = _shortwave_gas_columns_tensor(pre, table.gas_names)
         plan, tau_abs, _, _ = _build_plan_and_major(table, play=play, tlay=tlay, col_gas=col_gas,
                                                     longwave=False, coordinates=coordinates)
     else:
         col_gas, col_dry, plan = preparation.col_gas, preparation.col_dry, preparation.plan
-        tau_abs = _interp3d_all_gpoints(table.kmajor, table, plan, scale_by_col_mix=True)
+        tau_abs = _interp3d_all_gpoints(table.kmajor, table, plan, scale_by_col_mix=True,
+                                        fpress=None if coordinates is None else coordinates[4],
+                                        level_major=level_major, inference=inference)
     tau_abs = _accumulate_minor_tau(
         table, plan, play=play, tlay=tlay, col_gas=col_gas, dtype=tau_abs.dtype, device=tau_abs.device,
-        initial_tau=tau_abs,
+        initial_tau=tau_abs, level_major=level_major, inference=inference,
     )
     _, _, tau, ssa, _ = _rayleigh_and_finalize_shortwave(
         table,
         plan,
         tau_abs=tau_abs,
         moist_plus_dry_column=col_gas[1] + col_dry,
+        level_major=level_major,
+        inference=inference,
     )
     return {"tau": tau, "ssa": ssa, "g": torch.zeros_like(tau)}
 
@@ -1335,7 +1444,8 @@ def shortwave_gas_optics_v17(table: ReducedGasOpticsTable, pre: Mapping[str, tor
 # ---------------------------------------------------------------------------
 def _lw_sources(fields: dict[str, torch.Tensor], trans: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``lw_source_noscat`` from ``fields`` (``lay_source``, ``lev_source``, ``tau_loc``), which it
-    pops so each is released once read for the last time."""
+    pops so each is released once read for the last time. ``lev_source``: the ``[ngpt, nlay + 1, ncol]`` level
+    sources, or the pair of each layer's upper and lower level source (``_lw_block_transport``)."""
 
     tau_loc = fields.pop("tau_loc")
     big = tau_loc > LW_TAU_THRESH
@@ -1349,8 +1459,17 @@ def _lw_sources(fields: dict[str, torch.Tensor], trans: torch.Tensor) -> tuple[t
     one_minus = 1.0 - trans
     lay_source = fields.pop("lay_source")
     lev_source = fields.pop("lev_source")
-    source_up = one_minus * lev_source[:, 1:, :] + 2.0 * fact * (lay_source - lev_source[:, 1:, :])
-    source_dn = one_minus * lev_source[:, :-1, :] + 2.0 * fact * (lay_source - lev_source[:, :-1, :])
+    pair = lev_source if isinstance(lev_source, tuple) else None
+
+    # Each read of the whole-column array slices it again: one slice per use keeps the derivative's backward
+    # accumulation order (a shared slice regrouped the VJP sums, a round-off change).
+    def upper():
+        return lev_source[:, 1:, :] if pair is None else pair[0]
+
+    def lower():
+        return lev_source[:, :-1, :] if pair is None else pair[1]
+    source_up = one_minus * upper() + 2.0 * fact * (lay_source - upper())
+    source_dn = one_minus * lower() + 2.0 * fact * (lay_source - lower())
     return source_up, source_dn
 
 
@@ -1380,13 +1499,10 @@ def _lw_transport_optics(fields, *, level_major=False):
     fields["tau_loc"] = tau_loc
     del tau_loc
     source_up, source_dn = _lw_sources(fields, trans)
-    # Inductor writes these layouts directly. Eager sweeps need no normalization.
-    if level_major:
-        trans = trans.transpose(0, 1).contiguous()
-        source_up = source_up.transpose(0, 1).contiguous()
-        source_dn = source_dn.transpose(0, 1).contiguous()
-        cn = None if cn is None else cn.transpose(0, 1).contiguous()
-    return trans, source_up, source_dn, cn
+    # Pack each level once; all-sky optics otherwise stride over columns in every sweep.
+    packed = tuple(None if value is None else value.transpose(0, 1).contiguous()
+                   for value in (trans, source_up, source_dn, cn))
+    return packed if level_major else tuple(None if value is None else value.transpose(0, 1) for value in packed)
 
 
 def _lw_down_levels(trans, source, downward):
@@ -1415,14 +1531,31 @@ def _lw_scatter_up_levels(trans, source_up, source_dn, cn, down, upward):
     return tuple(up)
 
 
-def _lw_scatter_down_levels(trans, source_up, source_dn, cn, up, downward):
+def _lw_scatter_down_levels(trans, source_up, source_dn, cn, up, downward, *, scale=None, width=None,
+                            up_top=None, previous=None):
+    """With ``width`` (the banded inference solve: the widest band's g-point count): the lowest down level and each
+    level's g-point sum (``_gpoint_sum`` of ``scale`` times the level) of the block's up and down levels, instead of
+    the down levels. ``up_top``: the column's
+    top up level, whose reductions (with ``downward``, the top down level) follow the block's. ``previous``: the up
+    and down reductions of the bands before this one at the same levels, each added first (``flux + band``, the
+    order in which ``_lw_solve_banded`` adds the bands)."""
+    top_down = downward
     down = [None] * len(trans)
     for k in range(len(trans) - 1, -1, -1):
         an = 1.0 - trans[k] * trans[k]
         adj = cn[k] * (an * up[k] - trans[k] * source_up[k] - source_dn[k])
         downward = trans[k] * downward + source_dn[k] + adj
         down[k] = downward
-    return tuple(down)
+    if width is None:
+        return tuple(down)
+    if up_top is not None:
+        up, down = (*up, up_top), (*down, top_down)
+    sums_up = tuple(_gpoint_sum(scale * x.unsqueeze(1), width) for x in up)
+    sums_dn = tuple(_gpoint_sum(scale * x.unsqueeze(1), width) for x in down)
+    if previous is not None:
+        sums_up = tuple(p + x for p, x in zip(previous[0], sums_up))
+        sums_dn = tuple(p + x for p, x in zip(previous[1], sums_dn))
+    return down[0], sums_up, sums_dn
 
 
 def _lw_finish_levels(up, down, *, scale, band_lims_gpt):
@@ -1430,25 +1563,37 @@ def _lw_finish_levels(up, down, *, scale, band_lims_gpt):
             _sum_gpoints_by_band_then_bands(scale * torch.stack(down, dim=1), band_lims_gpt))
 
 
-def _lw_solve(fields: dict[str, torch.Tensor], *, sfc_emis: torch.Tensor, sfc_src: torch.Tensor,
+def _lw_solve(*, transport_optics, sfc_emis: torch.Tensor, sfc_src: torch.Tensor,
               weight: float = 1.0, region=None, band_lims_gpt=None,
-              transport_optics=None) -> tuple[torch.Tensor, torch.Tensor]:
-    """Ordered longwave sweeps with bounded live level outputs per compiled region."""
-    nlay = (fields["tau"].shape[1] if transport_optics is None
-            else transport_optics[0].shape[0 if region is not None else 1])
+              level_sums=None, previous=None, level_axis=None):
+    """Ordered longwave sweeps of ``transport_optics`` (``_lw_transport_optics``) with bounded live level outputs per
+    compiled region.
+
+    ``level_sums`` (the banded inference solve, with a ``region``: the widest band's g-point count): the scattering
+    down sweep reduces each level of its block as it forms it (``_lw_scatter_down_levels``), so the down levels and the
+    reduction regions are not written and read again, and adds the reductions to ``previous`` (those of the bands
+    before, per level, or None) in the same region; it returns the per-level ``[1, ncol]`` sums of this band and those
+    before (a list per direction), so no band's level array is joined and added outside the regions (w3t: 32 cats and
+    30 adds, 2.5 ms per 60 km radiation step on the RTX PRO 6000, round 8 w4). Same sums in the same order. Its
+    regions take the band's g-points as a dynamic axis (``_any_width``). ``level_axis``: the level axis of
+    ``transport_optics`` (default: 0 with a ``region``, as ``_lw_transport_optics`` writes them then, else 1)."""
     call = (lambda fn: fn) if region is None else region
-    level_axis = 1 if region is None else 0
-    trans, source_up, source_dn, cn = (call(_lw_transport_optics)(fields, level_major=region is not None)
-                                     if transport_optics is None else transport_optics)
-    trans, source_up, source_dn = (x.unbind(level_axis) for x in (trans, source_up, source_dn))
+    level_axis = (1 if region is None else 0) if level_axis is None else level_axis
+    nlay = transport_optics[0].shape[level_axis]
+    trans, source_up, source_dn, cn = transport_optics
+    level_sums = level_sums if region is not None else None
+    width_free = _any_width if level_sums else (lambda values: values)
+    trans, source_up, source_dn = (width_free(x.unbind(level_axis)) for x in (trans, source_up, source_dn))
     zero = torch.zeros_like(sfc_src)
     dn = [None] * (nlay + 1)
     dn[nlay] = zero / (PI_RTE * weight)
+    width_free((dn[nlay],))
     for top in range(nlay, 0, -4):
         lo = max(top - 4, 0)
-        dn[lo:top] = call(_lw_down_levels)(trans[lo:top], source_dn[lo:top], dn[top])
+        dn[lo:top] = width_free(call(_lw_down_levels)(trans[lo:top], source_dn[lo:top], dn[top]))
     up = [None] * (nlay + 1)
     up[0] = dn[0] * (1.0 - sfc_emis) + sfc_emis * sfc_src
+    width_free((up[0],))
     scale = PI_RTE * weight
     reduced_up, reduced_dn = [], []
     scattering = cn is not None
@@ -1466,17 +1611,31 @@ def _lw_solve(fields: dict[str, torch.Tensor], *, sfc_emis: torch.Tensor, sfc_sr
                 finish_lo = top
                 del uu, dd
     else:
-        cn = cn.unbind(level_axis)
+        cn = width_free(cn.unbind(level_axis))
         top_down = dn[nlay]
         dn[0] = None
         for lo in range(0, nlay, 4):
             top = min(lo + 4, nlay)
-            up[lo + 1:top + 1] = call(_lw_scatter_up_levels)(trans[lo:top], source_up[lo:top],
-                source_dn[lo:top], cn[lo:top], tuple(dn[lo + 1:top + 1]), up[lo])
+            up[lo + 1:top + 1] = width_free(call(_lw_scatter_up_levels)(trans[lo:top], source_up[lo:top],
+                source_dn[lo:top], cn[lo:top], tuple(dn[lo + 1:top + 1]), up[lo]))
             dn[lo + 1:top + 1] = [None] * (top - lo)
         dn[nlay] = top_down
         del top_down
         finish_top = nlay
+        if level_sums:
+            summed_up, summed_dn = [None] * (nlay + 1), [None] * (nlay + 1)
+            for top in range(nlay, 0, -4):
+                lo = max(top - 4, 0)
+                last = top + 1 if top == nlay else top  # the top block also reduces the column's top level
+                before = None if previous is None else (tuple(previous[0][lo:last]), tuple(previous[1][lo:last]))
+                dn[lo], summed_up[lo:last], summed_dn[lo:last] = call(_lw_scatter_down_levels)(
+                    trans[lo:top], source_up[lo:top], source_dn[lo:top], cn[lo:top], tuple(up[lo:top]), dn[top],
+                    scale=scale, width=level_sums, up_top=up[nlay] if top == nlay else None, previous=before)
+                width_free((dn[lo],))
+                up[lo:last] = [None] * (last - lo)
+                dn[lo + 1:top + 1] = [None] * (top - lo)
+            del cn, trans, source_up, source_dn
+            return summed_up, summed_dn
         for top in range(nlay, 0, -4):
             lo = max(top - 4, 0)
             dn[lo:top] = call(_lw_scatter_down_levels)(trans[lo:top], source_up[lo:top],
@@ -1510,26 +1669,6 @@ def _lw_solve(fields: dict[str, torch.Tensor], *, sfc_emis: torch.Tensor, sfc_sr
     del dn
     flux_dn = scale * stacked
     return flux_up, flux_dn
-
-
-def lw_solver_noscat_v17(
-    *,
-    tau: torch.Tensor,
-    lay_source: torch.Tensor,
-    lev_source: torch.Tensor,
-    sfc_emis: torch.Tensor,
-    sfc_src: torch.Tensor,
-    secant: torch.Tensor,
-    weight: float = 1.0,
-    ssa: torch.Tensor | None = None,
-    g: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``lw_solver_noscat_oneangle`` (rescaled when ``ssa``/``g`` are given), per-g-point fluxes."""
-
-    fields = {"tau": tau, "secant": secant, "lay_source": lay_source, "lev_source": lev_source}
-    if ssa is not None:
-        fields.update(ssa=ssa, g=g)
-    return _lw_solve(fields, sfc_emis=sfc_emis, sfc_src=sfc_src, weight=weight)
 
 
 def _sw_layer_levels(tau_s, w0, g_s, mu0_s, positive, direct):
@@ -1577,7 +1716,13 @@ def _sw_layer_levels(tau_s, w0, g_s, mu0_s, positive, direct):
             torch.where(positive, tdir * dir_inc, 0.0), tuple(beam[:-1]))
 
 
-def _sw_adding_levels(rdif, tdif, src_up, src_dn, albedo, source):
+def _sw_adding_levels(rdif, tdif, src_up, src_dn, albedo, source, *, denoms=True):
+    """Upward adding sweep of the shortwave solve: the albedo and source of each level and its denominator.
+
+    ``denoms`` False (the banded inference solve): no denominators are returned and ``_sw_flux_levels`` forms them
+    again from the same rdif and albedo. The inference solve recomputes them so that no per-level denominator array
+    is held between the two sweeps; a differentiated solve keeps them, so the reverse pass does not differentiate
+    the denominator twice."""
     aa, ss, dd = [], [], []
     for k in range(len(rdif)):
         denom = 1.0 / (1.0 - rdif[k] * albedo)
@@ -1587,30 +1732,78 @@ def _sw_adding_levels(rdif, tdif, src_up, src_dn, albedo, source):
         aa.append(albedo)
         ss.append(source)
         dd.append(denom)
-    return tuple(aa), tuple(ss), tuple(dd)
+    return (tuple(aa), tuple(ss), tuple(dd)) if denoms else (tuple(aa), tuple(ss))
 
 
-def _sw_flux_levels(rdif, tdif, src_dn, denom, albedo, source, downward, direct=None):
+def _sw_flux_levels(rdif, tdif, src_dn, denom, albedo, source, downward, direct, *, sums=None):
+    """``sums`` (the banded inference solve: the widest band's g-point count): each level's g-point sum
+    (``_gpoint_sum``) instead of its fluxes.
+    ``denom`` None: each level's adding denominator formed here, the expression of ``_sw_adding_levels`` on the
+    same rdif and albedo (the adding region then neither writes it nor this one reads it)."""
     dd, uu = [None] * len(rdif), [None] * len(rdif)
     for k in range(len(rdif) - 1, -1, -1):
-        downward = (tdif[k] * downward + rdif[k] * source[k] + src_dn[k]) * denom[k]
-        dd[k] = downward if direct is None else downward + direct[k]
+        level_denom = 1.0 / (1.0 - rdif[k] * albedo[k]) if denom is None else denom[k]
+        downward = (tdif[k] * downward + rdif[k] * source[k] + src_dn[k]) * level_denom
+        dd[k] = downward + direct[k]
         uu[k] = downward * albedo[k] + source[k]
-    if direct is not None:
-        return tuple(dd), tuple(uu), downward
-    return tuple(dd), tuple(uu)
+        if sums is not None:
+            dd[k], uu[k] = _gpoint_sum(dd[k], sums), _gpoint_sum(uu[k], sums)
+    return tuple(dd), tuple(uu), downward
+
+
+def _gpoint_sum(flux, width):
+    """The sequential sum over the leading g-point axis (``_band_sums`` of one band), for an axis of at most ``width``
+    g-points: the sum steps through ``width`` rows of the axis padded with zeros and keeps its total past the axis,
+    so the additions are those of ``_band_sums`` in its order. A band region thus traces the same graph for every
+    band width (``_any_width``)."""
+    count = flux.shape[0]
+    padded = torch.nn.functional.pad(flux, (0, 0) * (flux.ndim - 1) + (0, width - count))
+    inside = torch.arange(width, device=flux.device) < count
+    total = padded[0]
+    for igpt in range(1, width):
+        total = torch.where(inside[igpt], total + padded[igpt], total)
+    return total
+
+
+def _any_width(values):
+    """``values`` (tensors, None, or tuples of them), each tensor with its leading axis marked dynamic
+    (``maybe_mark_dynamic``). The banded inference solves pass every tensor a band region reads whose leading axis is
+    the band's g-points (or 1), so each region compiles one graph for all band widths: with the band widths
+    static, the radiation inference check compiled 226 more graphs (11 LW and 8 SW widths) and took 270 s from a cold
+    cache instead of about 120 s (round 8)."""
+    for x in values:
+        if isinstance(x, tuple):
+            _any_width(x)
+        elif x is not None:
+            torch._dynamo.maybe_mark_dynamic(x, 0)
+    return values
+
+
+def _sw_edge_sums(up_top, down_top, surface_direct, *, width):
+    """The g-point sums (``_gpoint_sum``) of the top level's fluxes and of the surface direct flux."""
+    return _gpoint_sum(up_top, width), _gpoint_sum(down_top, width), _gpoint_sum(surface_direct, width)
 
 
 def _sw_solve(fields: dict[str, torch.Tensor], *, mu0: torch.Tensor, sfc_alb_dir: torch.Tensor,
-              sfc_alb_dif: torch.Tensor, inc_flux: torch.Tensor, region=None, surface_direct_only=False
-              ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``sw_solver_2stream_v17`` on ``fields`` (``tau``, ``ssa``, ``g``), which it pops: the layer
-    optics and each layer's adding terms are released once used. Same arithmetic."""
+              sfc_alb_dif: torch.Tensor, inc_flux: torch.Tensor, region=None,
+              band_sums=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``sw_solver_2stream`` (v1.7) on ``fields`` (``tau``, ``ssa``, ``g``), which it pops: the layer
+    optics and each layer's adding terms are released once used. Same arithmetic. Returns the up and total down
+    fluxes at every level and the direct flux at the surface.
 
-    tau = fields.pop("tau")
-    ssa = fields.pop("ssa")
-    g = fields.pop("g")
-    ngpt, nlay, ncol = tau.shape
+    ``band_sums`` (with a ``region``: the banded inference solve of one band, given the
+    widest band's g-point count) returns the g-point sums of ``_sw_band_flux_sums`` instead of the fluxes: each
+    level's sum is formed in the region that forms the level (``_sw_flux_levels``), so no level flux is written,
+    stacked and read again. Its regions then take the band's g-points as a dynamic axis (``_any_width``)."""
+    band_sums = band_sums if region is not None else None
+    width_free = (lambda values: values) if band_sums is None else _any_width
+
+    # ``band_optics`` (the banded inference solve): the inputs of one band's all-sky optics (``_sw_band_optics``),
+    # which each layer chunk's region forms itself (``_sw_band_layer_levels``) instead of tau, ssa and g; the last
+    # two are the per-column cloudy flag and the gas optics' level-major flag, passed as they are.
+    band_optics = fields.pop("band_optics", None)
+    tau, ssa, g = (None, None, None) if band_optics is not None else (fields.pop(n) for n in ("tau", "ssa", "g"))
+    ngpt, nlay, ncol = (tau if band_optics is None else band_optics[0]).shape
     mu0_row = mu0.unsqueeze(0)
     mu0_s = torch.clamp_min(mu0_row, torch.full((), SW_MIN_MU0, dtype=mu0.dtype, device=mu0.device))
     rdif = [None] * nlay
@@ -1625,86 +1818,73 @@ def _sw_solve(fields: dict[str, torch.Tensor], *, mu0: torch.Tensor, sfc_alb_dir
     # evaluated at once, level-major and contiguous; only the beam recurrence loops.
     for top in range(nlay, 0, -_SW_LAYER_CHUNK):
         lo = max(top - _SW_LAYER_CHUNK, 0)
-        tau_s, w0, g_s = (x[:, lo:top].transpose(0, 1).contiguous() for x in (tau, ssa, g))
-        rr, tt, su, sd, beam = call(_sw_layer_levels)(tau_s, w0, g_s, mu0_s, positive, flux_dir[top])
-        rdif[lo:top], tdif[lo:top] = rr.unbind(0), tt.unbind(0)
-        src_up[lo:top], src_dn[lo:top], flux_dir[lo:top] = su.unbind(0), sd.unbind(0), beam
-        del tau_s, w0, g_s, rr, tt, su, sd, beam
-    del tau, ssa, g
+        if band_optics is None:
+            layers = tuple(x[:, lo:top].transpose(0, 1).contiguous() for x in (tau, ssa, g))
+            levels = call(_sw_layer_levels)
+        else:  # the chunk's layers of the band's [ngpt or 1, nlay, ncol] inputs
+            layers = (*width_free(tuple(None if x is None else tuple(a[:, lo:top] for a in x) if isinstance(x, tuple)
+                                        else x[:, lo:top] for x in band_optics[:-2])), *band_optics[-2:])
+            levels = call(_sw_band_layer_levels)
+        rr, tt, su, sd, beam = levels(*layers, mu0_s, positive, *width_free((flux_dir[top],)))
+        rdif[lo:top], tdif[lo:top] = width_free(rr.unbind(0)), width_free(tt.unbind(0))
+        src_up[lo:top], src_dn[lo:top] = width_free(su.unbind(0)), width_free(sd.unbind(0))
+        flux_dir[lo:top] = width_free(beam)
+        del layers, rr, tt, su, sd, beam
+    del tau, ssa, g, band_optics
     source_sfc = torch.where(positive, flux_dir[0] * sfc_alb_dir, torch.zeros_like(flux_dir[0]))
     # adding (bottom-up)
     albedo = [None] * (nlay + 1)
     src = [None] * (nlay + 1)
     denom_l = [None] * nlay
-    albedo[0] = sfc_alb_dif
-    src[0] = source_sfc
+    albedo[0], src[0] = width_free((sfc_alb_dif, source_sfc))
     del source_sfc
     for lo in range(0, nlay, 4):
         top = min(lo + 4, nlay)
-        aa, ss, dd = call(_sw_adding_levels)(tuple(rdif[lo:top]), tuple(tdif[lo:top]),
-            tuple(src_up[lo:top]), tuple(src_dn[lo:top]), albedo[lo], src[lo])
-        albedo[lo + 1:top + 1], src[lo + 1:top + 1], denom_l[lo:top] = aa, ss, dd
+        added = call(_sw_adding_levels)(tuple(rdif[lo:top]), tuple(tdif[lo:top]),
+            tuple(src_up[lo:top]), tuple(src_dn[lo:top]), albedo[lo], src[lo], denoms=band_sums is None)
+        albedo[lo + 1:top + 1], src[lo + 1:top + 1] = width_free(added[0]), width_free(added[1])
+        if band_sums is None:
+            denom_l[lo:top] = added[2]
         src_up[lo:top] = [None] * (top - lo)
-        del aa, ss, dd
+        del added
     flux_dn = [None] * (nlay + 1)
     flux_up = [None] * (nlay + 1)
     flux_dn[nlay] = torch.zeros_like(inc_flux)
     flux_up[nlay] = flux_dn[nlay] * albedo[nlay] + src[nlay]
-    if surface_direct_only:
-        surface_direct = flux_dir[0].unsqueeze(1)
-        downward = flux_dn[nlay]
-        flux_dn[nlay] = downward + flux_dir[nlay]
-        flux_dir[nlay] = None
+    surface_direct = flux_dir[0].unsqueeze(1)
+    downward = flux_dn[nlay]
+    flux_dn[nlay] = downward + flux_dir[nlay]
+    flux_dir[nlay] = None
     albedo[nlay] = src[nlay] = None
+    if band_sums is not None:
+        top_sums = call(_sw_edge_sums)(*width_free((flux_up[nlay], flux_dn[nlay], surface_direct)), width=band_sums)
+        flux_up[nlay], flux_dn[nlay], surface_direct = top_sums
+        del top_sums
     for top in range(nlay, 0, -4):
         lo = max(top - 4, 0)
         args = (tuple(rdif[lo:top]), tuple(tdif[lo:top]), tuple(src_dn[lo:top]),
-                tuple(denom_l[lo:top]), tuple(albedo[lo:top]), tuple(src[lo:top]))
-        if surface_direct_only:
-            dd, uu, downward = call(_sw_flux_levels)(*args, downward, tuple(flux_dir[lo:top]))
-            flux_dir[lo:top] = [None] * (top - lo)
-        else:
-            dd, uu = call(_sw_flux_levels)(*args, flux_dn[top])
+                None if band_sums is not None else tuple(denom_l[lo:top]), tuple(albedo[lo:top]),
+                tuple(src[lo:top]))
+        dd, uu, downward = call(_sw_flux_levels)(*args, *width_free((downward,)), tuple(flux_dir[lo:top]),
+                                                 sums=band_sums)
+        flux_dir[lo:top] = [None] * (top - lo)
         flux_dn[lo:top], flux_up[lo:top] = dd, uu
         for values in (rdif, tdif, src_dn, denom_l, albedo, src):
             values[lo:top] = [None] * (top - lo)
         del dd, uu
+    if band_sums is not None:
+        return torch.stack(flux_up), torch.stack(flux_dn), surface_direct
     up = torch.stack(flux_up, dim=1)
     del flux_up
-    if surface_direct_only:
-        return up, torch.stack(flux_dn, dim=1), surface_direct
-    direct = torch.stack(flux_dir, dim=1)
-    del flux_dir
-    down = torch.stack(flux_dn, dim=1)
-    del flux_dn
-    down = down + direct
-    return up, down, direct
-
-
-def sw_solver_2stream_v17(
-    *,
-    tau: torch.Tensor,
-    ssa: torch.Tensor,
-    g: torch.Tensor,
-    mu0: torch.Tensor,
-    sfc_alb_dir: torch.Tensor,
-    sfc_alb_dif: torch.Tensor,
-    inc_flux: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``sw_solver_2stream`` with ``sw_dif_and_source`` and ``adding`` (v1.7), per g-point.
-
-    ``mu0`` is per column (``rte_sw_mu0_bycol``); returns up, total down and direct.
-    """
-
-    return _sw_solve({"tau": tau, "ssa": ssa, "g": g}, mu0=mu0, sfc_alb_dir=sfc_alb_dir,
-                     sfc_alb_dif=sfc_alb_dif, inc_flux=inc_flux)
+    return up, torch.stack(flux_dn, dim=1), surface_direct
 
 
 # ---------------------------------------------------------------------------
 # rrtmgp_sw_main
 # ---------------------------------------------------------------------------
-def _sw_precip_byband(cld_frac, cld_rwp, cld_swp, cld_resnow, *, nband: int):
-    active = (cld_frac > FTINY).unsqueeze(0)
+def _sw_precip_byband(cld_frac, cld_rwp, cld_swp, cld_resnow, *, nband: int, band_axis: int = 0):
+    """Precipitation optics by band ``[nband, nlay, ncol]`` (``band_axis`` 1: ``[nlay, nband, ncol]``)."""
+    active = (cld_frac > FTINY).unsqueeze(band_axis)
     tau_rain = cld_rwp * SW_A0R
     snow_ok = (cld_swp > 0.0) & (cld_resnow > 10.0)
     # Scalar / tensor takes reciprocal-multiply; the source divides directly.
@@ -1712,14 +1892,15 @@ def _sw_precip_byband(cld_frac, cld_rwp, cld_swp, cld_resnow, *, nband: int):
         cld_swp * 1.09087 * (SW_A0S + torch.div(SW_A1S, 1.0315 * cld_resnow)),
         torch.zeros_like(cld_swp))
     dev, dt = cld_frac.device, cld_frac.dtype
-    b0r = static_tensor(SW_B0R[:nband], dtype=dt, device=dev).reshape(-1, 1, 1)
-    b0s = static_tensor(SW_B0S[:nband], dtype=dt, device=dev).reshape(-1, 1, 1)
-    b1s = static_tensor(SW_B1S[:nband], dtype=dt, device=dev).reshape(-1, 1, 1)
-    c0r = static_tensor(SW_C0R[:nband], dtype=dt, device=dev).reshape(-1, 1, 1)
-    c0s = static_tensor(SW_C0S[:nband], dtype=dt, device=dev).reshape(-1, 1, 1)
-    tr = tau_rain.unsqueeze(0)
-    ts = tau_snow.unsqueeze(0)
-    rs = cld_resnow.unsqueeze(0)
+    by_band = (-1, 1, 1) if band_axis == 0 else (1, -1, 1)
+    b0r = static_tensor(SW_B0R[:nband], dtype=dt, device=dev).reshape(by_band)
+    b0s = static_tensor(SW_B0S[:nband], dtype=dt, device=dev).reshape(by_band)
+    b1s = static_tensor(SW_B1S[:nband], dtype=dt, device=dev).reshape(by_band)
+    c0r = static_tensor(SW_C0R[:nband], dtype=dt, device=dev).reshape(by_band)
+    c0s = static_tensor(SW_C0S[:nband], dtype=dt, device=dev).reshape(by_band)
+    tr = tau_rain.unsqueeze(band_axis)
+    ts = tau_snow.unsqueeze(band_axis)
+    rs = cld_resnow.unsqueeze(band_axis)
     ssa_rain = tr * (1.0 - b0r)
     asy_rain = ssa_rain * c0r
     ssa_snow = ts * (1.0 - (b0s + b1s * 1.0315 * rs))
@@ -1748,25 +1929,44 @@ def _column_cloudiness(cld_frac: torch.Tensor) -> torch.Tensor:
     return 1.0 - zcf0
 
 
-def _cloud_optics_sum(cloud_fn, cloud, *, tables, rough):
-    """Grid-scale cloud optics plus SAMF and PBL sub-grid increments, by band.
+def _cloud_optics_sum(cloud_fn, cloud, *, tables, rough, band_axis=0, radius_limits=None):
+    """Grid-scale cloud optics plus SAMF and PBL sub-grid increments, by band (on ``band_axis``).
 
     Also returns the grid-scale optical depth by band (the ``cldtausw`` diagnostic reads it).
     """
 
-    tau, ssa, g = cloud_fn(cloud["cld_lwp"], cloud["cld_iwp"], cloud["cld_reliq"], cloud["cld_reice"], tables=tables, ice_roughness_index=rough)
+    def optics(lwp, iwp, reliq, reice):
+        if radius_limits is not None:
+            # The shared cloud preparation uses LW bounds; SW tables can be narrower.
+            reliq = torch.clamp(reliq, min=radius_limits[0], max=radius_limits[1])
+            reice = torch.clamp(reice, min=radius_limits[2], max=radius_limits[3])
+        return cloud_fn(lwp, iwp, reliq, reice, tables=tables, ice_roughness_index=rough, band_axis=band_axis)
+
+    tau, ssa, g = optics(cloud["cld_lwp"], cloud["cld_iwp"], cloud["cld_reliq"], cloud["cld_reice"])
     grid_tau = tau
     for prefix in ("cld_cnv", "cld_pbl"):
-        t2, s2, g2 = cloud_fn(
+        t2, s2, g2 = optics(
             cloud[f"{prefix}_lwp"],
             cloud[f"{prefix}_iwp"],
             cloud[f"{prefix}_reliq"],
             cloud[f"{prefix}_reice"],
-            tables=tables,
-            ice_roughness_index=rough,
         )
         tau, ssa, g = _inc_2str(tau, ssa, g, t2, s2, g2)
     return tau, ssa, g, grid_tau
+
+
+def _shortwave_cloud_optics_sum(cloud, *, tables, rough, band_axis=0):
+    """``_cloud_optics_sum`` of the SW tables, with the grid, convective and PBL radii clamped to the SW table bounds.
+
+    Physics change: upstream ``rrtmgp_sw_main`` passes the radii that ``GFS_rrtmgp_cloud_mp`` bounds by the LW
+    tables to the SW cloud optics, whose tables can be narrower (liquid to 20 um against the LW 21.5 um); upstream
+    then reports an out-of-bounds error and leaves that column without grid-cloud optics, an invalid result, while a
+    lookup past the table would extrapolate. Here each SW lookup clamps the radii to the SW table bounds, as the
+    oracle's recorded Fortran patch does (``orchestration/fortran_patches``). It changes the SW cloud optics only
+    where a radius lies outside the SW table; the cloud state and the LW radii are unchanged."""
+    limits = tables.files["sw_cloud"].tensors
+    return _cloud_optics_sum(compute_shortwave_cloud_optics_byband, cloud, tables=tables, rough=rough, band_axis=band_axis,
+        radius_limits=tuple(limits[name] for name in ("radliq_lwr", "radliq_upr", "radice_lwr", "radice_upr")))
 
 
 _SW_SOLAR_SOURCES: dict = {}
@@ -1813,29 +2013,137 @@ def _sw_band_split(tables: RrtmgpTableBundle) -> tuple[int, int]:
     return ibd, ibd_uv
 
 
+def _sw_band_optics(tau, ssa, g, aer, mask, c_tau, c_ssa, c_g, cloudy, level_major):
+    """All-sky shortwave optics of one band's g-points (inference): the aerosol increment of the gas optics
+    (``aer``: the band's ``tau, ssa, g``, or None for a zero increment), the McICA cloud increment, and the
+    cloudy/clear column selection. The band values broadcast over the band's g-points; each element is the same
+    expression as the whole-spectrum form of ``_sw_daylit_optics``.
+
+    ``level_major``: the gas optics are transposed views of level-major buffers (the compiled inference gas optics,
+    ``_sw_daylit_optics``); the band optics are then formed level-major too and returned as [ngpt, nlay, ncol] views:
+    the same elements, and the solve's layer chunks are contiguous rows (no transposing copy per chunk in
+    ``_sw_solve``)."""
+    eps = torch.full((), _optics_eps(tau.dtype), dtype=tau.dtype, device=tau.device)
+    zero = torch.zeros((), dtype=tau.dtype, device=tau.device)
+
+    def lay(x):
+        return x.transpose(0, 1) if level_major else x
+
+    tau, ssa, g, mask, c_tau, c_ssa, c_g = (lay(x) for x in (tau, ssa, g, mask, c_tau, c_ssa, c_g))
+    increment = (zero, zero, zero) if aer is None else tuple(lay(x) for x in aer)
+    a_tau, a_ssa, a_g = _increment_shortwave_same_spectral_kernel(tau, ssa, g, *increment, eps)
+    s_tau = torch.where(mask, c_tau, 0.0)
+    s_ssa = torch.where(mask, c_ssa, 0.0)
+    s_g = torch.where(mask, c_g, 0.0)
+    all_tau, all_ssa, all_g = _increment_shortwave_same_spectral_kernel(a_tau, a_ssa, a_g, s_tau, s_ssa, s_g, eps)
+    sel = cloudy.reshape(1, 1, -1)
+    return {"tau": lay(torch.where(sel, all_tau, a_tau)), "ssa": lay(torch.where(sel, all_ssa, a_ssa)),
+            "g": lay(torch.where(sel, all_g, a_g))}
+
+
+def _sw_band_layer_levels(tau, ssa, g, aer, mask, c_tau, c_ssa, c_g, cloudy, level_major, mu0_s, positive, direct):
+    """``_sw_layer_levels`` of one band's layer chunk from the inputs of its all-sky optics (``_sw_band_optics``,
+    the chunk's layers): the optics are formed in the region that reads them, so they are not written and read
+    again (the band optics region wrote tau, ssa and g, 10 ms per 60 km radiation step on the RTX PRO 6000, round 8
+    w2b 469/*). Same expressions per element."""
+    optics = _sw_band_optics(tau, ssa, g, aer, mask, c_tau, c_ssa, c_g, cloudy, level_major)
+    return _sw_layer_levels(*(optics[name].transpose(0, 1) for name in ("tau", "ssa", "g")), mu0_s, positive, direct)
+
+
+def _sw_band_flux_sums(up, down, direct):
+    """The band sums of ``_sw_daylit_outputs`` (``_band_sums``: sequential over the band's g-points) of one band's
+    upward, downward and surface direct fluxes."""
+    limits = [(1, up.shape[0])]
+    return _band_sums(up, limits)[0], _band_sums(down, limits)[0], _band_sums(direct[:, :1], limits)[0]
+
+
+def _sw_solve_banded(parts, *, mask, cloudy, band_lims_gpt, mu0, sfc_alb_dir, sfc_alb_dif, inc_flux, region=None):
+    """The all-sky shortwave solve one band at a time (inference), returning the band sums.
+
+    ``parts`` are the whole-spectrum gas optics, the band aerosol and cloud optics and the gas optics' layout
+    (``level_major``) of ``_sw_daylit_optics``. Each
+    band runs ``_sw_solve`` on the inputs of its optics (``_sw_band_optics``), which each layer chunk forms in its own
+    region (``_sw_band_layer_levels``): only one band's layer terms and level fluxes are live, and no sweep rebuilds
+    the layer terms. The band sums equal those of the whole-spectrum solve (the same sequential g-point sums per
+    band)."""
+    tau, ssa, g = parts["gas"]
+    # The band regions read coalesced band rows: band arrays that arrive band-innermost (a column stride of nband) are
+    # copied column-innermost once (the LW band arrays likewise, round 6); _sw_daylit_optics writes them so.
+    aer = None if parts["aer"] is None else tuple(_column_innermost(x) for x in parts["aer"])
+    c_tau, c_ssa, c_g = (_column_innermost(x) for x in parts["cloud"])
+    width = max(int(hi) - int(lo) + 1 for lo, hi in band_lims_gpt)
+    up_b, dn_b, dir_b = [], [], []
+    for band, (lo, hi) in enumerate(band_lims_gpt):
+        rows = slice(int(lo) - 1, int(hi))
+        band_aer = None if aer is None else tuple(x[band:band + 1] for x in aer)
+        optics = {"band_optics": (tau[rows], ssa[rows], g[rows], band_aer, mask[rows], c_tau[band:band + 1],
+                                  c_ssa[band:band + 1], c_g[band:band + 1], cloudy, parts["level_major"])}
+        solved = _sw_solve(optics, mu0=mu0, sfc_alb_dir=sfc_alb_dir[rows], sfc_alb_dif=sfc_alb_dif[rows],
+                           inc_flux=inc_flux[rows], region=region, band_sums=width)
+        del optics
+        # Compiled regions form the band sums with the levels (_sw_solve band_sums); eager solves sum the fluxes here.
+        u, d, s = solved if region is not None else _sw_band_flux_sums(*solved)
+        del solved
+        up_b.append(u)
+        dn_b.append(d)
+        dir_b.append(s)
+    return up_b, dn_b, dir_b
+
+
+def _sw_cloud_mask(columns, *, ngpt, config, region=None):
+    """McICA cloud mask of ``_sw_daylit_optics`` (boolean ``[ngpt, nlay, ncol]``), drawn in its own region so
+    the random-number work is not live during the gas optics (round-4 M5c)."""
+    cloudy = _column_cloudiness(columns["cld_frac"]) > EPS_PRE
+    return mcica_cloud_mask(columns["icsdsw"], columns["cld_frac"], columns.get("cloud_overlap_param"), ngpt=ngpt,
+                            iovr=config.iovr, region=region, column_cloudy=cloudy)
+
+
 def _sw_daylit_optics(columns: dict[str, torch.Tensor], *, tables: RrtmgpTableBundle,
-                      config: RadiationConfig, coordinates=None, preparation=None):
-    """Gas/cloud optics and McICA, before the ordered transport sweeps."""
+                      config: RadiationConfig, coordinates=None, preparation=None, banded, mask, inference):
+    """Gas/cloud optics and McICA, before the ordered transport sweeps (``mask``: ``_sw_cloud_mask``).
+
+    ``banded`` (inference without clear-sky heating) returns the parts the band solve combines band by band
+    (``_sw_solve_banded``); compiled, its gas optics are level-major (``shortwave_gas_optics_v17``)."""
     table = reduce_gas_optics_table(tables.files["sw_gas"])
     gpt_to_band = table.gpt_to_band.to(device=columns["p_lay"].device, dtype=torch.int64)
-    nband, ngpt = table.nband, table.ngpt
+    nband = table.nband
     rough = config.nrghice - 1
     col_day = columns["day"]
     nlay, ncol = columns["p_lay"].shape
     mu0 = torch.where(col_day, columns["coszen"], torch.ones_like(columns["coszen"]))
-    gas = shortwave_gas_optics_v17(table, columns, coordinates=coordinates, preparation=preparation)
-
     zcf1 = _column_cloudiness(columns["cld_frac"])
     cloudy = zcf1 > EPS_PRE
+    # Inference without clear-sky heating (``banded``, decided by the caller: no derivative, no swhtr) returns the
+    # gas optics and the band aerosol and cloud optics; the caller combines them band by band with the solve
+    # (_sw_solve_banded), so no whole-spectrum all-sky optics exist. Its preparation has no major weights; compiled,
+    # the gas optics are computed level-major (each layer's index and weight rows read once for all g-points).
+    level_major = banded and torch.compiler.is_compiling()
+    gas = shortwave_gas_optics_v17(table, columns, coordinates=coordinates, preparation=preparation,
+                                   level_major=level_major, inference=inference)
 
-    c_tau, c_ssa, c_g, grid_tau = _cloud_optics_sum(
-        compute_shortwave_cloud_optics_byband, columns, tables=tables, rough=rough)
-    grid_tau_band11 = grid_tau[10]
+    # banded: the band arrays computed level-major ([nlay, nband, ncol]), as the band solve stores them.
+    band_axis = 1 if banded else 0
+    c_tau, c_ssa, c_g, grid_tau = _shortwave_cloud_optics_sum(columns, tables=tables, rough=rough, band_axis=band_axis)
+    grid_tau_band11 = grid_tau.select(band_axis, 10)
     del grid_tau
     p_tau, p_ssa, p_g = _sw_precip_byband(columns["cld_frac"], columns["cld_rwp"], columns["cld_swp"],
-                                          columns["cld_resnow"], nband=nband)
+                                          columns["cld_resnow"], nband=nband, band_axis=band_axis)
     c_tau, c_ssa, c_g = _inc_2str(c_tau, c_ssa, c_g, p_tau, p_ssa, p_g)
     del p_tau, p_ssa, p_g
+
+    if banded:
+        # Band aerosol and cloud optics level-major (_level_major_bands): the band solve reads their band rows in place.
+        aer = (tuple(_level_major_bands(x) for x in merra2_sw_optics(
+            config.merra2_optics, columns["aer_nm"], columns["p_lev"], columns["p_lay"], columns["tv_lay"],
+            columns["relhum"], band_axis=1)) if config.iaerflg != 0 else None)
+        # The gas asymmetry is zero: a stride-0 zero here, not the filled [ngpt, nlay, ncol] array every band's optics
+        # read (w2b 468/1 triton_poi_fused_zeros_like_5, 2.2 GB written per 60 km radiation step). The derivative
+        # forms keep the filled zeros of shortwave_gas_optics_v17 (see its docstring).
+        tau = gas.pop("tau")
+        parts = {"gas": (tau, gas.pop("ssa"), tau.new_zeros(()).expand(tau.shape)), "aer": aer,
+                 "cloud": tuple(_level_major_bands(x) for x in (c_tau, c_ssa, c_g)), "level_major": level_major}
+        del gas, aer, c_tau, c_ssa, c_g, tau
+        return None, parts, mu0, cloudy, grid_tau_band11
 
     # G-point-sized fields are released as soon as they are dead (the solve's peak is otherwise
     # set by gas, aerosol, cloud and all-sky optics that are no longer read). The aerosol increment
@@ -1854,8 +2162,6 @@ def _sw_daylit_optics(columns: dict[str, torch.Tensor], *, tables: RrtmgpTableBu
         a_tau, a_ssa, a_g = _inc_2str(gas.pop("tau"), gas.pop("ssa"), gas.pop("g"), zero, zero, zero)
     del gas
 
-    mask = sampled_mask(_mcica_draws(columns["icsdsw"], ngpt=ngpt, nlay=nlay, dtype=columns["cld_frac"].dtype), columns["cld_frac"],
-                        config, columns.get("cloud_overlap_param")) & cloudy.reshape(1, 1, ncol)
     s_tau = torch.where(mask, _band_to_gpt(c_tau, gpt_to_band), torch.zeros_like(mask, dtype=c_tau.dtype))
     s_ssa = torch.where(mask, _band_to_gpt(c_ssa, gpt_to_band), torch.zeros_like(mask, dtype=c_tau.dtype))
     s_g = torch.where(mask, _band_to_gpt(c_g, gpt_to_band), torch.zeros_like(mask, dtype=c_tau.dtype))
@@ -1882,7 +2188,8 @@ def _sw_daylit_optics(columns: dict[str, torch.Tensor], *, tables: RrtmgpTableBu
     return clear, optics, mu0, cloudy, grid_tau_band11
 
 
-def _column_gas_coordinates(columns, table, region):
+def _column_gas_coordinates(columns, table, region, *, compact=False):
+    """``compact``: inference index dtypes (``_interpolation_coordinates_tensor``)."""
     play = columns["p_lay"]
     call = _interpolation_coordinates_tensor if region is None else region(_interpolation_coordinates_tensor)
     return call(
@@ -1890,32 +2197,45 @@ def _column_gas_coordinates(columns, table, region):
         table.temp_ref.to(device=play.device, dtype=play.dtype),
         table.press_ref.to(device=play.device, dtype=play.dtype),
         table.press_ref_trop.to(device=play.device, dtype=play.dtype),
-        ntemp=table.ntemp, npres=table.npres,
+        ntemp=table.ntemp, npres=table.npres, compact=compact,
     )
 
 
 def _sw_daylit_columns(columns: dict[str, torch.Tensor], *, toa_gpt: torch.Tensor, tables: RrtmgpTableBundle,
-                       config: RadiationConfig, region=None) -> dict[str, torch.Tensor]:
-    """One column driver; optional regions leave ordered transport orchestration eager."""
+                       config: RadiationConfig, region=None, inference=False) -> dict[str, torch.Tensor]:
+    """The SW column work of the daylit columns; optional regions leave the ordered transport orchestration eager.
+
+    ``inference`` (no derivative is formed, ``_derivative_free``) without clear-sky heating takes the banded forms:
+    band-by-band all-sky optics and solves, the same values with one band's spectra live (without them a full-batch
+    call at high resolution does not fit in GPU memory)."""
     call = (lambda fn: fn) if region is None else region
     # Keep pressure logarithms and temperature coordinates outside spectral fusion.
     table = reduce_gas_optics_table(tables.files["sw_gas"])
-    coordinates = _column_gas_coordinates(columns, table, region)
-    preparation = _prepare_shortwave_gas_v17(table, columns, coordinates=coordinates, region=region)
+    banded = inference and not config.swhtr
+    coordinates = _column_gas_coordinates(columns, table, region, compact=banded)
+    # Inference (banded) forms each major weight from fminor and the pressure fraction (no plan fmajor), as the LW.
+    preparation = _prepare_shortwave_gas_v17(table, columns, coordinates=coordinates, region=region,
+                                             major_weights=not banded)
+    mask = _sw_cloud_mask(columns, ngpt=table.ngpt, config=config, region=region)
     clear, optics, mu0, cloudy, grid_tau = call(_sw_daylit_optics)(
-        columns, tables=tables, config=config, coordinates=coordinates, preparation=preparation)
+        columns, tables=tables, config=config, coordinates=coordinates, preparation=preparation, banded=banded,
+        mask=mask, inference=inference)
     del coordinates, preparation
     solve = {"mu0": mu0, "sfc_alb_dir": columns["alb_dir"], "sfc_alb_dif": columns["alb_dif"],
-             "inc_flux": toa_gpt.unsqueeze(1).expand(toa_gpt.shape[0], mu0.shape[0]), "region": region,
-             "surface_direct_only": True}
+             "inc_flux": toa_gpt.unsqueeze(1).expand(toa_gpt.shape[0], mu0.shape[0]), "region": region}
     clear_bands = None
     if clear is not None:
         clr_up, clr_dn, _ = _sw_solve(clear, **solve)
         clear_bands = call(_sw_clear_band_sums)(clr_up, clr_dn, tables=tables)
         del clr_up, clr_dn, clear
-    all_up, all_dn, all_dir = _sw_solve(optics, **solve)
-    return call(_sw_daylit_outputs)(columns, all_up, all_dn, all_dir, clear_bands, mu0, cloudy,
-                                    grid_tau, tables=tables, config=config)
+    if banded:
+        bands = _sw_solve_banded(optics, mask=mask, cloudy=cloudy, band_lims_gpt=table_metadata(tables)["sw_band_lims_gpt"],
+                                 mu0=mu0, sfc_alb_dir=solve["sfc_alb_dir"], sfc_alb_dif=solve["sfc_alb_dif"],
+                                 inc_flux=solve["inc_flux"], region=region)
+    else:
+        bands = call(_sw_spectral_band_sums)(*_sw_solve(optics, **solve), tables=tables)
+    del mask, optics
+    return call(_sw_daylit_outputs)(columns, *bands, clear_bands, mu0, cloudy, grid_tau, tables=tables, config=config)
 
 
 def _sw_clear_band_sums(up, down, *, tables):
@@ -1923,19 +2243,20 @@ def _sw_clear_band_sums(up, down, *, tables):
     return _band_sums(up, limits), _band_sums(down, limits)
 
 
-def _sw_daylit_outputs(columns, all_up, all_dn, all_dir, clear_bands, mu0, cloudy,
+def _sw_spectral_band_sums(all_up, all_dn, all_dir, *, tables):
+    """Band sums of whole-spectrum all-sky fluxes; only the surface direct flux is read (``_sw_daylit_outputs``)."""
+    band_lims_gpt = table_metadata(tables)["sw_band_lims_gpt"]
+    return (_band_sums(all_up, band_lims_gpt), _band_sums(all_dn, band_lims_gpt),
+            _band_sums(all_dir[:, :1], band_lims_gpt))
+
+
+def _sw_daylit_outputs(columns, all_up_b, all_dn_b, all_dir_b, clear_bands, mu0, cloudy,
                        grid_tau_band11, *, tables, config):
+    """Outputs from the all-sky band sums (``all_*_b``: one tensor per band; the surface direct flux of each)."""
     band_lims_gpt = table_metadata(tables)["sw_band_lims_gpt"]
     nband = len(band_lims_gpt)
     ibd, ibd_uv = _sw_band_split(tables)
     col_day = columns["day"]
-    all_up_b = _band_sums(all_up, band_lims_gpt)
-    del all_up
-    all_dn_b = _band_sums(all_dn, band_lims_gpt)
-    del all_dn
-    # Only the surface direct flux is read (the component sums below).
-    all_dir_b = _band_sums(all_dir[:, :1], band_lims_gpt)
-    del all_dir
     if not config.swhtr:
         clr_up_b, clr_dn_b = all_up_b, all_dn_b
     else:
@@ -2004,6 +2325,7 @@ def run_rrtmgp_sw_main(
     day_fraction: float = 1.0,
     blocks=None,
     overlap: Mapping[str, torch.Tensor] | None = None,
+    inference: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Port ``rrtmgp_sw_main_run`` with ``rrtmgp_sw_phys_blksz = 1``.
 
@@ -2015,7 +2337,8 @@ def run_rrtmgp_sw_main(
     result does not depend on the buffer; a buffer too small for the daylit columns sets the
     region's overflow bit. ``day_fraction`` 1.0 runs every column. ``blocks(fn, columns, **kw)``,
     if given, runs ``_sw_daylit_columns`` over blocks of the buffer's columns (the host's column
-    chunks); every column computes alone, so blocks do not change the result.
+    chunks); every column computes alone, so blocks do not change the result. ``inference``: no derivative is
+    formed (``_derivative_free``).
     """
 
     table = reduce_gas_optics_table(tables.files["sw_gas"])
@@ -2052,7 +2375,7 @@ def run_rrtmgp_sw_main(
     columns.update({name: state[f"{name}_prev"] for name in _SW_OUTPUTS})
     # Night columns (and every column of a call without daylight) get zero first.
     columns["cldtausw"] = torch.zeros_like(state["cldtausw_prev"])
-    options = {"toa_gpt": toa_gpt, "tables": tables, "config": config}
+    options = {"toa_gpt": toa_gpt, "tables": tables, "config": config, "inference": inference}
 
     def daylit(part: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         if blocks is None:
@@ -2098,12 +2421,13 @@ def run_rrtmgp_lw_main(
     tables: RrtmgpTableBundle,
     blocks=None,
     overlap: Mapping[str, torch.Tensor] | None = None,
+    inference: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Port ``rrtmgp_lw_main_run`` (``doGP_lwscat``, one angle, ``rrtmgp_lw_phys_blksz = 1``).
 
     ``blocks(fn, columns, **kw)``, if given, runs the column work (``_lw_columns``) over blocks of
     the columns (the host's column chunks); every column computes alone, so blocks do not change
-    the result.
+    the result. ``inference``: no derivative is formed (``_derivative_free``).
     """
 
     table = reduce_gas_optics_table(tables.files["lw_gas"])
@@ -2114,7 +2438,7 @@ def run_rrtmgp_lw_main(
     columns.update(_optional_columns(pre, config, overlap))
     if config.iaerflg != 0 and "aerosol_cm" in pre:
         columns.update({name: pre[name] for name in _AEROSOL_PREPARATION_FIELDS})
-    options = {"tables": tables, "config": config}
+    options = {"tables": tables, "config": config, "inference": inference}
     fluxes = _lw_columns(columns, **options) if blocks is None else blocks(_lw_columns, columns, **options)
     return {
         **fluxes,
@@ -2124,33 +2448,53 @@ def run_rrtmgp_lw_main(
     }
 
 
-def _lw_column_optics(columns, tau, *, tables, config):
-    table = reduce_gas_optics_table(tables.files["lw_gas"])
-    gpt_to_band = table.gpt_to_band.to(device=columns["p_lay"].device, dtype=torch.int64)
-    nband = table.nband
-    ngpt = table.ngpt
-    nlay, ncol = columns["p_lay"].shape
-    cloud = columns
-
+def _lw_surface_emissivity(columns, *, ngpt):
+    """The LW surface emissivity of each g-point ``[ngpt, ncol]`` (``semis``; 1 outside ``(EPS_PRE, 1]``)."""
     semis = columns["semis"]
     emis_col = torch.where((semis > EPS_PRE) & (semis <= 1.0), semis, torch.ones_like(semis))
-    sfc_emis = emis_col.unsqueeze(0).expand(ngpt, ncol)
+    return emis_col.unsqueeze(0).expand(ngpt, emis_col.shape[0])
 
+
+def _lw_aerosol_tau(columns, config, *, band_axis=0):
+    """The MERRA-2 LW aerosol optical depth by band ``[nband, nlay, ncol]`` (``band_axis`` 1: ``[nlay, nband,
+    ncol]``): the 1scl increment of the clear sky uses the extinction only."""
+    preparation = (tuple(columns[name] for name in _AEROSOL_PREPARATION_FIELDS) if "aerosol_cm" in columns
+                   else None)
+    return merra2_band_optics(config.merra2_optics, columns["aer_nm"], columns["p_lev"], columns["p_lay"],
+                              columns["tv_lay"], columns["relhum"], tuple(range(NBDSW, NBDSW + NBDLW)),
+                              preparation=preparation, tau_only=True, band_axis=band_axis)[0]
+
+
+def _lw_column_optics(columns, tau, *, tables, config):
+    """Clear-sky optical depth (gas plus aerosol, by g-point), surface emissivity, cloud band optics and the
+    cloudy-column flag of the whole-column LW solve."""
+    table = reduce_gas_optics_table(tables.files["lw_gas"])
+    gpt_to_band = table.gpt_to_band.to(device=columns["p_lay"].device, dtype=torch.int64)
+    sfc_emis = _lw_surface_emissivity(columns, ngpt=table.ngpt)
     clr_tau = tau
-    if config.iaerflg != 0:
-        # 1scl aerosol optical depth (MERRA-2 extinction) incremented into the clear sky by band
-        aer_tau, _, _ = merra2_lw_optics(config.merra2_optics, columns["aer_nm"], columns["p_lev"],
-                                         columns["p_lay"], columns["tv_lay"], columns["relhum"],
-                                         preparation=(tuple(columns[name] for name in _AEROSOL_PREPARATION_FIELDS)
-                                                      if "aerosol_cm" in columns else None))
-        clr_tau = clr_tau + _band_to_gpt(aer_tau, gpt_to_band)
-        del aer_tau
-    # else iaerflg = 0: the 1scl aerosol increment adds a zero optical depth
+    if config.iaerflg != 0:  # iaerflg = 0: the 1scl aerosol increment adds a zero optical depth
+        clr_tau = clr_tau + _band_to_gpt(_lw_aerosol_tau(columns, config), gpt_to_band)
+    c_tau, c_ssa, c_g, cloudy = _lw_cloud_band_optics(columns, tables=tables, config=config)
+    return clr_tau, sfc_emis, c_tau, c_ssa, c_g, cloudy
 
+
+def _lw_band_aerosol(columns, config):
+    """``_lw_aerosol_tau`` of the banded solve, level-major (``_level_major_bands``): read by band rows in place."""
+    return _level_major_bands(_lw_aerosol_tau(columns, config, band_axis=1))
+
+
+def _lw_cloud_band_optics(columns, *, tables, config, level_major=False):
+    """Band cloud and precipitation optics of ``_lw_column_optics`` (``c_tau, c_ssa, c_g``) and the
+    cloudy-column flag. They do not read the gas optics, so an inference caller forms them first,
+    while no spectral array is live (``level_major``: the band arrays as ``_level_major_bands``)."""
+    cloud = columns
+    ncol = columns["p_lay"].shape[1]
     zcf1 = _column_cloudiness(cloud["cld_frac"])
     cloudy = zcf1 > EPS_PRE
     rough = config.nrghice - 1
-    c_tau, c_ssa, c_g, _ = _cloud_optics_sum(compute_longwave_cloud_optics_byband, cloud, tables=tables, rough=rough)
+    band_axis = 1 if level_major else 0  # level-major: computed [nlay, nband, ncol] (_level_major_bands)
+    c_tau, c_ssa, c_g, _ = _cloud_optics_sum(compute_longwave_cloud_optics_byband, cloud, tables=tables, rough=rough,
+                                             band_axis=band_axis)
     zero_band = torch.zeros_like(c_tau)
     cloudy_b = cloudy.reshape(1, 1, ncol)
     c_tau = torch.where(cloudy_b, c_tau, zero_band)
@@ -2160,10 +2504,12 @@ def _lw_column_optics(columns, tau, *, tables, config):
     snow_ok = (cloud["cld_swp"] > 0.0) & (cloud["cld_resnow"] > 10.0)
     tau_rain = ABSRAIN * cloud["cld_rwp"]
     tau_snow = torch.where(snow_ok, ABSSNOW0 * 1.05756 * cloud["cld_swp"] / cloud["cld_resnow"], torch.zeros_like(tau_rain))
-    p_tau = torch.where(active, tau_rain + tau_snow, torch.zeros_like(tau_rain)).unsqueeze(0).expand(nband, nlay, ncol)
+    p_tau = torch.where(active, tau_rain + tau_snow, torch.zeros_like(tau_rain)).unsqueeze(band_axis).expand(c_tau.shape)
     c_tau, c_ssa, c_g = _inc_2str(c_tau, c_ssa, c_g, p_tau, zero_band, zero_band)
     del p_tau, zero_band
-    return clr_tau, sfc_emis, c_tau, c_ssa, c_g, cloudy
+    if level_major:
+        c_tau, c_ssa, c_g = (_level_major_bands(x) for x in (c_tau, c_ssa, c_g))
+    return c_tau, c_ssa, c_g, cloudy
 
 
 def _lw_clear_secant(clr_tau, *, tables):
@@ -2182,8 +2528,8 @@ def _lw_allsky_fields(columns, clr_tau, c_tau, c_ssa, c_g, cloudy, *, tables, co
     gpt_to_band = table.gpt_to_band.to(device=clr_tau.device, dtype=torch.int64)
     ngpt, nlay, ncol = clr_tau.shape
     cloud = columns
-    mask = sampled_mask(_mcica_draws(columns["icsdlw"], ngpt=ngpt, nlay=nlay, dtype=cloud["cld_frac"].dtype), cloud["cld_frac"],
-                        config, columns.get("cloud_overlap_param")) & cloudy.reshape(1, 1, ncol)
+    mask = mcica_cloud_mask(columns["icsdlw"], cloud["cld_frac"], columns.get("cloud_overlap_param"), ngpt=ngpt,
+                            iovr=config.iovr, column_cloudy=cloudy)
     s_tau = torch.where(mask, _band_to_gpt(c_tau, gpt_to_band), torch.zeros_like(mask, dtype=c_tau.dtype))
     s_ssa = torch.where(mask, _band_to_gpt(c_ssa, gpt_to_band), torch.zeros_like(mask, dtype=c_tau.dtype))
     s_g = torch.where(mask, _band_to_gpt(c_g, gpt_to_band), torch.zeros_like(mask, dtype=c_tau.dtype))
@@ -2212,31 +2558,160 @@ def _lw_allsky_transport(columns, clr_tau, c_tau, c_ssa, c_g, cloudy, lay_source
     return _lw_transport_optics(fields, level_major=level_major)
 
 
+def _derivative_free() -> bool:
+    """No derivative is being formed: grad mode off, no forward-mode level, no functorch transform.
+
+    ``run_radiation_group`` decides it once per call (``inference``) and passes it down: the inference forms
+    (banded solves, in-place minor gases, reused index buffers) run only then."""
+    return (not torch.is_grad_enabled() and not torch_compat.forward_ad_active()
+            and torch_compat.functorch_level() is None)
+
+
+def _lw_cloud_mask(columns, cloudy, *, ngpt, config, region=None):
+    """McICA cloud mask of ``_lw_allsky_fields`` (boolean ``[ngpt, nlay, ncol]``)."""
+    return mcica_cloud_mask(columns["icsdlw"], columns["cld_frac"], columns.get("cloud_overlap_param"), ngpt=ngpt,
+                            iovr=config.iovr, region=region, column_cloudy=cloudy)
+
+
+def _lw_band_transport(clr_tau, mask, c_tau, c_ssa, c_g, secant, pfrac, lay_planck, lev_planck, *, aerosol=None):
+    """All-sky transport optics of one band's g-points for the whole column, from the inputs the full-column form
+    starts from.
+
+    ``clr_tau``, ``mask``, ``pfrac``: ``[ngpt, nlay, ncol]`` (the band's g-points); ``c_*``, ``lay_planck``,
+    ``aerosol``: ``[1, nlay, ncol]``, the band's row, which every g-point of the band reads by broadcasting;
+    ``lev_planck``: ``[1, nlay + 1, ncol]``. The all-sky fields and the layer and level sources are the elements of
+    ``_lw_allsky_fields`` and ``_longwave_sources_tensor``; the transport is ``_lw_transport_optics`` itself, so the
+    values equal the full-column form bit for bit. Returns ``trans, source_up, source_dn, cn`` as whole
+    ``[ngpt, nlay, ncol]`` arrays in the layout their pointwise kernel computes them; the sweeps of ``_lw_solve``
+    read their level slices in place (``level_axis=1``)."""
+    if aerosol is not None:  # the band aerosol optical depth
+        clr_tau = clr_tau + aerosol
+    nlay = clr_tau.shape[1]
+    s_tau = torch.where(mask, c_tau, 0.0)
+    s_ssa = torch.where(mask, c_ssa, 0.0)
+    s_g = torch.where(mask, c_g, 0.0)
+    del mask
+    fields = {"tau": s_tau + clr_tau}
+    fields["ssa"] = s_tau * s_ssa / torch.clamp_min(fields["tau"], _optics_eps(fields["tau"].dtype))
+    del s_tau, s_ssa
+    fields["g"] = s_g
+    fields["secant"] = secant
+    fields["lay_source"] = pfrac * lay_planck
+    # Level sources (_longwave_sources_tensor): the bottom and top levels of the column take their one adjacent
+    # layer, the others the geometric mean of the two. They are formed as the two [ngpt, nlay, ncol] arrays the
+    # layer sources read (each layer's upper and lower level), in the layers' own index space, so no level array is
+    # joined and written; the transport kernel forms each element from pfrac and the band's level Planck row. Same
+    # expression per level; the padded rows are discarded by the where.
+    level = torch.arange(nlay, device=pfrac.device).view(1, nlay, 1)
+    lower = torch.nn.functional.pad(pfrac[:, :-1], (0, 0, 1, 0))
+    lev_dn = torch.where(level == 0, pfrac * lev_planck[:, :nlay], torch.sqrt(lower * pfrac) * lev_planck[:, :nlay])
+    upper = torch.nn.functional.pad(pfrac[:, 1:], (0, 0, 0, 1))
+    lev_up = torch.where(level == nlay - 1, pfrac * lev_planck[:, 1:], torch.sqrt(pfrac * upper) * lev_planck[:, 1:])
+    fields["lev_source"] = (lev_up, lev_dn)
+    del level
+    return _lw_transport_optics(fields, level_major=False)
+
+
+def _lw_solve_banded(inputs, *, sfc_emis, sfc_src, region, band_lims_gpt, weight: float = 1.0, aerosol=None):
+    """``_lw_solve`` of the all-sky transport one band at a time (inference).
+
+    ``inputs`` are the whole-spectrum fields the transport starts from (``_lw_band_transport``); ``aerosol``: band
+    aerosol optical depth ``[nband, nlay, ncol]``. Each band forms its transport once for the whole column and runs
+    the three sweeps of ``_lw_solve`` on it: no sweep rebuilds the transport, and only one band's transport and level
+    spectra are live. The fluxes are the band sums of ``_sum_gpoints_by_band_then_bands`` (sequential g-point sums
+    per band), added over the bands in band order: the same sums in the same order, so the same values.
+    """
+    clr_tau, mask, c_tau, c_ssa, c_g, secant, pfrac, lay_planck, lev_planck = inputs
+    # The band regions read coalesced band rows: band arrays that arrive band-innermost (a column stride of nband) are
+    # copied column-innermost once (round 6: strided reads made the LW sweeps 144 -> 642 ms). The inference producers
+    # write the cloud and aerosol band arrays level-major (_level_major_bands), which needs no copy.
+    c_tau, c_ssa, c_g, lay_planck, lev_planck = (_column_innermost(x) for x in (c_tau, c_ssa, c_g, lay_planck, lev_planck))
+    aerosol = None if aerosol is None else _column_innermost(aerosol)
+    call = (lambda fn: fn) if region is None else region
+    # With a region, the band regions take the band's g-points as a dynamic axis (_any_width).
+    width_free = (lambda values: values) if region is None else _any_width
+    width = max(int(hi) - int(lo) + 1 for lo, hi in band_lims_gpt)
+    flux_up = flux_dn = None
+    sums = None  # with a region: the per-level sums of the bands so far (``_lw_solve`` level_sums)
+    for band, (lo, hi) in enumerate(band_lims_gpt):
+        g = slice(int(lo) - 1, int(hi))
+        b = slice(band, band + 1)
+        # The band's own rows of the band arrays, which its g-points (bands are contiguous) read by broadcasting:
+        # the same values as a gather of row 0, without an index tensor.
+        transport = call(_lw_band_transport)(*width_free((clr_tau[g], mask[g])), c_tau[b], c_ssa[b], c_g[b],
+                                             *width_free((secant[g], pfrac[g])), lay_planck[b], lev_planck[b],
+                                             aerosol=None if aerosol is None else aerosol[b])
+        up, dn = _lw_solve(sfc_emis=sfc_emis[g], sfc_src=sfc_src[g], weight=weight, region=region,
+                           band_lims_gpt=[(1, int(hi) - int(lo) + 1)], transport_optics=transport, level_sums=width,
+                           previous=sums, level_axis=1)
+        del transport
+        if region is not None:
+            sums = up, dn
+        else:
+            flux_up = up if flux_up is None else flux_up + up
+            flux_dn = dn if flux_dn is None else flux_dn + dn
+    if region is not None:
+        return torch.cat(sums[0], dim=0), torch.cat(sums[1], dim=0)
+    return flux_up, flux_dn
+
+
 def _lw_columns(columns: dict[str, torch.Tensor], *, tables: RrtmgpTableBundle,
-                config: RadiationConfig, region=None) -> dict[str, torch.Tensor]:
-    """Column orchestration; only bounded tensor regions enter the compiler."""
+                config: RadiationConfig, region=None, inference=False) -> dict[str, torch.Tensor]:
+    """The LW column work; only bounded tensor regions enter the compiler.
+
+    ``inference`` (no derivative is formed, ``_derivative_free``) without a clear-sky solve takes the banded forms:
+    the all-sky solve runs one band at a time (``_lw_solve_banded``), the same values with one band's transport and
+    level spectra live: without them a full-batch call at high resolution does not fit in GPU memory. A derivative
+    keeps the whole-spectrum transport, whose reverse pass saves each transport array once."""
     call = (lambda fn: fn) if region is None else region
     limits = table_metadata(tables)["lw_band_lims_gpt"]
     table = reduce_gas_optics_table(tables.files["lw_gas"])
-    coordinates = _column_gas_coordinates(columns, table, region)
-    preparation = _prepare_longwave_gas_v17(table, columns, coordinates=coordinates, region=region)
-    gas = longwave_gas_optics_v17(table, columns, coordinates=coordinates, preparation=preparation, region=region)
+    banded = inference and not config.lwhtr
+    coordinates = _column_gas_coordinates(columns, table, region, compact=banded)
+    # The banded forms take each major weight from fminor and the pressure fraction (no plan fmajor): the banded
+    # eager interpolation per band, the compiled one inside its kernel.
+    preparation = _prepare_longwave_gas_v17(table, columns, coordinates=coordinates, region=region,
+                                            major_weights=not banded)
+    gas = longwave_gas_optics_v17(table, columns, coordinates=coordinates, preparation=preparation, region=region,
+                                  sources=not banded, band_flavors=table_metadata(tables)["lw_band_flavors"],
+                                  inference=inference)
+    planck_by_band = preparation.planck_by_band
     del coordinates, preparation
+    if banded:
+        # Cloud band optics and the McICA mask (seeded per column) after the gas optics: they are not live during
+        # the absorption region, the step's largest. The band aerosol is added per band in the solve, so no
+        # whole-spectrum clear-sky copy of tau is made.
+        c_tau, c_ssa, c_g, cloudy = call(_lw_cloud_band_optics)(columns, tables=tables, config=config,
+                                                                 level_major=True)
+        # Its twist and layer steps are regions of their own (mcica_cloud_mask), not one region over all layers.
+        mask = _lw_cloud_mask(columns, cloudy, ngpt=table.ngpt, config=config, region=region)
+        sfc_emis = _lw_surface_emissivity(columns, ngpt=table.ngpt)
+        aerosol = call(_lw_band_aerosol)(columns, config) if config.iaerflg != 0 else None
+        tau = gas.pop("tau")
+        secant = tau.new_full((table.ngpt, tau.shape[2]), GAUSS_DS_1)
+        inputs = (tau, mask, c_tau, c_ssa, c_g, secant, gas.pop("pfrac"), planck_by_band[1], planck_by_band[2])
+        del tau, mask, c_tau, c_ssa, c_g, cloudy, planck_by_band
+        flux_all_up, flux_all_dn = _lw_solve_banded(inputs, sfc_emis=sfc_emis, sfc_src=gas["sfc_source"],
+                                                  region=region, band_lims_gpt=limits, aerosol=aerosol)
+        del inputs, gas, aerosol
+        return dict(zip(_LW_OUTPUTS, (flux_all_up, flux_all_dn, torch.zeros_like(flux_all_up),
+                                      torch.zeros_like(flux_all_dn))))
     clr_tau, sfc_emis, c_tau, c_ssa, c_g, cloudy = call(_lw_column_optics)(
         columns, gas.pop("tau"), tables=tables, config=config)
+    del planck_by_band
     # Clear-sky fluxes are reduced before all-sky optics become live.
     if config.lwhtr:
         transport = call(_lw_clear_transport)(clr_tau, gas["lay_source"], gas["lev_source"],
             tables=tables, level_major=region is not None)
         flux_clr_up, flux_clr_dn = _lw_solve(
-            {}, sfc_emis=sfc_emis, sfc_src=gas["sfc_source"], region=region,
+            sfc_emis=sfc_emis, sfc_src=gas["sfc_source"], region=region,
             band_lims_gpt=limits, transport_optics=transport)
         del transport
     transport = call(_lw_allsky_transport)(columns, clr_tau, c_tau, c_ssa, c_g, cloudy,
         gas.pop("lay_source"), gas.pop("lev_source"), tables=tables, config=config,
         level_major=region is not None)
     del clr_tau, c_tau, c_ssa, c_g, cloudy
-    flux_all_up, flux_all_dn = _lw_solve({}, sfc_emis=sfc_emis, sfc_src=gas["sfc_source"],
+    flux_all_up, flux_all_dn = _lw_solve(sfc_emis=sfc_emis, sfc_src=gas["sfc_source"],
         region=region, band_lims_gpt=limits, transport_optics=transport)
     del transport, gas
     if not config.lwhtr:
@@ -2359,8 +2834,16 @@ def run_radiation_post(
 # ---------------------------------------------------------------------------
 # group driver
 # ---------------------------------------------------------------------------
-def _group_head(state: Mapping[str, torch.Tensor], config: RadiationConfig, bundle: RrtmgpTableBundle):
-    """The group up to the mains: setup, pre, MERRA-2 aerosol, surface, cloud, overlap, diagnostics."""
+def _group_head(state: Mapping[str, torch.Tensor], config: RadiationConfig, bundle: RrtmgpTableBundle,
+                scales: Mapping[str, torch.Tensor] | None = None):
+    """The group up to the mains: setup, pre, MERRA-2 aerosol, surface, cloud, overlap, diagnostics.
+
+    ``scales``: the trainable scales by name (``run_rrtmgp_cloud_mp``; ``decorr`` for the overlap), 0-d or
+    1-element. A compiled region takes them as 1-element views (a 0-d CPU argument costs a guard host read per
+    call); they act as 0-d tensors from here.
+    """
+    if scales is not None:
+        scales = {name: value.reshape(()) for name, value in scales.items()}
 
     r1, slag, sdec, cdec = _solar_state(
         config.jdat, con_pi=CON_PI, device=state["prsl"].device
@@ -2385,8 +2868,9 @@ def _group_head(state: Mapping[str, torch.Tensor], config: RadiationConfig, bund
         pre = {**pre, "aer_nm": aer_nm, **dict(zip(_AEROSOL_PREPARATION_FIELDS, preparation))}
     surface = radiation_surface(state, pre, config)
     state = {**state, **surface}
-    cloud = run_rrtmgp_cloud_mp(state, pre, config, tables=bundle)
-    overlap = run_rrtmgp_cloud_overlap(state, cloud, config, pre=pre)
+    cloud = run_rrtmgp_cloud_mp(state, pre, config, tables=bundle, scales=scales)
+    overlap = run_rrtmgp_cloud_overlap(state, cloud, config, pre=pre,
+                                       decorr_scale=scales["decorr"] if scales and "decorr" in scales else None)
     diagnostics = cloud_diagnostics(state, pre, cloud, config, overlap=overlap)
     setup = {k: v.to(dtype=state['prsl'].dtype, device=state['prsl'].device)
              for k, v in (('slag', slag), ('sdec', sdec), ('cdec', cdec), ('solcon', solcon))}
@@ -2411,6 +2895,7 @@ def run_radiation_group(
     sw_day_fraction: float = 1.0,
     blocks=None,
     region=None,
+    parameter_scales: Mapping[str, torch.Tensor] | None = None,
 ) -> dict[str, dict[str, torch.Tensor]]:
     """Run the ported radiation group; returns the per-scheme output dictionaries.
 
@@ -2418,17 +2903,21 @@ def run_radiation_group(
     runs the column work of both mains over column blocks (``run_rrtmgp_sw_main``). ``region(fn)``,
     if given, wraps the whole-mesh parts around the mains (``_group_head``, ``_group_tail``), e.g.
     as compiled regions when the host compiles the column blocks separately.
+    ``parameter_scales``: trainable scales by name, 0-d or 1-element (``_group_head``); None or absent names: no op.
     """
 
     config.require_supported()
     bundle = tables if tables is not None else load_rrtmgp_tables(device=state["prsl"].device)
     head, tail = (_group_head, _group_tail) if region is None else (region(_group_head), region(_group_tail))
-    solcon, setup, pre, aerosol, surface, cloud, overlap, diagnostics = head(state, config, bundle)
+    # The inference forms run only when no derivative is formed; decided once here and passed down.
+    inference = _derivative_free()
+    solcon, setup, pre, aerosol, surface, cloud, overlap, diagnostics = head(state, config, bundle, parameter_scales)
     config = replace(config, solcon=solcon)
     state = {**state, **surface}
     sw = run_rrtmgp_sw_main(state, pre, cloud, config, tables=bundle, day_fraction=sw_day_fraction, blocks=blocks,
-                            overlap=overlap)
-    lw = run_rrtmgp_lw_main(state, pre, cloud, config, tables=bundle, blocks=blocks, overlap=overlap)
+                            overlap=overlap, inference=inference)
+    lw = run_rrtmgp_lw_main(state, pre, cloud, config, tables=bundle, blocks=blocks, overlap=overlap,
+                            inference=inference)
     post = tail(state, pre, sw, lw, config, aerosol, diagnostics)
     pre = {name: value for name, value in pre.items() if name not in _AEROSOL_PREPARATION_FIELDS}
     return {"setup": setup, "pre": pre, "surface": surface, "cloud_mp": cloud, "cloud_overlap": overlap,
@@ -2443,8 +2932,7 @@ __all__ = [
     "coszmn_with_daily",
     "gfs_mersenne_twister_uniform",
     "longwave_gas_optics_v17",
-    "lw_solver_noscat_v17",
-    "mcica_randoms_maxrand",
+    "mcica_cloud_mask",
     "run_radiation_group",
     "run_radiation_post",
     "run_rrtmgp_cloud_mp",
@@ -2452,7 +2940,5 @@ __all__ = [
     "run_rrtmgp_lw_main",
     "run_rrtmgp_pre",
     "run_rrtmgp_sw_main",
-    "sampled_mask_maxrand",
     "shortwave_gas_optics_v17",
-    "sw_solver_2stream_v17",
 ]

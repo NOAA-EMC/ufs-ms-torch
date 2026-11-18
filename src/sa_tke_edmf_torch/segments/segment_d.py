@@ -10,10 +10,8 @@ from ufs_physics_common.precision import working_power
 
 from sa_tke_edmf_torch.autodiff import safe_positive_denominator, safe_sqrt_nonnegative
 from sa_tke_edmf_torch.compile import run_compile_island
-from sa_tke_edmf_torch.constants import FV, GRAV, IM, KM, NTRAC, NTQV, QMIN, source_real
+from sa_tke_edmf_torch.constants import FV, GRAV, NTQV, QMIN, source_real
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
-
-CHECKPOINT_FIELDS = ("hpbl", "kpbl", "rbup", "rbdn", "pblflg")
 
 
 def _take_level(values: torch.Tensor, one_based_index: torch.Tensor) -> torch.Tensor:
@@ -239,5 +237,3 @@ def _interpolated_hpbl(
     return torch.where(kpblx > 1, z_lower + rbint * (z_upper - z_lower), zl[:, 0])
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

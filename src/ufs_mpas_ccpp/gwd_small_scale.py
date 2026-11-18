@@ -7,6 +7,7 @@ import math
 from collections.abc import Mapping
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from gfs_surface_layer_torch.driver import CP, GRAV, RD, RVRDM1
 from sa_tke_edmf_torch.diagnostics import add_diagnostic_
 
@@ -45,13 +46,18 @@ def small_scale_gwd_inputs(
 
 def drag_suite_psl(
     fields: Mapping[str, torch.Tensor], *, dtp: torch.Tensor,
-    alpha_fd: torch.Tensor, control: Mapping[str, object],
+    alpha_fd: torch.Tensor, control: Mapping[str, object], dx_factor_scale: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Port drag_suite_psl: SS, then TOFD, then large-scale GWD plus blocking (LS/BL).
 
     R4 (unified_ugwp) runs SS/TOFD after legacy gwdps; GFS v17 (ugwpv1_gsldrag) runs
     LS/BL and TOFD here. The source's gsd_diss_ht_opt=0 leaves temperature tendency at zero.
+    dx_factor_scale (parameter scale gwd.dx_factor, a device-local scalar in the working dtype, or its 1-element
+    view as a compiled region's argument) multiplies the LS effective length cleff = psl_gwd_dx_factor*dx; None
+    leaves the source expression.
     """
+    if dx_factor_scale is not None:
+        dx_factor_scale = dx_factor_scale.reshape(())
     t, u, v, q = (fields[n] for n in ("t1", "u1", "v1", "q1"))
     prsi, prsl, prslk, phil, dp = (fields[n] for n in ("prsi", "prsl", "prslk", "phil", "del"))
     if t.ndim != 2 or t.dtype not in WORKING_DTYPES or t.shape[1] < 4:
@@ -61,11 +67,13 @@ def drag_suite_psl(
         value = fields[name]
         if value.shape != t.shape or value.dtype != t.dtype or value.device != t.device:
             raise ValueError(f"invalid PSL field {name}")
-    for name, value in (("dtp", dtp), ("alpha_fd", alpha_fd)):
+    scalars = (("dtp", dtp), ("alpha_fd", alpha_fd)) + (
+        () if dx_factor_scale is None else (("dx_factor_scale", dx_factor_scale),))
+    for name, value in scalars:
         if value.shape != () or value.dtype != t.dtype or value.device != t.device:
             raise ValueError(f"PSL {name} requires a device-local scalar in the working dtype")
     kpbl = fields["kpbl"].to(torch.int64)
-    torch._assert_async(((kpbl >= 1) & (kpbl <= km)).all(), "invalid PSL PBL index")
+    torch_compat.assert_async(((kpbl >= 1) & (kpbl <= km)).all(), "invalid PSL PBL index")
     vtj = t * (1.0 + RVRDM1 * q)
     ro = (1.0 / RD) * prsl / vtj
     zl = phil * (1.0 / GRAV)
@@ -104,7 +112,7 @@ def drag_suite_psl(
     if control["do_gsl_drag_ls_bl"]:
         large = _large_scale_and_blocking(fields, t=t, u=u, v=v, var=var, zl=zl, ro=ro, vtj=vtj,
             land=land, kbl=kbl, zlowtop=zlowtop, delks=delks, ubar=ubar, vbar=vbar, nwd=nwd, dtp=dtp,
-            control=control)
+            control=control, dx_factor_scale=dx_factor_scale)
     wave_u, wave_v = torch.zeros_like(t), torch.zeros_like(t)
     form_u, form_v = torch.zeros_like(t), torch.zeros_like(t)
     if control["do_gsl_drag_ss"]:
@@ -185,7 +193,7 @@ def drag_suite_psl(
             process = control["index_of_process_orographic_gwd"] - 1
             for name, wave, form in (("index_of_x_wind", wave_u, form_u), ("index_of_y_wind", wave_v, form_v)):
                 slot = fields["dtidx"][control[name] - 1, process]
-                torch._assert_async(slot <= dtend.shape[2], "PSL diagnostic slot outside allocation")
+                torch_compat.assert_async(slot <= dtend.shape[2], "PSL diagnostic slot outside allocation")
                 if control["do_gsl_drag_ss"]:
                     add_diagnostic_(dtend, wave * dtp, slot)
                 if control["do_gsl_drag_tofd"]:
@@ -223,7 +231,7 @@ def _minimum(current: torch.Tensor, candidate: torch.Tensor) -> torch.Tensor:
 
 
 def _large_scale_and_blocking(fields, *, t, u, v, var, zl, ro, vtj, land, kbl, zlowtop, delks,
-                              ubar, vbar, nwd, dtp, control):
+                              ubar, vbar, nwd, dtp, control, dx_factor_scale=None):
     """drag_suite_psl large-scale GWD (Kim-Arakawa) and flow blocking (Kim-Doyle), gwd_opt_ls=bl=1.
 
     Returns the per-level tendencies dtaux/dtauy (LS) and dtauxb/dtauyb (BL), the tapered-column
@@ -253,6 +261,9 @@ def _large_scale_and_blocking(fields, *, t, u, v, var, zl, ro, vtj, land, kbl, z
     diagonal = torch.sqrt(dx * dx + dx * dx)
     along = torch.where(index.squeeze(1) >= 2, diagonal, dx)  # dxy4(dir) = dxy4p(dir) for delx = dely
     cleff = control["psl_gwd_dx_factor"] * (dx + dx) * 0.5
+    if dx_factor_scale is not None:
+        # gwd.dx_factor: cleff*s after the source expression (s = 1 is bit for bit); xlinv = coefm/cleff below.
+        cleff = cleff * dx_factor_scale
     # Reference and blocking heights.
     levels = torch.arange(1, km + 1, device=dev)
     kbmax = _first_hit(zl[:, 1:] >= (fields["elvmax"] + zlowtop)[:, None], levels[1:] + 1)
@@ -333,7 +344,7 @@ def _large_scale_and_blocking(fields, *, t, u, v, var, zl, ro, vtj, land, kbl, z
         taup[k] = torch.where(active, torch.where(rim <= 0.25, saturated, current), taup[k])
     # Flow blocking: dividing-streamline level kblk where potential energy exceeds kinetic energy.
     # kbmax = km + 1 (blocking top above the model top) reads past the source array; not reached.
-    torch._assert_async((~lsm | (kbmax <= km)).all(), "PSL blocking launch level above the model top")
+    torch_compat.assert_async((~lsm | (kbmax <= km)).all(), "PSL blocking launch level above the model top")
     zl_bmax = zl.gather(1, torch.clamp(kbmax - 1, min=0, max=km - 1)[:, None]).squeeze(1)
     pe = torch.zeros_like(var)
     kblk = torch.zeros_like(kbl)

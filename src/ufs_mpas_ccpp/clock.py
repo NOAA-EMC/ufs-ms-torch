@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from .containers import static_tensor
 from rrtmgp_radiation_torch.setup import _iw3jdn
@@ -33,7 +34,7 @@ def advance_utc_date(
         raise ValueError("UTC advancement requires int32 NCEP date and float64 hours")
     date = initial_date.to(torch.int64)
     year, month, day, zone, hour, minute, second, millisecond = date.unbind()
-    torch._assert_async(
+    torch_compat.assert_async(
         (year >= 1583)
         & (year <= 3300)
         & (month >= 1)
@@ -52,7 +53,7 @@ def advance_utc_date(
         "invalid UTC initial date",
     )
     hours = forecast_hours.reshape(()) + hour.to(torch.float64)
-    torch._assert_async(
+    torch_compat.assert_async(
         torch.isfinite(hours) & (torch.abs(hours) < 2147483647.0),
         "UTC forecast interval exceeds source int32 hours",
     )
@@ -80,7 +81,7 @@ def advance_utc_date(
     length = m // 11
     m = m + 2 - 12 * length
     y = 100 * (century - 49) + y + length
-    torch._assert_async(
+    torch_compat.assert_async(
         (y >= 1583) & (y <= 3300), "UTC date exceeds source calendar range"
     )
     return torch.stack((y, m, d, zone, hh, mm, ss, ms)).to(torch.int32)
@@ -125,7 +126,7 @@ def prepare_physics_calendar(
                                dtype=torch.int64, device=jdat.device)
     days = month_days.gather(0, torch.clamp(month - 1, 0, 11).reshape(1)).reshape(())
     days = days + ((month == 2) & leap)
-    torch._assert_async(
+    torch_compat.assert_async(
         (year >= 1583) & (year <= 3300) & (month >= 1) & (month <= 12)
         & (day >= 1) & (day <= days) & (date[3] == 0)
         & (hour >= 0) & (hour < 24) & (minute >= 0) & (minute < 60)
@@ -167,7 +168,7 @@ def prepare_timestep_clock(
         or sec.device != dtp.device
     ):
         raise ValueError("invalid elapsed time/timestep dtype, shape or device")
-    torch._assert_async(
+    torch_compat.assert_async(
         (torch.isfinite(sec) & (sec >= 0.0)).all()
         & (torch.isfinite(dtp) & (dtp > 0.0)).all(),
         "invalid elapsed time or physics timestep",
@@ -175,7 +176,7 @@ def prepare_timestep_clock(
     sec, dtp = sec.reshape(()), dtp.reshape(())
     phour = sec / 3600.0
     step = (sec + dtp) / dtp
-    torch._assert_async(
+    torch_compat.assert_async(
         step < 2147483647.5, "physics step counter exceeds source int32"
     )
     kdt = _nint_nonnegative(step).to(torch.int32)

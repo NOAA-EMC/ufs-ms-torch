@@ -9,13 +9,10 @@ import torch
 
 from sa_sas_deep_convection_torch import recurrence_chunks as chunks
 from sa_sas_deep_convection_torch.compile import run_compile_island
-from sa_sas_deep_convection_torch.constants import KM
 from sa_sas_deep_convection_torch.ops import sqrt_zero_grad
 from sa_sas_deep_convection_torch.segments.segment_d import _gather_column
 from ufs_physics_common.ordered_sum import masked_sum
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
-
-CHECKPOINT_FIELDS = ("advfac", "dtconv", "xpwav", "xpwev", "mbdt", "edtx", "asqecflg")
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -39,14 +36,16 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
     xlamdet = state.require("xlamdet")
     xlamddt = state.require("xlamddt")
     xlamd = state.require("xlamd")
-    hcdo = state.require("hcdo").clone()
-    qcdo = state.require("qcdo").clone()
-    qrcd = state.require("qrcd").clone()
-    xpwev = state.require("xpwev").clone()
-    edtx = state.require("edtx").clone()
-    xaa0 = state.require("xaa0").clone()
-    dtconv = state.require("dtconv").clone()
-    advfac = state.require("advfac").clone()
+    # The islands below write no input (they copy before any indexed store), so the state's tensors enter them as
+    # they are: copies here cost one full pass each on the compacted buffer (round 8 wave 4).
+    hcdo = state.require("hcdo")
+    qcdo = state.require("qcdo")
+    qrcd = state.require("qrcd")
+    xpwev = state.require("xpwev")
+    edtx = state.require("edtx")
+    xaa0 = state.require("xaa0")
+    dtconv = state.require("dtconv")
+    advfac = state.require("advfac")
     u1 = state.require("u1")
     v1 = state.require("v1")
     gdx = state.require("gdx")
@@ -129,6 +128,7 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
         state.require("delt"),
         state.require("cat_adj_deep"),
         bool(state.config.get("hwrf_samfdeep", False)),
+        state.require("tau_scale") if "tau_scale" in state.fields else None,
     )
 
     return state.with_updates(
@@ -186,6 +186,7 @@ def _asqec_downdraft_advective_block(
     delt: torch.Tensor,
     cat_adj_deep: torch.Tensor,
     hwrf_samfdeep: bool,
+    tau_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     KM = zo.shape[1]
     asqec = asqecflg != 0.0
@@ -246,6 +247,8 @@ def _asqec_downdraft_advective_block(
     dtconv_candidate = depth / torch.where(cnvflg != 0.0, wc, torch.ones_like(wc))
     if not hwrf_samfdeep:
         dtconv_candidate = (1.0 + gdx / 75000.0) * dtconv_candidate
+    if tau_scale is not None:  # samf.tau_deep: the turnover time, before the clamp (a 1-element view, as 0-d)
+        dtconv_candidate = dtconv_candidate * tau_scale.reshape(())
     dtmin = torch.maximum(delt, torch.full_like(delt, 600.0))
     dtmax = torch.maximum(delt, torch.full_like(delt, 10800.0))
     dtconv_candidate = torch.minimum(torch.maximum(dtconv_candidate, dtmin), dtmax)
@@ -268,5 +271,3 @@ def _asqec_downdraft_advective_block(
     return hcdo, qcdo, qrcd, xpwev, edtx, xaa0, dtconv, sumx, umean, advfac
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

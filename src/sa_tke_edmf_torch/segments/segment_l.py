@@ -19,22 +19,15 @@ from sa_tke_edmf_torch.constants import (
     F32_0P55,
     F32_0P76,
     F32_ONE_THIRD,
-    FV,
-    GRAV,
     HFUS,
     HVAP,
-    IM,
-    KM,
     NTCW,
     NTIW,
-    NTRAC,
     QLMIN,
     source_real,
 )
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
 from sa_tke_edmf_torch.tracers import satmedmf_hydrometeor_indices
-
-CHECKPOINT_FIELDS = ("dku", "dkt", "dkq", "dku_h", "dkq_h")
 
 
 def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
@@ -375,5 +368,3 @@ def _take_level(values: torch.Tensor, one_based_index: torch.Tensor) -> torch.Te
     return values.gather(1, index[:, None]).squeeze(1)
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

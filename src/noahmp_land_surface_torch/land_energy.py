@@ -19,7 +19,6 @@ the frozen Noah-MP table file and accepts tensor state prepared by the caller.
 
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -29,7 +28,6 @@ import torch
 from ufs_physics_common.precision import working_power
 from .thermo import static_tensor
 
-from .compile import compile_categories_enabled, run_compile_island, vegetation_chunk_size
 from .tables import GFS_V17_PROFILE_SCM_TABLE_VARIANT, PACKAGE_TABLE_VARIANT, resolve_noahmp_table_path
 
 
@@ -44,7 +42,6 @@ NOAHMP_RAIR = 287.04
 NOAHMP_RW = 461.269
 NOAHMP_CWAT = 4.188e06
 NOAHMP_CICE = 2.094e06
-NOAHMP_TKWAT = 0.6
 NOAHMP_TKICE = 2.2
 NOAHMP_DENICE = 917.0
 NOAHMP_DENH2O = 1000.0
@@ -88,10 +85,6 @@ def _pow3(value: torch.Tensor) -> torch.Tensor:
 def _pow4(value: torch.Tensor) -> torch.Tensor:
     squared = value * value
     return squared * squared
-
-
-def _replace_column_tuple(columns: tuple[torch.Tensor, ...], index: int, values: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    return tuple(values if pos == int(index) else column for pos, column in enumerate(columns))
 
 
 def _columns_to_matrix(columns: tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -267,27 +260,6 @@ class BtranResult:
 
 
 @dataclass(frozen=True)
-class RagrbResult:
-    """Under-canopy aerodynamic resistances from ``ragrb``."""
-
-    ramg: torch.Tensor
-    rahg: torch.Tensor
-    rawg: torch.Tensor
-    rb: torch.Tensor
-    mozg: torch.Tensor
-    fhg: torch.Tensor
-    fhgh: torch.Tensor
-
-
-@dataclass(frozen=True)
-class CanopyResistanceResult:
-    """Jarvis canopy resistance result for one PAR stream."""
-
-    rc: torch.Tensor
-    psn: torch.Tensor
-
-
-@dataclass(frozen=True)
 class VegFluxResult:
     """Outputs from the ``opt_sfc=3`` vegetated flux path."""
 
@@ -322,15 +294,6 @@ class VegFluxResult:
     z0h: torch.Tensor
     z0hg: torch.Tensor
     csigmaf1: torch.Tensor
-
-
-@dataclass(frozen=True)
-class LandEnergyPathResult:
-    """Combined helper result suitable for later H assembly in land_body."""
-
-    geometry: LandEnergyGeometry
-    radiation: RadiationResult
-    bare_flux: BareFluxResult
 
 
 @dataclass(frozen=True)
@@ -740,6 +703,7 @@ def _energy_geometry_flat_kwargs(
         "rsurf_exp": tables.rsurf_exp,
         "isurban": int(tables.isurban),
         "z0_bare_soil": 0.002 if tables.table_variant == GFS_V17_PROFILE_SCM_TABLE_VARIANT else Z0_BARE_SOIL,
+        **({} if state.rsurf_scale is None else {"rsurf_scale": state.rsurf_scale}),
     }
 
 
@@ -773,6 +737,7 @@ def _compute_energy_geometry_flat_impl(
     rsurf_exp: torch.Tensor,
     isurban: int,
     z0_bare_soil: float,
+    rsurf_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     dtype = temperature_forcing.dtype
     device = temperature_forcing.device
@@ -817,6 +782,8 @@ def _compute_energy_geometry_flat_impl(
     l_rsurf = (-zsoil[0]) * (torch.exp(torch.pow(one_minus_wetness, rsurf_exp)) - 1.0) / (2.71828 - 1.0)
     d_rsurf = 2.2e-5 * smcmax * smcmax * torch.pow(1.0 - smcwlt / smcmax, 2.0 + 3.0 / bexp)
     rsurf_dry = l_rsurf / d_rsurf
+    if rsurf_scale is not None:  # trainable scale: before the clamp and the snow blend
+        rsurf_dry = rsurf_dry * rsurf_scale
     rsurf = 1.0 / (fsno * (1.0 / rsurf_snow) + (1.0 - fsno) * (1.0 / torch.clamp(rsurf_dry, min=0.001)))
     rsurf = torch.where((sh2o1 < 0.01) & (snowh == 0.0), 1.0e6, rsurf)
     rsurf = torch.where(urban & (snowh == 0.0), 1.0e6, rsurf)
@@ -1459,7 +1426,6 @@ def _thermoprop_source_corridor_flat_impl(
     csoil: torch.Tensor,
     urban: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    zero3 = dzsnso[:, :3] * 0.0
     snow_idx = torch.arange(-2, 1, device=snow_levels.device, dtype=snow_levels.dtype)
     active_snow = snow_idx[None, :] >= (snow_levels + 1)[:, None]
     dz_snow = dzsnso[:, :3]
@@ -1529,19 +1495,6 @@ def _thermoprop_source_corridor_flat_impl(
     fact = torch.where(participates, dt_tensor[:, None] / fact_denom_safe, fact_denom * 0.0)
 
     return (df, hcpct, fact, snicev, snliqv, epore)
-
-
-def thermoprop_source_corridor(
-    state: Any,
-    tables: LandEnergyTables,
-    geometry: LandEnergyGeometry,
-    *,
-    dt: torch.Tensor | float,
-    shdfac: torch.Tensor,
-) -> ThermopropResult:
-    """Port ``thermoprop``/``csnow``/``tdfcnd`` for the sealed land corridor."""
-
-    return _thermoprop_result(_thermoprop_source_corridor_flat_impl(**_thermoprop_flat_kwargs(state, tables, geometry, dt=dt, shdfac=shdfac)))
 
 
 def tsnosoi_source_corridor(
@@ -2170,32 +2123,7 @@ def soilwater_opt_run1_inf1_source_corridor(
     dzsnso_soil = torch.abs(state.dzsnso[:, 3:7]) if dzsnso_soil_initial is None else torch.abs(dzsnso_soil_initial)
     smc = state.soil_moisture_vol if smc_initial is None else smc_initial
     sh2o = state.soil_liquid_vol if sh2o_initial is None else sh2o_initial
-    result = run_compile_island(
-        "land_soilwater",
-        "soilwater_opt_run1_inf1_source_corridor",
-        _soilwater_opt_run1_inf1_source_corridor_flat_impl,
-        vegtype=state.vegtype,
-        smcmax=_state_cached_tensor(state, "smcmax_by_column", lambda: soil_parameter_by_column(tables, "smcmax", soil_layers, state.vegtype)),
-        psisat=_state_cached_tensor(state, "psisat_by_column", lambda: tables.psisat[soil_layers]),
-        bexp=_state_cached_tensor(state, "bexp_by_column", lambda: tables.bexp[soil_layers]),
-        dksat=_state_cached_tensor(state, "dksat_by_column", lambda: tables.dksat[soil_layers]),
-        dwsat=_state_cached_tensor(state, "dwsat_by_column", lambda: tables.dwsat[soil_layers]),
-        fsatmx=tables.fsatmx,
-        isurban=tables.isurban,
-        timean=tables.timean,
-        dzsnso_soil=dzsnso_soil,
-        smc=smc,
-        sh2o=sh2o,
-        qinsur=qinsur,
-        qseva=qseva,
-        etrani=etrani,
-        dt=dt_tensor,
-        zwt=zwt,
-        wa=wa,
-        wt=wt,
-        iteration_count=int(iteration_count),
-        sice_initial=sice_initial,
-    )
+    result = _soilwater_opt_run1_inf1_source_corridor_flat_impl(vegtype=state.vegtype, smcmax=_state_cached_tensor(state, "smcmax_by_column", lambda: soil_parameter_by_column(tables, "smcmax", soil_layers, state.vegtype)), psisat=_state_cached_tensor(state, "psisat_by_column", lambda: tables.psisat[soil_layers]), bexp=_state_cached_tensor(state, "bexp_by_column", lambda: tables.bexp[soil_layers]), dksat=_state_cached_tensor(state, "dksat_by_column", lambda: tables.dksat[soil_layers]), dwsat=_state_cached_tensor(state, "dwsat_by_column", lambda: tables.dwsat[soil_layers]), fsatmx=tables.fsatmx, isurban=tables.isurban, timean=tables.timean, dzsnso_soil=dzsnso_soil, smc=smc, sh2o=sh2o, qinsur=qinsur, qseva=qseva, etrani=etrani, dt=dt_tensor, zwt=zwt, wa=wa, wt=wt, iteration_count=int(iteration_count), sice_initial=sice_initial)
     return SoilWaterOptRun1Result(
         sh2o=result[0],
         smc=result[1],
@@ -2266,30 +2194,7 @@ def thermalz0_bare_chen09(
     zpd: torch.Tensor,
     ustarx: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return run_compile_island(
-        "land_stability",
-        "thermalz0_bare_chen09",
-        _thermalz0_bare_chen09_impl,
-        z0mg=z0mg,
-        zlvl=zlvl,
-        zpd=zpd,
-        ustarx=ustarx,
-    )
-
-
-def thermalz0_vegetated_chen09(
-    tables: LandEnergyTables,
-    *,
-    vegtype: torch.Tensor,
-    z0m: torch.Tensor,
-    ustarx: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fortran ``thermalz0`` vegetated-flag branch for ``opt_trs=2``."""
-
-    veg_idx = _veg_index(vegtype)
-    czil = torch.pow(torch.full_like(z0m, 10.0), -0.4 * tables.hvt[veg_idx])
-    z0h = z0m * torch.exp(-czil * 0.4 * 258.2 * torch.sqrt(ustarx * z0m))
-    return z0m, z0h, torch.zeros_like(z0m)
+    return _thermalz0_bare_chen09_impl(z0mg=z0mg, zlvl=zlvl, zpd=zpd, ustarx=ustarx)
 
 
 def calhum_noahmp(sfctmp: torch.Tensor, sfcprs: torch.Tensor) -> torch.Tensor:
@@ -2300,108 +2205,6 @@ def calhum_noahmp(sfctmp: torch.Tensor, sfcprs: torch.Tensor) -> torch.Tensor:
     q2sat = 0.622 * es / (sfcprsx - es)
     q2sat = q2sat * 1.0e3
     return q2sat / 1.0e3
-
-
-def canres_jarvis_source_corridor(
-    tables: LandEnergyTables,
-    *,
-    vegtype: torch.Tensor,
-    par: torch.Tensor,
-    sfctmp: torch.Tensor,
-    rcsoil: torch.Tensor,
-    eah: torch.Tensor,
-    sfcprs: torch.Tensor,
-) -> CanopyResistanceResult:
-    """Port ``canres`` for the sealed Jarvis ``opt_crs=2`` path."""
-
-    veg_idx = _veg_index(vegtype)
-    q2 = CON_EPS * eah / (sfcprs + CON_EPSM1 * eah)
-    q2 = q2 / (1.0 - q2)
-    q2sat = calhum_noahmp(sfctmp, sfcprs)
-    ff = 2.0 * par / tables.rgl[veg_idx]
-    rcs = torch.clamp((ff + tables.rsmin[veg_idx] / tables.rsmax[veg_idx]) / (1.0 + ff), min=0.0001)
-    rct = torch.clamp(1.0 - 0.0016 * _pow2(tables.topt[veg_idx] - sfctmp), min=0.0001)
-    rcq = torch.maximum(
-        1.0 / (1.0 + tables.hs[veg_idx] * torch.clamp(q2sat - q2, min=0.0)),
-        par * 0.0 + 0.01,
-    )
-    rc = tables.rsmin[veg_idx] / (rcs * rct * rcq * rcsoil)
-    psn = par * 0.0 - 999.99
-    return CanopyResistanceResult(rc=rc, psn=psn)
-
-
-def ragrb_source_corridor(
-    tables: LandEnergyTables,
-    *,
-    iter_number: int,
-    vegtype: torch.Tensor,
-    vai: torch.Tensor,
-    rhoair: torch.Tensor,
-    hg: torch.Tensor,
-    tah: torch.Tensor,
-    zpd: torch.Tensor,
-    z0mg: torch.Tensor,
-    z0hg: torch.Tensor,
-    hcan: torch.Tensor,
-    uc: torch.Tensor,
-    z0h: torch.Tensor,
-    fv: torch.Tensor,
-    cwp: torch.Tensor,
-    tv: torch.Tensor,
-    mozg: torch.Tensor,
-    fhg: torch.Tensor,
-    fhgh: torch.Tensor,
-) -> RagrbResult:
-    """Vectorized ``ragrb`` under-canopy and leaf boundary resistance."""
-
-    if iter_number > 1:
-        tmp1 = NOAHMP_VKC * (torch.full_like(tah, NOAHMP_GRAV) / tah) * hg / (rhoair * NOAHMP_CPAIR)
-        tmp1 = torch.where(torch.abs(tmp1) <= MPE, MPE, tmp1)
-        molg = -_pow3(fv) / tmp1
-        mozg_new = torch.clamp((zpd - z0mg) / molg, max=1.0)
-        mozgh = torch.clamp((hcan - zpd) / molg, max=1.0)
-    else:
-        mozg_new = mozg * 0.0
-        mozgh = mozg * 0.0
-
-    unstable = mozg_new < 0.0
-    one = torch.ones_like(mozg_new)
-    fhg_power_base = torch.where(unstable, torch.clamp(1.0 - 15.0 * mozg_new, min=1.0e-30), one)
-    fhgh_power_base = torch.where(unstable, torch.clamp(1.0 - 9.0 * mozg_new, min=1.0e-30), one)
-    fhgnew = torch.where(
-        unstable,
-        working_power(fhg_power_base, -0.25),
-        1.0 + 4.7 * mozg_new,
-    )
-    fhgnewh = torch.where(
-        unstable,
-        0.74 * working_power(fhgh_power_base, torch.full_like(fhgh_power_base, -0.5)),
-        0.74 + 4.7 * mozgh,
-    )
-    if iter_number == 1:
-        fhg_out = fhgnew
-        fhgh_out = fhgnewh
-    else:
-        fhg_out = 0.5 * (fhg + fhgnew)
-        fhgh_out = 0.5 * (fhgh + fhgnewh)
-
-    cwpc_base = torch.clamp(cwp * vai * hcan * fhg_out, min=1.0)
-    # RAGRB uses a real exponent, whose source rounding differs from sqrt.
-    cwpc = working_power(cwpc_base, torch.full_like(cwpc_base, 0.5))
-    cwpc = torch.clamp(cwpc, min=1.0, max=5.0)
-    tmp1 = torch.exp(-cwpc * z0hg / hcan)
-    tmp2 = torch.exp(-cwpc * (z0h + zpd) / hcan)
-    tmprah2 = hcan * torch.exp(cwpc) / cwpc * (tmp1 - tmp2)
-    kh = torch.clamp(NOAHMP_VKC * fv * (hcan - zpd) / torch.clamp(fhgh_out, min=0.1), min=MPE)
-    rahg = tmprah2 / kh
-    rawg = rahg
-    ramg = rahg * 0.0
-    tmprb = cwpc * 50.0 / (1.0 - torch.exp(-cwpc / 2.0))
-    dleaf = tables.dleaf[_veg_index(vegtype)]
-    rb = tmprb * torch.sqrt(dleaf / uc)
-    rb = torch.clamp(rb, min=5.0, max=50.0)
-    _ = tv
-    return RagrbResult(ramg=ramg, rahg=rahg, rawg=rawg, rb=rb, mozg=mozg_new, fhg=fhg_out, fhgh=fhgh_out)
 
 
 def _gather_top_layer(values: torch.Tensor, snow_levels: torch.Tensor) -> torch.Tensor:
@@ -2560,14 +2363,7 @@ def _vege_flux_update_state_impl(
     )
 
 
-def _vege_flux_update_state(*, use_compile: bool, **kwargs: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    if use_compile:
-        return run_compile_island(
-            "land_vege_flux_update",
-            "vege_flux_update_state",
-            _vege_flux_update_state_impl,
-            **kwargs,
-        )
+def _vege_flux_update_state(**kwargs: torch.Tensor) -> tuple[torch.Tensor, ...]:
     return _vege_flux_update_state_impl(**kwargs)
 
 
@@ -2830,684 +2626,8 @@ def _vege_flux_iteration_physics_impl(
     )
 
 
-def _vege_flux_iteration_physics(*, use_compile: bool, **kwargs: torch.Tensor | bool) -> tuple[torch.Tensor, ...]:
-    if use_compile:
-        return run_compile_island(
-            "land_vege_flux_iteration",
-            "vege_flux_iteration_physics",
-            _vege_flux_iteration_physics_impl,
-            **kwargs,
-        )
+def _vege_flux_iteration_physics(**kwargs: torch.Tensor | bool) -> tuple[torch.Tensor, ...]:
     return _vege_flux_iteration_physics_impl(**kwargs)
-
-
-def _vege_flux_loop_step_impl(
-    *,
-    after_first: bool,
-    first_iteration: bool,
-    can_converge: bool,
-    use_active_mask: bool,
-    thsfc_loc: bool,
-    sfctmp: torch.Tensor,
-    qair: torch.Tensor,
-    ps: torch.Tensor,
-    prsl1: torch.Tensor,
-    rhoair: torch.Tensor,
-    fveg: torch.Tensor,
-    shdfac: torch.Tensor,
-    garea: torch.Tensor,
-    pahv: torch.Tensor,
-    pahg: torch.Tensor,
-    eair: torch.Tensor,
-    dlwflx: torch.Tensor,
-    zpd: torch.Tensor,
-    z0m: torch.Tensor,
-    z0mg: torch.Tensor,
-    hcan: torch.Tensor,
-    emv: torch.Tensor,
-    emg: torch.Tensor,
-    gamma_ground: torch.Tensor,
-    rsurf: torch.Tensor,
-    rhsur: torch.Tensor,
-    df_top: torch.Tensor,
-    dz_top: torch.Tensor,
-    stc_top: torch.Tensor,
-    ur: torch.Tensor,
-    zlvl: torch.Tensor,
-    vaie: torch.Tensor,
-    laisune: torch.Tensor,
-    laishae: torch.Tensor,
-    parsun: torch.Tensor,
-    parsha: torch.Tensor,
-    sav: torch.Tensor,
-    sag: torch.Tensor,
-    cwp: torch.Tensor,
-    dleaf: torch.Tensor,
-    cbiom: torch.Tensor,
-    rgl: torch.Tensor,
-    rsmin: torch.Tensor,
-    rsmax: torch.Tensor,
-    topt: torch.Tensor,
-    hs: torch.Tensor,
-    dt_tensor: torch.Tensor,
-    canliq: torch.Tensor,
-    canice: torch.Tensor,
-    fwet: torch.Tensor,
-    btran: torch.Tensor,
-    latheav: torch.Tensor,
-    gammav: torch.Tensor,
-    uc: torch.Tensor,
-    zero: torch.Tensor,
-    one: torch.Tensor,
-    z0h_static: torch.Tensor,
-    z0hg_static: torch.Tensor,
-    prslkix: torch.Tensor,
-    prsik1x: torch.Tensor,
-    prslk1x: torch.Tensor,
-    liter: torch.Tensor,
-    done: torch.Tensor,
-    z0h: torch.Tensor,
-    z0hg: torch.Tensor,
-    csigmaf1: torch.Tensor,
-    fm: torch.Tensor,
-    fh: torch.Tensor,
-    fh2: torch.Tensor,
-    fv: torch.Tensor,
-    cm: torch.Tensor,
-    ch: torch.Tensor,
-    mozg: torch.Tensor,
-    fhg: torch.Tensor,
-    fhgh: torch.Tensor,
-    rahg_final: torch.Tensor,
-    rssun: torch.Tensor,
-    rssha: torch.Tensor,
-    psnsun: torch.Tensor,
-    psnsha: torch.Tensor,
-    tv: torch.Tensor,
-    tg: torch.Tensor,
-    tah: torch.Tensor,
-    eah: torch.Tensor,
-    irc: torch.Tensor,
-    shc: torch.Tensor,
-    evc: torch.Tensor,
-    tr: torch.Tensor,
-    irg: torch.Tensor,
-    shg: torch.Tensor,
-    evg: torch.Tensor,
-    gh: torch.Tensor,
-    canhs: torch.Tensor,
-    h: torch.Tensor,
-    hg: torch.Tensor,
-    qsfc: torch.Tensor,
-    estg: torch.Tensor,
-) -> tuple[torch.Tensor, ...]:
-    """One fixed-point pass of vegetated surface flux as a flat tensor island."""
-
-    active = ~done
-    fm_new, fh_new, fh2_new, fv_new, cm_new, ch_new = _sfcdif3_impl(
-        sfctmp=sfctmp,
-        qair=qair,
-        ur=ur,
-        zlvl=zlvl,
-        tgb=tah,
-        thsfc_loc=thsfc_loc,
-        prslkix=prslkix,
-        prsik1x=prsik1x,
-        prslk1x=prslk1x,
-        z0m=z0m,
-        z0h=z0h_static,
-        zpd=zpd,
-        fveg=shdfac,
-        garea1=garea,
-    )
-    (
-        rag_mozg,
-        rag_fhg,
-        rag_fhgh,
-        rag_rahg,
-        rssun_work,
-        rssha_work,
-        psnsun_work,
-        psnsha_work,
-        tv_new,
-        tg_new,
-        tah_new,
-        eah_new,
-        irc_new,
-        shc_new,
-        evc_new,
-        tr_new,
-        irg_new,
-        shg_new,
-        evg_new,
-        gh_new,
-        canhs_new,
-        h_new,
-        hg_new,
-        qsfc_new,
-        estg_work,
-        dtv,
-        dtg,
-    ) = _vege_flux_iteration_physics_impl(
-        after_first=after_first,
-        first_iteration=first_iteration,
-        sfctmp=sfctmp,
-        ps=ps,
-        prsl1=prsl1,
-        rhoair=rhoair,
-        fveg=fveg,
-        pahv=pahv,
-        pahg=pahg,
-        eair=eair,
-        dlwflx=dlwflx,
-        zpd=zpd,
-        z0mg=z0mg,
-        hcan=hcan,
-        emv=emv,
-        emg=emg,
-        gamma_ground=gamma_ground,
-        rsurf=rsurf,
-        rhsur=rhsur,
-        df_top=df_top,
-        dz_top=dz_top,
-        stc_top=stc_top,
-        ur=ur,
-        laisune=laisune,
-        laishae=laishae,
-        parsun=parsun,
-        parsha=parsha,
-        sav=sav,
-        sag=sag,
-        cwp=cwp,
-        dleaf=dleaf,
-        cbiom=cbiom,
-        rgl=rgl,
-        rsmin=rsmin,
-        rsmax=rsmax,
-        topt=topt,
-        hs=hs,
-        dt_tensor=dt_tensor,
-        canliq=canliq,
-        canice=canice,
-        fwet=fwet,
-        btran=btran,
-        latheav=latheav,
-        gammav=gammav,
-        uc=uc,
-        vaie=vaie,
-        zero=zero,
-        one=one,
-        z0h_static=z0h_static,
-        z0hg_static=z0hg_static,
-        fv_new=fv_new,
-        ch_new=ch_new,
-        tah=tah,
-        hg=hg,
-        fv=fv,
-        mozg=mozg,
-        fhg=fhg,
-        fhgh=fhgh,
-        rssun=rssun,
-        rssha=rssha,
-        psnsun=psnsun,
-        psnsha=psnsha,
-        tv=tv,
-        tg=tg,
-        eah=eah,
-        estg=estg,
-    )
-    (
-        z0h,
-        z0hg,
-        csigmaf1,
-        fm,
-        fh,
-        fh2,
-        fv,
-        cm,
-        ch,
-        mozg,
-        fhg,
-        fhgh,
-        rahg_final,
-        rssun,
-        rssha,
-        psnsun,
-        psnsha,
-        tv,
-        tg,
-        tah,
-        eah,
-        irc,
-        shc,
-        evc,
-        tr,
-        irg,
-        shg,
-        evg,
-        gh,
-        canhs,
-        h,
-        hg,
-        qsfc,
-        estg,
-    ) = _vege_flux_update_state_impl(
-        active=active,
-        use_active_mask=use_active_mask,
-        z0h=z0h,
-        z0hg=z0hg,
-        csigmaf1=csigmaf1,
-        fm=fm,
-        fh=fh,
-        fh2=fh2,
-        fv=fv,
-        cm=cm,
-        ch=ch,
-        mozg=mozg,
-        fhg=fhg,
-        fhgh=fhgh,
-        rahg_final=rahg_final,
-        rssun=rssun,
-        rssha=rssha,
-        psnsun=psnsun,
-        psnsha=psnsha,
-        tv=tv,
-        tg=tg,
-        tah=tah,
-        eah=eah,
-        irc=irc,
-        shc=shc,
-        evc=evc,
-        tr=tr,
-        irg=irg,
-        shg=shg,
-        evg=evg,
-        gh=gh,
-        canhs=canhs,
-        h=h,
-        hg=hg,
-        qsfc=qsfc,
-        estg=estg,
-        z0h_new=z0h_static,
-        z0hg_new=z0hg_static,
-        csigmaf1_new=zero,
-        fm_new=fm_new,
-        fh_new=fh_new,
-        fh2_new=fh2_new,
-        fv_new=fv_new,
-        cm_new=cm_new,
-        ch_new=ch_new,
-        rag_mozg=rag_mozg,
-        rag_fhg=rag_fhg,
-        rag_fhgh=rag_fhgh,
-        rag_rahg=rag_rahg,
-        rssun_work=rssun_work,
-        rssha_work=rssha_work,
-        psnsun_work=psnsun_work,
-        psnsha_work=psnsha_work,
-        tv_new=tv_new,
-        tg_new=tg_new,
-        tah_new=tah_new,
-        eah_new=eah_new,
-        irc_new=irc_new,
-        shc_new=shc_new,
-        evc_new=evc_new,
-        tr_new=tr_new,
-        irg_new=irg_new,
-        shg_new=shg_new,
-        evg_new=evg_new,
-        gh_new=gh_new,
-        canhs_new=canhs_new,
-        h_new=h_new,
-        hg_new=hg_new,
-        qsfc_new=qsfc_new,
-        estg_work=estg_work,
-    )
-    completed_final_loop = active & liter
-    converged = active & (~liter) & can_converge & (torch.abs(dtv) <= 0.01) & (torch.abs(dtg) <= 0.01)
-    done = done | completed_final_loop
-    liter = liter | converged
-    return (
-        z0h,
-        z0hg,
-        csigmaf1,
-        fm,
-        fh,
-        fh2,
-        fv,
-        cm,
-        ch,
-        mozg,
-        fhg,
-        fhgh,
-        rahg_final,
-        rssun,
-        rssha,
-        psnsun,
-        psnsha,
-        tv,
-        tg,
-        tah,
-        eah,
-        irc,
-        shc,
-        evc,
-        tr,
-        irg,
-        shg,
-        evg,
-        gh,
-        canhs,
-        h,
-        hg,
-        qsfc,
-        estg,
-        done,
-        liter,
-    )
-
-
-def _vege_flux_loop_step(*, use_compile: bool, **kwargs: torch.Tensor | bool) -> tuple[torch.Tensor, ...]:
-    if use_compile:
-        return run_compile_island(
-            "land_vege_flux_loop_step",
-            "vege_flux_sfc3_loop_step",
-            _vege_flux_loop_step_impl,
-            **kwargs,
-        )
-    return _vege_flux_loop_step_impl(**kwargs)
-
-
-def _vege_flux_loop_chunk_impl(
-    *,
-    base_iter_index: int,
-    chunk_count: int,
-    thsfc_loc: bool,
-    sfctmp: torch.Tensor,
-    qair: torch.Tensor,
-    ps: torch.Tensor,
-    prsl1: torch.Tensor,
-    rhoair: torch.Tensor,
-    fveg: torch.Tensor,
-    shdfac: torch.Tensor,
-    garea: torch.Tensor,
-    pahv: torch.Tensor,
-    pahg: torch.Tensor,
-    eair: torch.Tensor,
-    dlwflx: torch.Tensor,
-    zpd: torch.Tensor,
-    z0m: torch.Tensor,
-    z0mg: torch.Tensor,
-    hcan: torch.Tensor,
-    emv: torch.Tensor,
-    emg: torch.Tensor,
-    gamma_ground: torch.Tensor,
-    rsurf: torch.Tensor,
-    rhsur: torch.Tensor,
-    df_top: torch.Tensor,
-    dz_top: torch.Tensor,
-    stc_top: torch.Tensor,
-    ur: torch.Tensor,
-    zlvl: torch.Tensor,
-    vaie: torch.Tensor,
-    laisune: torch.Tensor,
-    laishae: torch.Tensor,
-    parsun: torch.Tensor,
-    parsha: torch.Tensor,
-    sav: torch.Tensor,
-    sag: torch.Tensor,
-    cwp: torch.Tensor,
-    dleaf: torch.Tensor,
-    cbiom: torch.Tensor,
-    rgl: torch.Tensor,
-    rsmin: torch.Tensor,
-    rsmax: torch.Tensor,
-    topt: torch.Tensor,
-    hs: torch.Tensor,
-    dt_tensor: torch.Tensor,
-    canliq: torch.Tensor,
-    canice: torch.Tensor,
-    fwet: torch.Tensor,
-    btran: torch.Tensor,
-    latheav: torch.Tensor,
-    gammav: torch.Tensor,
-    uc: torch.Tensor,
-    zero: torch.Tensor,
-    one: torch.Tensor,
-    z0h_static: torch.Tensor,
-    z0hg_static: torch.Tensor,
-    prslkix: torch.Tensor,
-    prsik1x: torch.Tensor,
-    prslk1x: torch.Tensor,
-    liter: torch.Tensor,
-    done: torch.Tensor,
-    z0h: torch.Tensor,
-    z0hg: torch.Tensor,
-    csigmaf1: torch.Tensor,
-    fm: torch.Tensor,
-    fh: torch.Tensor,
-    fh2: torch.Tensor,
-    fv: torch.Tensor,
-    cm: torch.Tensor,
-    ch: torch.Tensor,
-    mozg: torch.Tensor,
-    fhg: torch.Tensor,
-    fhgh: torch.Tensor,
-    rahg_final: torch.Tensor,
-    rssun: torch.Tensor,
-    rssha: torch.Tensor,
-    psnsun: torch.Tensor,
-    psnsha: torch.Tensor,
-    tv: torch.Tensor,
-    tg: torch.Tensor,
-    tah: torch.Tensor,
-    eah: torch.Tensor,
-    irc: torch.Tensor,
-    shc: torch.Tensor,
-    evc: torch.Tensor,
-    tr: torch.Tensor,
-    irg: torch.Tensor,
-    shg: torch.Tensor,
-    evg: torch.Tensor,
-    gh: torch.Tensor,
-    canhs: torch.Tensor,
-    h: torch.Tensor,
-    hg: torch.Tensor,
-    qsfc: torch.Tensor,
-    estg: torch.Tensor,
-) -> tuple[torch.Tensor, ...]:
-    """Fixed-count vegetated-flux passes as one flat compile island."""
-
-    local_iter_index = 0
-    while local_iter_index < chunk_count:
-        iter_index = base_iter_index + local_iter_index
-        iter_number = iter_index + 1
-        (
-            z0h,
-            z0hg,
-            csigmaf1,
-            fm,
-            fh,
-            fh2,
-            fv,
-            cm,
-            ch,
-            mozg,
-            fhg,
-            fhgh,
-            rahg_final,
-            rssun,
-            rssha,
-            psnsun,
-            psnsha,
-            tv,
-            tg,
-            tah,
-            eah,
-            irc,
-            shc,
-            evc,
-            tr,
-            irg,
-            shg,
-            evg,
-            gh,
-            canhs,
-            h,
-            hg,
-            qsfc,
-            estg,
-            done,
-            liter,
-        ) = _vege_flux_loop_step_impl(
-            after_first=iter_number > 1,
-            first_iteration=iter_number == 1,
-            can_converge=iter_number >= 5,
-            use_active_mask=iter_index >= 6,
-            thsfc_loc=thsfc_loc,
-            sfctmp=sfctmp,
-            qair=qair,
-            ps=ps,
-            prsl1=prsl1,
-            rhoair=rhoair,
-            fveg=fveg,
-            shdfac=shdfac,
-            garea=garea,
-            pahv=pahv,
-            pahg=pahg,
-            eair=eair,
-            dlwflx=dlwflx,
-            zpd=zpd,
-            z0m=z0m,
-            z0mg=z0mg,
-            hcan=hcan,
-            emv=emv,
-            emg=emg,
-            gamma_ground=gamma_ground,
-            rsurf=rsurf,
-            rhsur=rhsur,
-            df_top=df_top,
-            dz_top=dz_top,
-            stc_top=stc_top,
-            ur=ur,
-            zlvl=zlvl,
-            vaie=vaie,
-            laisune=laisune,
-            laishae=laishae,
-            parsun=parsun,
-            parsha=parsha,
-            sav=sav,
-            sag=sag,
-            cwp=cwp,
-            dleaf=dleaf,
-            cbiom=cbiom,
-            rgl=rgl,
-            rsmin=rsmin,
-            rsmax=rsmax,
-            topt=topt,
-            hs=hs,
-            dt_tensor=dt_tensor,
-            canliq=canliq,
-            canice=canice,
-            fwet=fwet,
-            btran=btran,
-            latheav=latheav,
-            gammav=gammav,
-            uc=uc,
-            zero=zero,
-            one=one,
-            z0h_static=z0h_static,
-            z0hg_static=z0hg_static,
-            prslkix=prslkix,
-            prsik1x=prsik1x,
-            prslk1x=prslk1x,
-            liter=liter,
-            done=done,
-            z0h=z0h,
-            z0hg=z0hg,
-            csigmaf1=csigmaf1,
-            fm=fm,
-            fh=fh,
-            fh2=fh2,
-            fv=fv,
-            cm=cm,
-            ch=ch,
-            mozg=mozg,
-            fhg=fhg,
-            fhgh=fhgh,
-            rahg_final=rahg_final,
-            rssun=rssun,
-            rssha=rssha,
-            psnsun=psnsun,
-            psnsha=psnsha,
-            tv=tv,
-            tg=tg,
-            tah=tah,
-            eah=eah,
-            irc=irc,
-            shc=shc,
-            evc=evc,
-            tr=tr,
-            irg=irg,
-            shg=shg,
-            evg=evg,
-            gh=gh,
-            canhs=canhs,
-            h=h,
-            hg=hg,
-            qsfc=qsfc,
-            estg=estg,
-        )
-        local_iter_index += 1
-    return (
-        z0h,
-        z0hg,
-        csigmaf1,
-        fm,
-        fh,
-        fh2,
-        fv,
-        cm,
-        ch,
-        mozg,
-        fhg,
-        fhgh,
-        rahg_final,
-        rssun,
-        rssha,
-        psnsun,
-        psnsha,
-        tv,
-        tg,
-        tah,
-        eah,
-        irc,
-        shc,
-        evc,
-        tr,
-        irg,
-        shg,
-        evg,
-        gh,
-        canhs,
-        h,
-        hg,
-        qsfc,
-        estg,
-        done,
-        liter,
-    )
-
-
-def _vege_flux_loop_chunk(*, use_compile: bool, **kwargs: torch.Tensor | bool | int) -> tuple[torch.Tensor, ...]:
-    if use_compile:
-        return run_compile_island(
-            "land_vege_flux_loop_chunk",
-            "vege_flux_sfc3_loop_chunk",
-            _vege_flux_loop_chunk_impl,
-            **kwargs,
-        )
-    return _vege_flux_loop_chunk_impl(**kwargs)
 
 
 def _vege_flux_finalize_impl(
@@ -3628,14 +2748,7 @@ def _vege_flux_finalize_impl(
     )
 
 
-def _vege_flux_finalize(*, use_compile: bool, **kwargs: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    if use_compile:
-        return run_compile_island(
-            "land_vege_flux_finalize",
-            "vege_flux_sfc3_finalize",
-            _vege_flux_finalize_impl,
-            **kwargs,
-        )
+def _vege_flux_finalize(**kwargs: torch.Tensor) -> tuple[torch.Tensor, ...]:
     return _vege_flux_finalize_impl(**kwargs)
 
 
@@ -3699,8 +2812,6 @@ def _vege_flux_setup(
     btran: torch.Tensor,
     thsfc_loc: bool = True,
     niter: int = 20,
-    use_nested_stability_compile: bool = True,
-    use_inner_compile_islands: bool = True,
     selected_gfs_v17: bool = False,
     use_sfcdif4: bool = False,
     temperature_leaf: torch.Tensor | None = None,
@@ -3711,6 +2822,7 @@ def _vege_flux_setup(
     prslk1_input: torch.Tensor | None = None,
     prsik1_input: torch.Tensor | None = None,
     friction_velocity: torch.Tensor | None = None,
+    czil_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """``vege_flux`` up to its canopy iteration loop (``opt_sfc=3,opt_crs=2`` land corridor): the loop
     state. ``_vege_flux_iteration`` runs one pass and ``_vege_flux_finish`` the rest."""
@@ -3753,8 +2865,6 @@ def _vege_flux_setup(
     psnsha = zero
     rb = zero
     rahg_final = one
-    cah2 = zero
-    q2v = zero
 
     vaie = torch.clamp(vai, max=6.0)
     laisune = torch.clamp(laisun, max=6.0)
@@ -3785,186 +2895,20 @@ def _vege_flux_setup(
         _z0m_g_static = z0mg
         z0hg_static = torch.where(vegtype <= 5, z0mg, z0mg * 0.01)
         _csigmaf0_static = torch.zeros_like(z0mg)
-    elif use_nested_stability_compile:
-        _z0m_g_static, z0hg_static, _csigmaf0_static = thermalz0_bare_chen09(
-            z0mg=z0mg,
-            zlvl=zlvl,
-            zpd=zpd,
-            ustarx=ustarx,
-        )
-    else:
-        _z0m_g_static, z0hg_static, _csigmaf0_static = _thermalz0_bare_chen09_impl(
-            z0mg=z0mg,
-            zlvl=zlvl,
-            zpd=zpd,
-            ustarx=ustarx,
-        )
+    _z0m_g_static, z0hg_static, _csigmaf0_static = thermalz0_bare_chen09(
+        z0mg=z0mg,
+        zlvl=zlvl,
+        zpd=zpd,
+        ustarx=ustarx,
+    )
     czil_static = torch.pow(torch.full_like(z0m, 10.0), -0.4 * hcan)
+    if czil_scale is not None:  # trainable scale of czil itself
+        czil_static = czil_static * czil_scale
     z0h_static = z0m * torch.exp(-czil_static * 0.4 * 258.2 * torch.sqrt(ustarx * z0m))
     _ = (_z0m_g_static, _csigmaf0_static)
 
     liter = torch.zeros_like(sfctmp, dtype=torch.bool)
     done = torch.zeros_like(sfctmp, dtype=torch.bool)
-    # The loop chunk/step islands implement the opt_sfc=3 stability only; sfcdif4 columns iterate in vege_flux_iteration.
-    use_loop_chunk_compile = (not selected_gfs_v17) and (not use_sfcdif4) and use_inner_compile_islands and "land_vege_flux_loop_chunk" in compile_categories_enabled()
-    use_loop_step_compile = (not selected_gfs_v17) and (not use_sfcdif4) and use_inner_compile_islands and "land_vege_flux_loop_step" in compile_categories_enabled()
-    use_update_compile = use_inner_compile_islands and "land_vege_flux_update" in compile_categories_enabled()
-    use_iteration_compile = use_inner_compile_islands and "land_vege_flux_iteration" in compile_categories_enabled()
-    use_finalize_compile = use_inner_compile_islands and "land_vege_flux_finalize" in compile_categories_enabled()
-    if use_loop_chunk_compile and niter == 20:
-        loop_common_kwargs = {
-            "sfctmp": sfctmp,
-            "qair": qair,
-            "ps": ps,
-            "prsl1": prsl1,
-            "rhoair": rhoair,
-            "fveg": fveg,
-            "shdfac": shdfac,
-            "garea": garea,
-            "pahv": pahv,
-            "pahg": pahg,
-            "eair": eair,
-            "dlwflx": dlwflx,
-            "zpd": zpd,
-            "z0m": z0m,
-            "z0mg": z0mg,
-            "hcan": hcan,
-            "emv": emv,
-            "emg": emg,
-            "gamma_ground": gammag,
-            "rsurf": rsurf,
-            "rhsur": rhsur,
-            "df_top": top_df,
-            "dz_top": top_dz,
-            "stc_top": top_stc,
-            "ur": ur,
-            "zlvl": zlvl,
-            "vaie": vaie,
-            "laisune": laisune,
-            "laishae": laishae,
-            "parsun": parsun,
-            "parsha": parsha,
-            "sav": sav,
-            "sag": sag,
-            "cwp": cwp,
-            "dleaf": dleaf,
-            "cbiom": cbiom,
-            "rgl": rgl,
-            "rsmin": rsmin,
-            "rsmax": rsmax,
-            "topt": topt,
-            "hs": hs,
-            "dt_tensor": dt_tensor,
-            "canliq": canliq,
-            "canice": canice,
-            "fwet": fwet,
-            "btran": btran,
-            "latheav": latheav,
-            "gammav": gammav,
-            "uc": uc,
-            "zero": zero,
-            "one": one,
-            "z0h_static": z0h_static,
-            "z0hg_static": z0hg_static,
-            "prslkix": prslkix,
-            "prsik1x": prsik1x,
-            "prslk1x": prslk1x,
-        }
-        chunk_start = 0
-        selected_chunk_size = vegetation_chunk_size()
-        while chunk_start < 20:
-            if selected_chunk_size == 20:
-                chunk_count = 20
-                chunk_base = chunk_start
-            else:
-                # Flags change at indices 4 (convergence permitted) and 6
-                # (completed points masked). After 6 the step uses the index
-                # only for those constant flags; reuse that exact specialization.
-                phase_end = 4 if chunk_start < 4 else 6 if chunk_start < 6 else 20
-                chunk_count = min(selected_chunk_size, phase_end - chunk_start)
-                chunk_base = min(chunk_start, 6)
-            (
-                z0h,
-                z0hg,
-                csigmaf1,
-                fm,
-                fh,
-                fh2,
-                fv,
-                cm,
-                ch,
-                mozg,
-                fhg,
-                fhgh,
-                rahg_final,
-                rssun,
-                rssha,
-                psnsun,
-                psnsha,
-                tv,
-                tg,
-                tah,
-                eah,
-                irc,
-                shc,
-                evc,
-                tr,
-                irg,
-                shg,
-                evg,
-                gh,
-                canhs,
-                h,
-                hg,
-                qsfc,
-                estg,
-                done,
-                liter,
-            ) = _vege_flux_loop_chunk(
-                use_compile=True,
-                base_iter_index=chunk_base,
-                chunk_count=chunk_count,
-                thsfc_loc=thsfc_loc,
-                **loop_common_kwargs,
-                liter=liter,
-                done=done,
-                z0h=z0h,
-                z0hg=z0hg,
-                csigmaf1=csigmaf1,
-                fm=fm,
-                fh=fh,
-                fh2=fh2,
-                fv=fv,
-                cm=cm,
-                ch=ch,
-                mozg=mozg,
-                fhg=fhg,
-                fhgh=fhgh,
-                rahg_final=rahg_final,
-                rssun=rssun,
-                rssha=rssha,
-                psnsun=psnsun,
-                psnsha=psnsha,
-                tv=tv,
-                tg=tg,
-                tah=tah,
-                eah=eah,
-                irc=irc,
-                shc=shc,
-                evc=evc,
-                tr=tr,
-                irg=irg,
-                shg=shg,
-                evg=evg,
-                gh=gh,
-                canhs=canhs,
-                h=h,
-                hg=hg,
-                qsfc=qsfc,
-                estg=estg,
-            )
-            chunk_start += chunk_count
-        niter = 0
     return {
         "btran": btran, "canhs": canhs, "canice": canice, "canliq": canliq, "cbiom": cbiom, "ch": ch,
         "cm": cm, "csigmaf1": csigmaf1, "cwp": cwp, "dleaf": dleaf, "dlwflx": dlwflx, "done": done,
@@ -3981,10 +2925,7 @@ def _vege_flux_setup(
         "selected_gfs_v17": selected_gfs_v17, "sfctmp": sfctmp, "shc": shc, "shdfac": shdfac, "shg": shg,
         "snowh": snowh, "tah": tah, "tg": tg, "thsfc_loc": thsfc_loc, "top_df": top_df, "top_dz": top_dz,
         "top_stc": top_stc, "topt": topt, "tr": tr, "tv": tv, "u1": u1, "uc": uc, "ur": ur,
-        "use_finalize_compile": use_finalize_compile, "use_iteration_compile": use_iteration_compile,
-        "use_loop_step_compile": use_loop_step_compile,
-        "use_nested_stability_compile": use_nested_stability_compile, "use_sfcdif4": use_sfcdif4,
-        "use_update_compile": use_update_compile, "v1": v1, "vaie": vaie, "z0h": z0h,
+        "use_sfcdif4": use_sfcdif4, "v1": v1, "vaie": vaie, "z0h": z0h,
         "z0h_static": z0h_static, "z0hg": z0hg, "z0hg_static": z0hg_static, "z0m": z0m, "z0mg": z0mg,
         "zero": zero, "zlvl": zlvl, "zpd": zpd,
         # sfcdif4 (opt_sfc=4): wspdv, ch2v (/wspdv) and cq2v of the last iteration.
@@ -4005,8 +2946,8 @@ def _vege_flux_iteration(
         hcan, hg, hs, irc, irg, laishae, laisune, latheav, liter, mozg, one, pahg, pahv, parsha, parsun,
         pblh, prsik1x, prsl1, prslk1x, prslkix, ps, psnsha, psnsun, qair, qfx, qsfc, rahg_final, rgl, rhoair,
         rhsur, rsmax, rsmin, rssha, rssun, rsurf, sag, sav, selected_gfs_v17, sfctmp, shc, shdfac, shg,
-        snowh, tah, tg, thsfc_loc, top_df, top_dz, top_stc, topt, tr, tv, u1, uc, ur, use_iteration_compile,
-        use_loop_step_compile, use_nested_stability_compile, use_sfcdif4, use_update_compile, v1, vaie, z0h,
+        snowh, tah, tg, thsfc_loc, top_df, top_dz, top_stc, topt, tr, tv, u1, uc, ur,
+        use_sfcdif4, v1, vaie, z0h,
         z0h_static, z0hg, z0hg_static, z0m, z0mg, zero, zlvl, zpd,
     ) = _env_values(env, (
         "btran canhs canice canliq cbiom ch cm csigmaf1 cwp dleaf dlwflx done dt_tensor eah eair emg emv "
@@ -4014,159 +2955,13 @@ def _vege_flux_iteration(
         "laisune latheav liter mozg one pahg pahv parsha parsun pblh prsik1x prsl1 prslk1x prslkix ps psnsha "
         "psnsun qair qfx qsfc rahg_final rgl rhoair rhsur rsmax rsmin rssha rssun rsurf sag sav "
         "selected_gfs_v17 sfctmp shc shdfac shg snowh tah tg thsfc_loc top_df top_dz top_stc topt tr tv u1 "
-        "uc ur use_iteration_compile use_loop_step_compile use_nested_stability_compile use_sfcdif4 "
-        "use_update_compile v1 vaie z0h z0h_static z0hg z0hg_static z0m z0mg zero zlvl zpd"
+        "uc ur use_sfcdif4 "
+        "v1 vaie z0h z0h_static z0hg z0hg_static z0m z0mg zero zlvl zpd"
     ))
     active = ~done
     z0hg_new = z0hg_static
     z0h_new = z0h_static
     csigmaf1_new = zero
-    if use_loop_step_compile:
-        (
-            z0h,
-            z0hg,
-            csigmaf1,
-            fm,
-            fh,
-            fh2,
-            fv,
-            cm,
-            ch,
-            mozg,
-            fhg,
-            fhgh,
-            rahg_final,
-            rssun,
-            rssha,
-            psnsun,
-            psnsha,
-            tv,
-            tg,
-            tah,
-            eah,
-            irc,
-            shc,
-            evc,
-            tr,
-            irg,
-            shg,
-            evg,
-            gh,
-            canhs,
-            h,
-            hg,
-            qsfc,
-            estg,
-            done,
-            liter,
-        ) = _vege_flux_loop_step(
-            use_compile=True,
-            after_first=not first_iteration,
-            first_iteration=first_iteration,
-            can_converge=can_converge,
-            use_active_mask=use_active_mask,
-            thsfc_loc=thsfc_loc,
-            sfctmp=sfctmp,
-            qair=qair,
-            ps=ps,
-            prsl1=prsl1,
-            rhoair=rhoair,
-            fveg=fveg,
-            shdfac=shdfac,
-            garea=garea,
-            pahv=pahv,
-            pahg=pahg,
-            eair=eair,
-            dlwflx=dlwflx,
-            zpd=zpd,
-            z0m=z0m,
-            z0mg=z0mg,
-            hcan=hcan,
-            emv=emv,
-            emg=emg,
-            gamma_ground=gammag,
-            rsurf=rsurf,
-            rhsur=rhsur,
-            df_top=top_df,
-            dz_top=top_dz,
-            stc_top=top_stc,
-            ur=ur,
-            zlvl=zlvl,
-            vaie=vaie,
-            laisune=laisune,
-            laishae=laishae,
-            parsun=parsun,
-            parsha=parsha,
-            sav=sav,
-            sag=sag,
-            cwp=cwp,
-            dleaf=dleaf,
-            cbiom=cbiom,
-            rgl=rgl,
-            rsmin=rsmin,
-            rsmax=rsmax,
-            topt=topt,
-            hs=hs,
-            dt_tensor=dt_tensor,
-            canliq=canliq,
-            canice=canice,
-            fwet=fwet,
-            btran=btran,
-            latheav=latheav,
-            gammav=gammav,
-            uc=uc,
-            zero=zero,
-            one=one,
-            z0h_static=z0h_static,
-            z0hg_static=z0hg_static,
-            prslkix=prslkix,
-            prsik1x=prsik1x,
-            prslk1x=prslk1x,
-            liter=liter,
-            done=done,
-            z0h=z0h,
-            z0hg=z0hg,
-            csigmaf1=csigmaf1,
-            fm=fm,
-            fh=fh,
-            fh2=fh2,
-            fv=fv,
-            cm=cm,
-            ch=ch,
-            mozg=mozg,
-            fhg=fhg,
-            fhgh=fhgh,
-            rahg_final=rahg_final,
-            rssun=rssun,
-            rssha=rssha,
-            psnsun=psnsun,
-            psnsha=psnsha,
-            tv=tv,
-            tg=tg,
-            tah=tah,
-            eah=eah,
-            irc=irc,
-            shc=shc,
-            evc=evc,
-            tr=tr,
-            irg=irg,
-            shg=shg,
-            evg=evg,
-            gh=gh,
-            canhs=canhs,
-            h=h,
-            hg=hg,
-            qsfc=qsfc,
-            estg=estg,
-        )
-        return {**env,
-                "canhs": canhs, "ch": ch, "cm": cm, "csigmaf1": csigmaf1, "done": done, "eah": eah, "estg": estg,
-                "evc": evc, "evg": evg, "fh": fh, "fh2": fh2, "fhg": fhg, "fhgh": fhgh, "fm": fm, "fv": fv,
-                "gh": gh, "h": h, "hg": hg, "irc": irc, "irg": irg, "liter": liter, "mozg": mozg,
-                "psnsha": psnsha, "psnsun": psnsun, "qfx": qfx, "qsfc": qsfc, "rahg_final": rahg_final,
-                "rssha": rssha, "rssun": rssun, "shc": shc, "shg": shg, "tah": tah, "tg": tg, "tr": tr, "tv": tv,
-                "z0h": z0h, "z0hg": z0hg,
-        }
     sfcdif3_args = {
         "sfctmp": sfctmp,
         "qair": qair,
@@ -4226,10 +3021,7 @@ def _vege_flux_iteration(
         fh2_new = _fh2_exchange
         ch2v_new = ch2_speed / exchange_wind
         cq2v_new = _cq2_speed
-    elif use_nested_stability_compile:
-        fm_new, fh_new, fh2_new, fv_new, cm_new, ch_new = sfcdif3(**sfcdif3_args)
-    else:
-        fm_new, fh_new, fh2_new, fv_new, cm_new, ch_new = _sfcdif3_impl(**sfcdif3_args)
+    fm_new, fh_new, fh2_new, fv_new, cm_new, ch_new = sfcdif3(**sfcdif3_args)
     (
         rag_mozg,
         rag_fhg,
@@ -4259,7 +3051,6 @@ def _vege_flux_iteration(
         dtv,
         dtg,
     ) = _vege_flux_iteration_physics(
-        use_compile=use_iteration_compile,
         after_first=not first_iteration,
         first_iteration=first_iteration,
         sfctmp=sfctmp,
@@ -4373,7 +3164,6 @@ def _vege_flux_iteration(
         qsfc,
         estg,
     ) = _vege_flux_update_state(
-        use_compile=use_update_compile,
         active=active,
         use_active_mask=use_active_mask,
         z0h=z0h,
@@ -4476,12 +3266,12 @@ def _vege_flux_finish(env: dict[str, Any]) -> tuple[torch.Tensor, ...]:
         canhs, ch, cm, csigmaf1, cwp, dleaf, dlwflx, eah, emg, emv, estg, evc, evg, fh, fh2, fhg, fm, fsno,
         fv, fveg, gamma_ground, gammag, gh, h, hcan, irc, irg, latheav, pahg, psnsha, psnsun, qsfc,
         rahg_final, rb, rhoair, rhsur, rssha, rssun, rsurf, sag, selected_gfs_v17, shc, shg, snowh, tah, tg,
-        top_df, top_dz, top_stc, tr, tv, u1, uc, ur, use_finalize_compile, v1, vaie, z0h, z0hg,
+        top_df, top_dz, top_stc, tr, tv, u1, uc, ur, v1, vaie, z0h, z0hg,
     ) = _env_values(env, (
         "canhs ch cm csigmaf1 cwp dleaf dlwflx eah emg emv estg evc evg fh fh2 fhg fm fsno fv fveg "
         "gamma_ground gammag gh h hcan irc irg latheav pahg psnsha psnsun qsfc rahg_final rb rhoair rhsur "
         "rssha rssun rsurf sag selected_gfs_v17 shc shg snowh tah tg top_df top_dz top_stc tr tv u1 uc ur "
-        "use_finalize_compile v1 vaie z0h z0hg"
+        "v1 vaie z0h z0hg"
     ))
     if selected_gfs_v17:
         air_g = -emg * (1.0 - emv) * dlwflx - emg * emv * NOAHMP_SB * _pow4(tv)
@@ -4516,7 +3306,6 @@ def _vege_flux_finish(env: dict[str, Any]) -> tuple[torch.Tensor, ...]:
     cwpc_final = torch.clamp(working_power(cwpc_base, torch.full_like(cwpc_base, 0.5)), min=1.0, max=5.0)
     rb = torch.clamp(cwpc_final * 50.0 / (1.0 - torch.exp(-cwpc_final / 2.0)) * torch.sqrt(dleaf / uc), min=5.0, max=50.0)
     return _vege_flux_finalize(
-        use_compile=use_finalize_compile,
         gamma_ground=gamma_ground,
         rsurf=rsurf,
         rhsur=rhsur,
@@ -4731,22 +3520,7 @@ def gfs_stability(
     zvfun: torch.Tensor | None = None,
     gdx: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return run_compile_island(
-        "land_stability",
-        "gfs_stability",
-        _gfs_stability_impl,
-        z1=z1,
-        tv1=tv1,
-        thv1=thv1,
-        wind=wind,
-        z0max=z0max,
-        ztmax=ztmax,
-        tvs=tvs,
-        thsfc_loc=thsfc_loc,
-        gravity=gravity,
-        zvfun=zvfun,
-        gdx=gdx,
-    )
+    return _gfs_stability_impl(z1=z1, tv1=tv1, thv1=thv1, wind=wind, z0max=z0max, ztmax=ztmax, tvs=tvs, thsfc_loc=thsfc_loc, gravity=gravity, zvfun=zvfun, gdx=gdx)
 
 
 def _sfcdif3_impl(
@@ -4803,25 +3577,7 @@ def sfcdif3(
     fveg: torch.Tensor,
     garea1: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return run_compile_island(
-        "land_stability",
-        "sfcdif3",
-        _sfcdif3_impl,
-        sfctmp=sfctmp,
-        qair=qair,
-        ur=ur,
-        zlvl=zlvl,
-        tgb=tgb,
-        thsfc_loc=thsfc_loc,
-        prslkix=prslkix,
-        prsik1x=prsik1x,
-        prslk1x=prslk1x,
-        z0m=z0m,
-        z0h=z0h,
-        zpd=zpd,
-        fveg=fveg,
-        garea1=garea1,
-    )
+    return _sfcdif3_impl(sfctmp=sfctmp, qair=qair, ur=ur, zlvl=zlvl, tgb=tgb, thsfc_loc=thsfc_loc, prslkix=prslkix, prsik1x=prsik1x, prslk1x=prslk1x, z0m=z0m, z0h=z0h, zpd=zpd, fveg=fveg, garea1=garea1)
 
 
 def _mynn_psim_stable_full(zolf: torch.Tensor) -> torch.Tensor:
@@ -5007,7 +3763,6 @@ def _sfcdif4_impl(
     zq = zt
     gz1oz0 = torch.log((za + z0m) / z0m)
     gz1ozt = torch.log((za + z0m) / zt)
-    gz2oz0 = torch.log((2.0 + z0m) / z0m)
     gz2ozt = torch.log((2.0 + z0m) / zt)
     gz10oz0 = torch.log((10.0 + z0m) / z0m)
     initial_zol = _li_etal_2010(rib, za / z0m, z0m / zt)
@@ -5065,49 +3820,6 @@ def _sfcdif4_impl(
     return qsfc, ustar, cm_speed, ch_speed, ch2_speed, cq2_speed, rmol, rib, psix, psit, stress, psix10, psit2, wind, flhc, flqc
 
 
-def bare_flux_opt_sfc3(
-    state: Any,
-    geometry: LandEnergyGeometry,
-    *,
-    sag: torch.Tensor,
-    df: torch.Tensor,
-    dt: torch.Tensor | float,
-    tgb: torch.Tensor | None = None,
-    cm: torch.Tensor | None = None,
-    ch: torch.Tensor | None = None,
-    ustarx: torch.Tensor | None = None,
-    thsfc_loc: bool = True,
-    niter: int = 5,
-    selected_gfs_v17: bool = False,
-    surface_exchange_option: int = 3,
-) -> BareFluxResult:
-    """Port ``bare_flux`` for ``opt_sfc=3`` and ``opt_stc=3``.
-
-    ``df`` is the snow/soil thermal conductivity from ``thermoprop`` with shape
-    ``[ncol, 7]`` for ``nsnow=3,nsoil=4``.  The current helper intentionally
-    keeps thermoprop outside this module.
-    """
-    _ = dt
-    return _bare_flux_result(
-        _bare_flux_opt_sfc3_flat_impl(
-            **_bare_flux_flat_kwargs(
-                state,
-                geometry,
-                sag=sag,
-                df=df,
-                tgb=tgb,
-                cm=cm,
-                ch=ch,
-                ustarx=ustarx,
-                thsfc_loc=thsfc_loc,
-                niter=niter,
-                selected_gfs_v17=selected_gfs_v17,
-                surface_exchange_option=surface_exchange_option,
-            )
-        )
-    )
-
-
 def _bare_flux_flat_kwargs(
     state: Any,
     geometry: LandEnergyGeometry,
@@ -5120,7 +3832,6 @@ def _bare_flux_flat_kwargs(
     ustarx: torch.Tensor | None,
     thsfc_loc: bool,
     niter: int,
-    use_nested_stability_compile: bool = True,
     selected_gfs_v17: bool = False,
     surface_exchange_option: int = 3,
 ) -> dict[str, Any]:
@@ -5167,7 +3878,6 @@ def _bare_flux_flat_kwargs(
         "ustarx": getattr(state, "friction_velocity", None) if ustarx is None else ustarx,
         "thsfc_loc": thsfc_loc,
         "niter": int(niter),
-        "use_nested_stability_compile": bool(use_nested_stability_compile),
         "selected_gfs_v17": bool(selected_gfs_v17),
         "use_sfcdif4": bool(surface_exchange_option == 4),
     }
@@ -5208,8 +3918,6 @@ def _vege_flux_flat_kwargs(
     btran: torch.Tensor,
     thsfc_loc: bool,
     niter: int,
-    use_nested_stability_compile: bool = True,
-    use_inner_compile_islands: bool = True,
     surface_exchange_option: int = 3,
 ) -> dict[str, Any]:
     veg_idx = _state_cached_tensor(state, "veg_idx", lambda: _veg_index(state.vegtype))
@@ -5280,8 +3988,6 @@ def _vege_flux_flat_kwargs(
         "btran": btran,
         "thsfc_loc": thsfc_loc,
         "niter": int(niter),
-        "use_nested_stability_compile": bool(use_nested_stability_compile),
-        "use_inner_compile_islands": bool(use_inner_compile_islands),
         "selected_gfs_v17": tables.table_variant == GFS_V17_PROFILE_SCM_TABLE_VARIANT,
         "use_sfcdif4": surface_exchange_option == 4,
     }
@@ -5294,6 +4000,8 @@ def _vege_flux_flat_kwargs(
                      "laisun": 1.0, "laisha": 1.0}
     for name, fallback in safe_controls.items():
         kwargs[name] = torch.where(canopy, kwargs[name], fallback)
+    if state.czil_scale is not None:
+        kwargs["czil_scale"] = state.czil_scale
     return kwargs
 
 
@@ -5374,7 +4082,6 @@ def _bare_flux_opt_sfc3_flat_impl(
     ustarx: torch.Tensor | None,
     thsfc_loc: bool,
     niter: int,
-    use_nested_stability_compile: bool = True,
     selected_gfs_v17: bool = False,
     use_sfcdif4: bool = False,
     prslki_input: torch.Tensor | None = None,
@@ -5402,20 +4109,12 @@ def _bare_flux_opt_sfc3_flat_impl(
         _z0m_out_static = z0mg
         z0h_static = torch.where(vegtype <= 5, z0mg, z0mg * 0.01)
         csigmaf0_static = torch.zeros_like(z0mg)
-    elif use_nested_stability_compile:
-        _z0m_out_static, z0h_static, csigmaf0_static = thermalz0_bare_chen09(
-            z0mg=z0mg,
-            zlvl=zlvl,
-            zpd=zpdg,
-            ustarx=ustar_work,
-        )
-    else:
-        _z0m_out_static, z0h_static, csigmaf0_static = _thermalz0_bare_chen09_impl(
-            z0mg=z0mg,
-            zlvl=zlvl,
-            zpd=zpdg,
-            ustarx=ustar_work,
-        )
+    _z0m_out_static, z0h_static, csigmaf0_static = thermalz0_bare_chen09(
+        z0mg=z0mg,
+        zlvl=zlvl,
+        zpd=zpdg,
+        ustarx=ustar_work,
+    )
     _ = _z0m_out_static
 
     zero = torch.zeros_like(sfctmp)
@@ -5503,10 +4202,7 @@ def _bare_flux_opt_sfc3_flat_impl(
             ch_work = torch.where(snow_present, torch.clamp(ch_work, max=0.01), ch_work)
             ch2_work = torch.where(snow_present, torch.clamp(ch2_work, max=0.01), ch2_work)
             cq2_work = torch.where(snow_present, torch.clamp(cq2_work, max=0.01), cq2_work)
-        elif use_nested_stability_compile:
-            fm, fh, fh2, fv, cm_work, ch_work = sfcdif3(**sfcdif3_args)
-        else:
-            fm, fh, fh2, fv, cm_work, ch_work = _sfcdif3_impl(**sfcdif3_args)
+        fm, fh, fh2, fv, cm_work, ch_work = sfcdif3(**sfcdif3_args)
         ramb = torch.clamp(1.0 / (cm_work * exchange_wind), min=1.0)
         rahb = torch.clamp(1.0 / (ch_work * exchange_wind), min=1.0)
         rawb = rahb
@@ -5591,9 +4287,7 @@ def _bare_flux_opt_sfc3_flat_impl(
 
 
 _compute_energy_geometry_impl = _compute_energy_geometry_flat_impl
-_thermoprop_source_corridor_impl = thermoprop_source_corridor
 _radiation_bats_two_stream_impl = _radiation_bats_two_stream_flat_impl
-_bare_flux_opt_sfc3_impl = bare_flux_opt_sfc3
 _soilwater_opt_run1_inf1_source_corridor_impl = soilwater_opt_run1_inf1_source_corridor
 _vege_flux_opt_sfc3_impl = _vege_flux_opt_sfc3_flat_impl
 
@@ -5607,12 +4301,7 @@ def compute_energy_geometry(
 ) -> LandEnergyGeometry:
     _option_check(options)
     return _geometry_result(
-        run_compile_island(
-            "land_geometry",
-            "compute_energy_geometry",
-            _compute_energy_geometry_impl,
-            **_energy_geometry_flat_kwargs(state, tables, soilcolor=soilcolor),
-        )
+        _compute_energy_geometry_impl(**_energy_geometry_flat_kwargs(state, tables, soilcolor=soilcolor))
     )
 
 
@@ -5625,12 +4314,7 @@ def thermoprop_source_corridor(
     shdfac: torch.Tensor,
 ) -> ThermopropResult:
     return _thermoprop_result(
-        run_compile_island(
-            "land_thermoprop",
-            "thermoprop_source_corridor",
-            _thermoprop_source_corridor_flat_impl,
-            **_thermoprop_flat_kwargs(state, tables, geometry, dt=dt, shdfac=shdfac),
-        )
+        _thermoprop_source_corridor_flat_impl(**_thermoprop_flat_kwargs(state, tables, geometry, dt=dt, shdfac=shdfac))
     )
 
 
@@ -5645,11 +4329,7 @@ def radiation_bats_two_stream(
     sneqvo: torch.Tensor | None = None,
 ) -> RadiationResult:
     return _radiation_result(
-        run_compile_island(
-            "land_radiation",
-            "radiation_bats_two_stream",
-            _radiation_bats_two_stream_impl,
-            **_radiation_flat_kwargs(
+        _radiation_bats_two_stream_impl(**_radiation_flat_kwargs(
                 state,
                 tables,
                 geometry=geometry,
@@ -5657,8 +4337,7 @@ def radiation_bats_two_stream(
                 soilcolor=soilcolor,
                 tauss=tauss,
                 sneqvo=sneqvo,
-            ),
-        )
+            ))
     )
 
 
@@ -5679,13 +4358,8 @@ def bare_flux_opt_sfc3(
     surface_exchange_option: int = 3,
 ) -> BareFluxResult:
     _ = dt
-    use_nested_stability_compile = "land_bare_flux" not in compile_categories_enabled()
     return _bare_flux_result(
-        run_compile_island(
-            "land_bare_flux",
-            "bare_flux_opt_sfc3",
-            _bare_flux_opt_sfc3_flat_impl,
-            **_bare_flux_flat_kwargs(
+        _bare_flux_opt_sfc3_flat_impl(**_bare_flux_flat_kwargs(
                 state,
                 geometry,
                 sag=sag,
@@ -5696,11 +4370,9 @@ def bare_flux_opt_sfc3(
                 ustarx=ustarx,
                 thsfc_loc=thsfc_loc,
                 niter=niter,
-                use_nested_stability_compile=use_nested_stability_compile,
                 selected_gfs_v17=selected_gfs_v17,
                 surface_exchange_option=surface_exchange_option,
-            ),
-        )
+            ))
     )
 
 
@@ -5755,14 +4427,8 @@ def vege_flux_opt_sfc3(
     niter: int = 20,
     surface_exchange_option: int = 3,
 ) -> VegFluxResult:
-    use_full_compile = "land_vege_flux" in compile_categories_enabled()
-    use_nested_stability_compile = not use_full_compile
     return _vege_flux_result(
-        run_compile_island(
-            "land_vege_flux",
-            "vege_flux_opt_sfc3",
-            _vege_flux_opt_sfc3_impl,
-            **_vege_flux_flat_kwargs(
+        _vege_flux_opt_sfc3_impl(**_vege_flux_flat_kwargs(
                 state,
                 tables,
                 geometry,
@@ -5775,11 +4441,8 @@ def vege_flux_opt_sfc3(
                 btran=btran,
                 thsfc_loc=thsfc_loc,
                 niter=niter,
-                use_nested_stability_compile=use_nested_stability_compile,
-                use_inner_compile_islands=not use_full_compile,
                 surface_exchange_option=surface_exchange_option,
-            ),
-        )
+            ))
     )
 
 
@@ -5802,16 +4465,12 @@ def vege_flux_opt_sfc3_begin(
     """``vege_flux_opt_sfc3`` up to its canopy iteration loop: the loop state.
 
     ``vege_flux_opt_sfc3_iterations`` runs the loop and ``vege_flux_opt_sfc3_finish`` gives the result;
-    the three equal ``vege_flux_opt_sfc3``. With the ``land_vege_flux`` island on, the state holds the
-    island's whole result.
+    the three equal ``vege_flux_opt_sfc3``.
     """
     arguments = dict(dt=dt, canliq=canliq, canice=canice, fwet=fwet, btran=btran, thsfc_loc=thsfc_loc, niter=niter,
                      surface_exchange_option=surface_exchange_option)
-    if "land_vege_flux" in compile_categories_enabled():
-        return {"result": vege_flux_opt_sfc3(state, tables, geometry, thermo, radiation, **arguments)}
     return _vege_flux_setup(**_vege_flux_flat_kwargs(
-        state, tables, geometry, thermo, radiation, **arguments,
-        use_nested_stability_compile=True, use_inner_compile_islands=True))
+        state, tables, geometry, thermo, radiation, **arguments))
 
 
 def vege_flux_opt_sfc3_iterations(env: dict[str, Any], step: Any = None) -> dict[str, Any]:
@@ -5824,78 +4483,3 @@ def vege_flux_opt_sfc3_finish(env: dict[str, Any]) -> VegFluxResult:
     return env["result"] if "result" in env else _vege_flux_result(_vege_flux_finish(env))
 
 
-def compute_radiation_and_bare_flux(
-    state: Any,
-    *,
-    tables: LandEnergyTables | None = None,
-    options: Mapping[str, Any] | None = None,
-    soilcolor: torch.Tensor | None = None,
-    df: torch.Tensor,
-    dt: torch.Tensor | float,
-    tauss: torch.Tensor | None = None,
-    sneqvo: torch.Tensor | None = None,
-) -> LandEnergyPathResult:
-    """Convenience wrapper for the requested H energy helper surface."""
-
-    _option_check(options)
-    local_tables = load_land_energy_tables(device=state.temperature_forcing.device, dtype=state.temperature_forcing.dtype) if tables is None else tables
-    geometry = compute_energy_geometry(state, local_tables, options=options, soilcolor=soilcolor)
-    radiation = radiation_bats_two_stream(
-        state,
-        local_tables,
-        geometry,
-        dt=dt,
-        soilcolor=soilcolor,
-        tauss=tauss,
-        sneqvo=sneqvo,
-    )
-    bare_flux = bare_flux_opt_sfc3(state, geometry, sag=radiation.sag, df=df, dt=dt)
-    return LandEnergyPathResult(geometry=geometry, radiation=radiation, bare_flux=bare_flux)
-
-
-def result_as_dict(result: LandEnergyPathResult) -> dict[str, torch.Tensor]:
-    """Flatten core helper outputs into names matching later H assembly needs."""
-
-    radiation = result.radiation
-    bare = result.bare_flux
-    geometry = result.geometry
-    return {
-        "fsno": geometry.fsno,
-        "emg": geometry.emg,
-        "z0mg": geometry.z0mg,
-        "zpdg": geometry.zpdg,
-        "zlvl": geometry.zlvl,
-        "fsa": radiation.fsa,
-        "fsr": radiation.fsr,
-        "sag": radiation.sag,
-        "sav": radiation.sav,
-        "fsrv": radiation.fsrv,
-        "fsrg": radiation.fsrg,
-        "albdvis": radiation.albd[:, 0],
-        "albdnir": radiation.albd[:, 1],
-        "albivis": radiation.albi[:, 0],
-        "albinir": radiation.albi[:, 1],
-        "albsnd_vis": radiation.albsnd[:, 0],
-        "albsnd_nir": radiation.albsnd[:, 1],
-        "albsni_vis": radiation.albsni[:, 0],
-        "albsni_nir": radiation.albsni[:, 1],
-        "fsun": radiation.fsun,
-        "laisun": radiation.laisun,
-        "laisha": radiation.laisha,
-        "parsun": radiation.parsun,
-        "parsha": radiation.parsha,
-        "apar": radiation.parsun * radiation.laisun + radiation.parsha * radiation.laisha,
-        "tgb": bare.tgb,
-        "cm_bare": bare.cm,
-        "ch_bare": bare.ch,
-        "z0h_bare": bare.z0h,
-        "tauxb": bare.tauxb,
-        "tauyb": bare.tauyb,
-        "irb": bare.irb,
-        "shb": bare.shb,
-        "evb": bare.evb,
-        "ghb": bare.ghb,
-        "t2mb": bare.t2mb,
-        "q2b": bare.q2b,
-        "qsfc": bare.qsfc,
-    }

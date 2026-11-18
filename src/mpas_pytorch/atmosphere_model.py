@@ -6,8 +6,6 @@
 import contextlib
 import logging
 import math
-import os
-import resource
 import warnings
 import weakref
 from collections.abc import Callable, Iterable, Mapping
@@ -63,6 +61,7 @@ from mpas_pytorch.dynamics.static_payloads import (
 from mpas_pytorch.dynamics.time_integration import (
     _checkpoint_context_for_policy,
     _checkpoint_non_tensor_signature_for_policy,
+    _parameter_scale,
     atm_srk3,
 )
 from mpas_pytorch.dynamics.vector_reconstruction import (
@@ -99,8 +98,6 @@ from mpas_pytorch.utils.checks import require_consistent_device
 
 LOGGER = logging.getLogger(__name__)
 _CPU_DEVICE = torch.device("cpu")
-# Preserve the historical private alias for eager checkpoint tests/tools.
-_SAVE_NOTHING_CONTEXT = _time_integration._SAVE_NOTHING_CONTEXT
 
 
 def _validate_public_inputs(
@@ -643,23 +640,8 @@ def _normalize_checkpointed_state(
     return normalized
 
 
-def _memory_probe_enabled() -> bool:
-    """Return whether timestep RSS logging is enabled."""
-    return os.environ.get("MPAS_MEM_PROBE") == "1"
-
-
-def _log_timestep_rss(step: int, phase: str) -> None:
-    """Emit the current process RSS high-water mark for the given timestep phase."""
-    if not _memory_probe_enabled():
-        return
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    LOGGER.info("mem_probe step=%d phase=%s ru_maxrss=%s", step, phase, rss)
-
-
 def _compile_requested(config: Mapping[str, Any] | None) -> bool:
     """Return whether raw caller config requests torch.compile."""
-    if os.environ.get("MPAS_DISABLE_TORCH_COMPILE", "0") == "1":
-        return False
     if not config:
         return False
     for key in ("config_use_torch_compile", "use_torch_compile"):
@@ -772,17 +754,13 @@ def _require_timestep_graph_policy(
         missing.append("a compile mode without Inductor CUDA graphs")
     if (
         config.get("_halo_observer") is not None
-        or config.get("_mpas_section_timer") is not None
         or bool(config.get("config_profile_sections", False))
     ):
-        missing.append("no halo observer or section timing")
+        missing.append("no halo observer or section profiling")
     exchanger = config.get("_halo_exchanger")
     if exchanger is not None and not _graph_capturable_halo(exchanger):
         # Host-side transports would run once while recording, never on replay.
         missing.append("an NCCL halo transport")
-    if bool(config.get("config_apply_lbcs", False)):
-        # Boundary forcing changes every step; a replay would freeze it.
-        missing.append("no lateral boundary forcing")
     if config.get("_dycore_workspace") is not None or bool(
         config.get("config_use_workspace", False)
     ):
@@ -1590,6 +1568,14 @@ def _init_coupled_diagnostics(
 
     zb_cell = combined["zb_cell"]  # (nCells+1, maxEdges, nVertLevels+1)
     zb3_cell = combined["zb3_cell"]  # (nCells+1, maxEdges, nVertLevels+1)
+    # zb3_cell carries config_coef_3rd_order; its scale multiplies it for this call (never stored).
+    coef_3rd_scale = (
+        None
+        if config is None
+        else _parameter_scale(config, "config_coef_3rd_order")
+    )
+    if coef_3rd_scale is not None:
+        zb3_cell = zb3_cell * coef_3rd_scale
 
     constants = constants_for_config(config)
     init_kwargs: dict[str, Any] = {
@@ -2223,10 +2209,6 @@ def _materialize_native_step(
         raise MpasConfigError("native step forcing contains non-forcing fields")
     if set(context.support) - _NATIVE_CONTEXT_KEYS:
         raise MpasConfigError("native context contains non-static fields")
-    if config.get("config_apply_lbcs", False):
-        raise MpasConfigError(
-            "native step closure is not yet qualified for LBCs"
-        )
     constants = constants_for_config(config)
     support = context.support
     exchanger = config.get("_halo_exchanger")
@@ -2278,6 +2260,7 @@ def _materialize_native_step(
         rgas=constants.RD,
         cp=constants.CP,
         p0=constants.P0,
+        coef_3rd_scale=_parameter_scale(config, "config_coef_3rd_order"),
     )
     result = {**support, **state, **decoded, **(forcing or {})}
     if exchanger is not None:
@@ -2304,99 +2287,6 @@ def _materialize_native_step(
         strict=True,
     )
     return result
-
-
-def _native_output_fields(
-    state: Mapping[str, torch.Tensor],
-    context: _NativeStepContext,
-    mesh: dict[str, Any],
-    config: dict[str, Any],
-    dt: float,
-    fields: Iterable[str],
-) -> dict[str, torch.Tensor]:
-    """Project requested current-state output without sharing writable state buffers.
-
-    Step-history work, such as ruAvg and kdiff, requires the step's output
-    record. A final native snapshot alone cannot recover that history.
-    """
-    from mpas_pytorch.io_schema import HISTORY_FIELD_METADATA
-
-    requested = tuple(fields)
-    supported = (
-        set(HISTORY_FIELD_METADATA)
-        | set(NATIVE_STATE_KEYS)
-        | set(INTER_STEP_EXACT_DIAGNOSTIC_KEYS)
-        | {"rho_zz", "theta_m"}
-    )
-    if set(requested) - supported:
-        raise MpasConfigError(
-            "native output contains unsupported or step-history fields"
-        )
-    if not requested:
-        return {}
-    output_config = dict(config)
-    output = _materialize_native_step(state, context, mesh, output_config, dt)
-    refresh_output_diagnostics(output, output_config)
-    output["qv"] = output["scalars"][..., 0]
-    return {name: output[name].clone() for name in requested}
-
-
-def _native_timestep(
-    state: Mapping[str, torch.Tensor],
-    context: _NativeStepContext,
-    mesh: dict[str, Any],
-    config: dict[str, Any],
-    dt: float,
-    *,
-    forcing: Mapping[str, torch.Tensor] | None = None,
-    differentiable: bool = False,
-    initial: bool = False,
-    experimental: bool = False,
-) -> dict[str, torch.Tensor]:
-    """Advance five fields through the maintained RK implementation.
-
-    Cold input uses u/w/rho_zz/theta_m/scalars. Integrated continuation uses
-    the five native producers; cold values must not undergo an inverse round trip.
-    """
-    with torch.set_grad_enabled(differentiable):
-        if initial:
-            if set(state) != {"u", "w", "rho_zz", "theta_m", "scalars"}:
-                raise MpasConfigError(
-                    "initial native step requires five physical input fields"
-                )
-            if forcing is not None and set(forcing) - _NATIVE_FORCING_KEYS:
-                raise MpasConfigError("native step forcing contains non-forcing fields")
-            if set(context.support) - _NATIVE_CONTEXT_KEYS:
-                raise MpasConfigError("native context contains non-static fields")
-            if (
-                config.get("config_apply_lbcs", False)
-                or config.get("_halo_exchanger") is not None
-            ):
-                raise MpasConfigError(
-                    "native step closure is not yet qualified for LBCs or partitions"
-                )
-            entry = _materialize_step_state(
-                {**context.support, **state, **(forcing or {})},
-                mesh,
-                config,
-                dt,
-                strict=True,
-            )
-        else:
-            entry = _materialize_native_step(state, context, mesh, config, dt, forcing)
-        advanced = atm_srk3(
-            entry,
-            mesh,
-            {**config, "_native_boundary_output": True},
-            dt,
-            strict=True,
-            differentiable=differentiable,
-            experimental=experimental,
-        )
-        _require_finite_model_fields(
-            advanced, "native timestep result", fields=NATIVE_STATE_KEYS, config=config
-        )
-        return {key: advanced[key] for key in NATIVE_STATE_KEYS}
 
 
 def run_simulation(
@@ -2607,7 +2497,6 @@ def run_simulation(
             continuation = {key: advanced[key] for key in NATIVE_STATE_KEYS}
             if on_step is not None:
                 on_step(step_number, own_cuda_graph_outputs(advanced))
-            _log_timestep_rss(step_number, "after")
             if step_number != nsteps:
                 return continuation
             if full_output:
@@ -2632,7 +2521,6 @@ def run_simulation(
                 step_state = {}
                 state = cuda_graph_step_boundary(state)
             step_number = step + 1
-            _log_timestep_rss(step_number, "before")
             resume_from_restart = (
                 timestep_boundary_predicate(state) if step == 0 else None
             )
@@ -2689,7 +2577,6 @@ def run_simulation(
                     on_initial(state)
                 if (
                     set(NATIVE_STATE_KEYS).issubset(state)
-                    and not full_config.get("config_apply_lbcs", False)
                     and (full_config.get("_halo_exchanger") is None
                          or state["ru"].device.type == "cpu")
                     and not graph_requested
@@ -2871,7 +2758,6 @@ def run_simulation(
                         step_number=step_number,
                         nsteps=nsteps,
                     )
-                _log_timestep_rss(step_number, "after")
                 continue
             if can_prepare_once and step > 0:
                 strict = bool(full_config.get("strict", True))
@@ -2931,7 +2817,6 @@ def run_simulation(
                         )
                     if timestep_graph is not None:
                         state = timestep_graph(state)
-                        _log_timestep_rss(step_number, "after")
                         continue
                     graph_signature = boundary_signature(
                         state, diagnostic_solve_checkpoint_metadata
@@ -3237,7 +3122,6 @@ def run_simulation(
                     step_number=step_number,
                     nsteps=nsteps,
                 )
-            _log_timestep_rss(step_number, "after")
         if forecast_integration_started and on_phase is not None:
             on_phase("forecast_integration_end")
         _require_finite_model_fields(state, "forecast result")

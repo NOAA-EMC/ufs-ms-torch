@@ -8,11 +8,9 @@ from __future__ import annotations
 import torch
 
 from sa_tke_edmf_torch.compile import run_compile_island
-from sa_tke_edmf_torch.constants import FV, IM, KM, NDTEND, NTRAC, NTQV, QMIN, RD
+from sa_tke_edmf_torch.constants import FV, NTQV, QMIN, RD
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
 from sa_tke_edmf_torch.diagnostics import diagnostic_slots, add_diagnostic_
-
-CHECKPOINT_FIELDS = ("ten_u", "ten_v", "dusfc", "dvsfc", "hpbl", "kpbl", "dku3d_h", "dku3d_e")
 
 
 def _tridi2_momentum(
@@ -22,9 +20,9 @@ def _tridi2_momentum(
     rhs_u: torch.Tensor,
     rhs_v: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    KM = diagonal.shape[1]
-    # Level-major rows: each sweep step reads one contiguous row per coefficient.
-    lower, diagonal, upper, rhs_u, rhs_v = (x.t().contiguous() for x in (lower, diagonal, upper, rhs_u, rhs_v))
+    KM = diagonal.shape[0]
+    # Level-major rows (``_momentum_system_rhs`` writes them): each sweep step reads one contiguous row per
+    # coefficient.
     fk = 1.0 / diagonal[0]
     upper_cols = [fk * upper[0]]
     u_cols = [fk * rhs_u[0]]
@@ -76,7 +74,6 @@ def _momentum_system_rhs(
     km1 = KM - 1
 
     dtdz1 = dt2 / (zi[:, 1] - zi[:, 0])
-    diagonal = torch.zeros((ncol, KM), dtype=dtype, device=device)
     dtodsd = dt2 / delp[:, :km1]
     dtodsu = dt2 / delp[:, 1:KM]
     dsig = prsl[:, :km1] - prsl[:, 1:KM]
@@ -84,9 +81,10 @@ def _momentum_system_rhs(
     dsdz2 = dsig * dku[:, :km1] * rdz * rdz
     upper = -dtodsd * dsdz2
     lower = -dtodsu * dsdz2
-    diagonal[:, 0] = 1.0 + dtdz1 * stress / spd1 - upper[:, 0]
-    diagonal[:, 1:km1] = 1.0 - lower[:, : km1 - 1] - upper[:, 1:km1]
-    diagonal[:, KM - 1] = 1.0 - lower[:, km1 - 1]
+    # Level-major outputs [level, column] for the Thomas sweep, each written once (no zero-filled matrix or
+    # row-by-row slice assignments); every element keeps the source's terms in the source's order.
+    diagonal = torch.cat(((1.0 + dtdz1 * stress / spd1 - upper[:, 0])[None],
+                          (1.0 - lower[:, : km1 - 1] - upper[:, 1:km1]).t(), (1.0 - lower[:, km1 - 1])[None]), dim=0)
     tem2 = dsig * rdz
 
     levels = torch.arange(1, KM, dtype=torch.int64, device=device)
@@ -113,18 +111,17 @@ def _momentum_system_rhs(
     down_v_left = torch.where(downdraft_active, delta_v * ptem1, zeros_2d)
     down_v_right = torch.where(downdraft_active, -delta_v * ptem2, zeros_2d)
 
-    rhs_u = u1.clone()
-    rhs_v = v1.clone()
-    # Keep below/above interface order and separate source plume additions.
-    rhs_u[:, 1:KM] = rhs_u[:, 1:KM] + rhs_u_right_delta
-    rhs_u[:, 1:KM] = rhs_u[:, 1:KM] + down_u_right
-    rhs_u[:, :km1] = rhs_u[:, :km1] + rhs_u_left_delta
-    rhs_u[:, :km1] = rhs_u[:, :km1] + down_u_left
-    rhs_v[:, 1:KM] = rhs_v[:, 1:KM] + rhs_v_right_delta
-    rhs_v[:, 1:KM] = rhs_v[:, 1:KM] + down_v_right
-    rhs_v[:, :km1] = rhs_v[:, :km1] + rhs_v_left_delta
-    rhs_v[:, :km1] = rhs_v[:, :km1] + down_v_left
-    return lower, diagonal, upper, rhs_u, rhs_v
+    def rhs(wind, right, down_right, left, down_left):
+        # Keep below/above interface order and separate source plume additions: levels 1..KM-1 add their lower
+        # interface's terms first, then levels 0..KM-2 their upper interface's.
+        from_below = (wind[:, 1:KM] + right) + down_right
+        bottom = (wind[:, 0] + left[:, 0]) + down_left[:, 0]
+        middle = (from_below[:, : km1 - 1] + left[:, 1:]) + down_left[:, 1:]
+        return torch.cat((bottom[None], middle.t(), from_below[:, km1 - 1][None]), dim=0)
+
+    rhs_u = rhs(u1, rhs_u_right_delta, down_u_right, rhs_u_left_delta, down_u_left)
+    rhs_v = rhs(v1, rhs_v_right_delta, down_v_right, rhs_v_left_delta, down_v_left)
+    return lower.t().contiguous(), diagonal, upper.t().contiguous(), rhs_u, rhs_v
 
 
 def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
@@ -273,5 +270,3 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     )
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

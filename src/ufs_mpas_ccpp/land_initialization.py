@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, replace
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from .surface_containers import (
     R4_SURFACE_INTEGER_MEMBERS,
@@ -113,11 +114,11 @@ def initialize_noahmp_cold_surface(
     land = x("landfrac") >= 1.0e-4
     veg = torch.where(x("vtype") == 0, 7, x("vtype")).to(torch.int64)
     soil = x("stype").to(torch.int64)
-    torch._assert_async(
+    torch_compat.assert_async(
         (~land | ((veg >= 1) & (veg <= tables.sla.numel()))).all(),
         "invalid active cold land vegetation category",
     )
-    torch._assert_async(
+    torch_compat.assert_async(
         (~land | ((soil >= 1) & (soil <= tables.smcmax.numel()))).all(),
         "undefined active cold land soil category",
     )

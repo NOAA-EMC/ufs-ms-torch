@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 
 import torch
-from torch._functorch.pyfunctorch import temporarily_clear_interpreter_stack
+from mpas_pytorch import _torch_compat as torch_compat
 
 LADDER = (1 / 16, 1 / 8, 1 / 4, 1 / 2, 1.0)
 MIN_COLUMNS = 512
@@ -72,11 +72,11 @@ def note_overflow(name: str, overflow: torch.Tensor) -> None:
     bit = 1 << region_bit(name)
     if (
         not torch.compiler.is_compiling()
-        and torch._C._functorch.maybe_current_level() is not None
+        and torch_compat.functorch_level() is not None
     ):
-        while torch._C._functorch.is_functorch_wrapped_tensor(overflow):
-            overflow = torch._C._functorch.get_unwrapped(overflow)
-        with temporarily_clear_interpreter_stack():
+        while torch_compat.is_functorch_wrapped(overflow):
+            overflow = torch_compat.functorch_unwrap(overflow)
+        with torch_compat.temporarily_clear_interpreter_stack():
             overflow_flag(overflow.device).bitwise_or_(
                 overflow.any().to(torch.int64) * bit
             )
@@ -99,15 +99,33 @@ def _compact_select(values, axes, order):
     return tuple(value.index_select(axis, order) for value, axis in zip(values, axes))
 
 
-def _compact_merge(originals, updates, axes, order, keep):
-    result = []
-    for original, update, axis in zip(originals, updates, axes):
-        shape = [1] * update.ndim
-        shape[axis] = order.shape[0]
-        old = original.index_select(axis, order)
-        result.append(original.contiguous().index_copy(
-            axis, order, torch.where(keep.view(shape), update, old)))
-    return tuple(result)
+def buffer_positions(need: torch.Tensor) -> torch.Tensor:
+    """Each column's row in the buffer order ``argsort(need, descending=True, stable=True)``: the
+    needed columns first, then the others, each group in column order (exact integer sums)."""
+    needed = need.to(torch.int64)
+    return torch.where(need, torch.cumsum(needed, 0) - 1, needed.sum() + torch.cumsum(1 - needed, 0) - 1)
+
+
+def merge_by_gather(original: torch.Tensor, update: torch.Tensor, axis: int, position: torch.Tensor,
+                    take: torch.Tensor) -> torch.Tensor:
+    """``original`` with the columns where ``take`` holds replaced by their buffer rows of ``update``.
+
+    A gather and a select, never a scatter into a buffer: Inductor (torch 2.8) fused a later reader
+    of an ``index_copy`` result with the pre-scatter values (TEMPO's rain-number tendency in the
+    compiled sedimentation tiers, round-4 log entry 3). ``position`` is ``buffer_positions(need)``;
+    the values are copied unchanged.
+    """
+    shape = [1] * original.ndim
+    shape[axis] = position.shape[0]
+    rows = update.index_select(axis, position.clamp(max=update.shape[axis] - 1))
+    return torch.where(take.view(shape), rows, original)
+
+
+def _compact_merge(originals, updates, axes, need, size):
+    position = buffer_positions(need)
+    take = need & (position < size)
+    return tuple(merge_by_gather(original, update, axis, position, take)
+                 for original, update, axis in zip(originals, updates, axes))
 
 
 def run_compacted(run, columns: dict[str, torch.Tensor], need: torch.Tensor, *, region: str,
@@ -131,7 +149,6 @@ def run_compacted(run, columns: dict[str, torch.Tensor], need: torch.Tensor, *, 
         return {**columns, **run({name: columns[name] for name in names})}
     note_overflow(region, need.sum() > size)
     order = torch.argsort(need.to(torch.int8), descending=True, stable=True)[:size]
-    keep = need.index_select(0, order)
     call = tensor_call if tensor_call is not None else lambda fn, *args: fn(*args)
     selected = call(_compact_select, tuple(columns[name] for name in names),
                     tuple(axes[name] for name in names), order)
@@ -139,6 +156,6 @@ def run_compacted(run, columns: dict[str, torch.Tensor], need: torch.Tensor, *, 
     merged = dict(columns)
     # Keep originals separate from the gathered buffers: a scheme can mutate those buffers.
     replacements = call(_compact_merge, tuple(columns[name] for name in part),
-                        tuple(part.values()), tuple(axes[name] for name in part), order, keep)
+                        tuple(part.values()), tuple(axes[name] for name in part), need, size)
     merged.update(zip(part, replacements))
     return merged

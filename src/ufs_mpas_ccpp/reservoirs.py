@@ -6,6 +6,8 @@
 from typing import Mapping
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
+from ufs_physics_common.ordered_sum import level_sum
 
 from .containers import NativeAtmosphere, static_tensor
 from .ledger import _observer_totals
@@ -19,8 +21,6 @@ SURFACE_INPUTS = (
 DIAGNOSTIC_INPUTS = (
     "totprcp", "runoff", "dqsfc", "tecan", "tetran", "tedir", "sbsnoa", "dqsfci",
 )
-TRACERS = ("qv", "qc", "qr", "qi", "qs", "qg", "ni", "nr", "sgs_tke", "o3mr")
-
 
 def physical_reservoirs(
     native: NativeAtmosphere, surface: Sfcprop, diagnostics: Mapping[str, torch.Tensor],
@@ -57,9 +57,9 @@ def physical_reservoirs(
     for name, value in operands.items():
         if not working_like(value, rho) or value.device != rho.device:
             raise ValueError(f"reservoir {name} must be device-local in the working dtype {rho.dtype}")
-        torch._assert_async(torch.isfinite(value).all(), f"nonfinite reservoir {name}")
+        torch_compat.assert_async(torch.isfinite(value).all(), f"nonfinite reservoir {name}")
     area = operands["area_cell"]
-    torch._assert_async((area > 0.).all() & (rdzw > 0.).all() & (rho[:n] > 0.).all()
+    torch_compat.assert_async((area > 0.).all() & (rdzw > 0.).all() & (rho[:n] > 0.).all()
         & (dtp > 0.), "nonpositive reservoir geometry/density/timestep")
 
     def total(terms):
@@ -76,7 +76,7 @@ def physical_reservoirs(
         atmospheric_ozone_kg=total(terms[..., 9]), number_species_count=total(terms[..., 6:8]),
         tke_energy_j=total(terms[..., 8]), dry_mass_weighted_tracers=tracer_totals)
     depths = static_tensor((.1, .3, .6, 1.), dtype=rho.dtype, device=rho.device)
-    soil = torch.cumsum(torch.where(land[:, None] > 0., surface.smc, 0.) * depths * 1000., dim=1)[:, -1]
+    soil = level_sum(torch.where(land[:, None] > 0., surface.smc, 0.) * depths * 1000., 1)
     snow = surface.weasd
     snow_ice = 0. + surface.snicexy[:, 0] + surface.snicexy[:, 1] + surface.snicexy[:, 2]
     snow_liquid = 0. + surface.snliqxy[:, 0] + surface.snliqxy[:, 1] + surface.snliqxy[:, 2]
@@ -112,5 +112,5 @@ def physical_reservoirs(
         current_step_diagnostic_precipitation_kg=total(area * 1000. * surface.tprcp))
     if not rho.is_cuda:  # On CUDA the observer totals are off (NaN by design).
         for name, value in out.items():
-            torch._assert_async(torch.isfinite(value).all(), f"nonfinite reservoir total {name}")
+            torch_compat.assert_async(torch.isfinite(value).all(), f"nonfinite reservoir total {name}")
     return out

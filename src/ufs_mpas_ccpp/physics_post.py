@@ -7,12 +7,13 @@ from dataclasses import dataclass, replace
 from typing import Mapping
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from ufs_physics_common.compile_policy import compiled
 
 from .containers import static_tensor
 from .clock import _nint_nonnegative
-from .runtime_policy import scheme_compile_selected
+from .runtime_policy import glue, scheme_compile_selected
 from .precision import WORKING_DTYPES
 
 
@@ -33,10 +34,10 @@ def hourly_reset(kdt, *, dtp, avg_max_length):
     for value in (dtp, avg_max_length):
         if value.shape != () or value.dtype not in WORKING_DTYPES or value.device != kdt.device:
             raise ValueError("hourly reset requires device-local float32/float64 intervals")
-    torch._assert_async((kdt >= 1) & torch.isfinite(dtp) & (dtp > 0.)
+    torch_compat.assert_async((kdt >= 1) & torch.isfinite(dtp) & (dtp > 0.)
         & torch.isfinite(avg_max_length) & (avg_max_length > 0.), "invalid hourly clock")
     count = _nint_nonnegative(avg_max_length/dtp)
-    torch._assert_async(count >= 1, "hourly reset interval rounds to zero")
+    torch_compat.assert_async(count >= 1, "hourly reset interval rounds to zero")
     return torch.remainder(kdt.to(torch.int64)-1, count) == 0
 
 
@@ -55,11 +56,11 @@ def maximum_hourly_diagnostics(fields, *, reset, control):
         value = f[name]
         if value.shape != reference.shape[:1] or value.dtype != reference.dtype or value.device != reference.device:
             raise ValueError(f"invalid hourly diagnostic {name}")
-        torch._assert_async(torch.isfinite(value).all(), f"nonfinite hourly diagnostic {name}")
+        torch_compat.assert_async(torch.isfinite(value).all(), f"nonfinite hourly diagnostic {name}")
     dtp = f["dtp"]
     if dtp.shape != () or dtp.dtype != reference.dtype or dtp.device != reference.device:
         raise ValueError("hourly diagnostics requires a device-local timestep")
-    torch._assert_async((dtp > 0.) & torch.isfinite(dtp)
+    torch_compat.assert_async((dtp > 0.) & torch.isfinite(dtp)
         & ((reference[:,0] > 0.) & (f["pgr"] > 0.) & (f["t2m"] > 35.86)).all(),
         "invalid hourly temperature/pressure/timestep")
     out = {n:f[n] for n in HOURLY_FIELDS}
@@ -129,7 +130,7 @@ def physics_post(fields, *, control):
             raise ValueError(f"invalid physics post process {name}")
     if not all(1 <= 100+c[n] <= nr for n in ("ntoz","ntqv")):
         raise ValueError("invalid physics post tracer index")
-    torch._assert_async((idx <= dtend.shape[2]).all(), "physics post slot exceeds allocation")
+    torch_compat.assert_async((idx <= dtend.shape[2]).all(), "physics post slot exceeds allocation")
     dtend = dtend.clone()  # owned: every write below replaces one slot in place
 
     def read(value,slot):
@@ -172,7 +173,7 @@ def physics_post(fields, *, control):
         raise ValueError("physics_variables must be unique ascending static source rows")
     excluded = tuple(r-1 for r in range(2,nr+1) if r not in rows)
     if excluded:
-        torch._assert_async((idx[static_tensor(excluded,dtype=torch.int64,device=idx.device),c["ip_physics"]-1] < 1).all(),
+        torch_compat.assert_async((idx[static_tensor(excluded,dtype=torch.int64,device=idx.device),c["ip_physics"]-1] < 1).all(),
             "prepared physics rows omit an active source sum")
     all_true = torch.ones(np,dtype=torch.bool,device=dtend.device)
     for row in rows:
@@ -182,11 +183,11 @@ def physics_post(fields, *, control):
 
 def finish_microphysics(statein,prefix,*,dtp,kdt,avg_max_length,dtidx,is_photochem,control):
     """Selected cap tail: hourly -> off stochastics -> ordered physics post."""
-    reset = hourly_reset(kdt,dtp=dtp,avg_max_length=avg_max_length)
+    reset = glue(hourly_reset)(kdt,dtp=dtp,avg_max_length=avg_max_length)
     diag = prefix.carry.intdiag
     f = {**diag,"gt0":prefix.stateout.gt0,"pgr":statein.pgr,
          "t2m":prefix.sfcprop.t2m,"q2m":prefix.sfcprop.q2m,"dtp":dtp}
-    hourly = maximum_hourly_diagnostics(f,reset=reset,control=control)
+    hourly = glue(maximum_hourly_diagnostics)(f,reset=reset,control=control)
     stochastics_off({},control=control)
     # The generated R4 cap passes null water-chemistry pointers when h2o_phys is off.
     for flag in ("ldiag3d", "oz_phys_2015", "h2o_phys"):

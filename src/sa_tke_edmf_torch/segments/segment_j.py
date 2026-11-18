@@ -7,12 +7,8 @@ from __future__ import annotations
 
 from sa_tke_edmf_torch.state import SaTkeEdmfState
 
-CHECKPOINT_FIELDS = ("xmfd", "xlamde", "tcdo", "qcdo", "buod")
-
 
 def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     return state
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

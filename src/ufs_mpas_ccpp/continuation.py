@@ -8,8 +8,9 @@ from dataclasses import fields, is_dataclass, replace
 import json
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from mpas_pytorch.state import (
-    _UFS_COMMIT_ENTRY, _LiveBoundarySnapshot, _TensorStamp, _live_boundary_matches, _live_boundary_snapshot,
+    _UFS_COMMIT_ENTRY, _TensorStamp, _live_boundary_matches, _live_boundary_snapshot,
 )
 
 
@@ -66,23 +67,5 @@ def bind_coupled_boundary(state):
 def require_coupled_boundary(state):
     if state.continuation is None:
         raise ValueError("coupled boundary lacks its original carry receipt")
-    torch._assert_async(_live_boundary_matches(state.continuation, carry_members(state),
+    torch_compat.assert_async(_live_boundary_matches(state.continuation, carry_members(state),
         device=state.sec.device, all_keys=True), "coupled continuation carry was edited")
-
-
-def portable_continuation(state, native_commit):
-    """``state`` with its native commit entry replaced by ``native_commit``, the byte form a
-    restart writes (``mpas_pytorch.state.boundary_snapshot_bytes`` checked every stamp against its
-    unchanged live tensor). The carry receipt follows that one change: the live carry must match
-    the original receipt first, and only the commit-entry members are re-bound, under the same
-    member names; every other receipt entry is kept as it was."""
-    require_coupled_boundary(state)
-    portable = replace(state, native_state={**state.native_state, _UFS_COMMIT_ENTRY: native_commit})
-    prefix = json.dumps(["native_commit"], separators=(",", ":"))[:-1]
-    members = carry_members(portable)
-    commit = {name: value for name, value in members.items() if name.startswith(prefix)}
-    if set(members) != {entry[0] for entry in state.continuation.entries}:
-        raise ValueError("a restart byte form must keep the carry members")
-    fresh = {entry[0]: entry for entry in _live_boundary_snapshot(commit, all_keys=True, mode="bytes").entries}
-    return replace(portable, continuation=_LiveBoundarySnapshot(
-        tuple(fresh.get(entry[0], entry) for entry in state.continuation.entries)))

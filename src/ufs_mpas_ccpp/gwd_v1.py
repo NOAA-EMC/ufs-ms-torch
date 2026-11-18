@@ -30,11 +30,13 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from ufs_physics_common.precision import working_power
 
 from ufs_physics_common.compaction import note_overflow
 from ufs_physics_common import compile_policy
 
+from . import parameters
 from .containers import static_tensor
 from .gwd_small_scale import drag_suite_psl
 from .runtime_policy import UGWP_V1_NSTAB_MAX, ugwp_v1_caps
@@ -233,7 +235,7 @@ def tau_amf_interp(xlat_d: torch.Tensor, forecast_day: torch.Tensor, setup: Mapp
     w2 = torch.where(same, 1.0, (xlat_d - lats[j1]) / span)
     w1 = 1.0 - w2
     later = forecast_day < days
-    torch._assert_async(later.any(), "tau_amf_interp: forecast day beyond the tau file days")
+    torch_compat.assert_async(later.any(), "tau_amf_interp: forecast day beyond the tau file days")
     it2 = torch.clamp_max(later.to(torch.int8).argmax(), nday - 1)
     it1 = torch.clamp_min(it2 - 1, 0)
     # Device gathers: indexing with a 0-dim tensor reads the index on the host.
@@ -283,47 +285,63 @@ def _clip(value: torch.Tensor, limit: float) -> torch.Tensor:
     return torch.where(value.abs() >= limit, torch.where(value < 0.0, -bound, bound), value)
 
 
+def _aligned_rows(rows: torch.Tensor) -> torch.Tensor:
+    """``rows`` ([n, ncol]) stored in a buffer whose rows start on 16-byte boundaries (ncol padded to a multiple of
+    4; the padding is never read). The wave loop passes single rows to its level region; Inductor copies a row
+    that starts off a 16-byte boundary (an FP32 array whose ncol is not a multiple of 4) at that region's entry.
+    Values are copies. The padding runs on every device, so CPU and GPU run one form."""
+    ncol = rows.shape[1]
+    return torch.nn.functional.pad(rows, (0, -ncol % 4))[:, :ncol]
+
+
 def _wave_level(flux, vueff, ksrc, level, umfp, bn2_next, vzmet, fden_next,
                 wrk3, bn2, ion, zci, c2f2, ucrit, zdci, v_kxw, mkz2min,
                 previous, fpu_seed, heat_seed, vueff_next):
-    """One complete ordered wave level, including its masked output updates."""
+    """One complete ordered wave level, including its masked output updates.
+
+    Each wave's update is formed inside the ordered wave loop on its [ncol, nazd] slice, so compiled, the level
+    is one kernel over [ncol, nazd] that reads and writes the flux once (G4a: a spectrum update kernel and an
+    integral kernel that read its vc, heat and vmdiff back, 0.53 + 0.56 GB per level at 60 km). Values are the
+    same per element and the integrals keep the wave order.
+    """
     active = level >= ksrc
-    act3 = active[None, :, None]
-    zci3 = zci[:, None, None]
-    flux_m = flux
-    live = ~(flux_m < 0.0) & act3
-    v_cdp = zci3 - umfp[None, :, :]
-    cdf2 = v_cdp * v_cdp - c2f2[None, :, None]
-    absorb = live & ((v_cdp <= ucrit[None, :, None]) | (cdf2 <= 0.0))
-    prop = live & ~absorb
-    v_wdp = v_kxw * v_cdp
-    kzw2 = (bn2_next[None, :, None] - v_wdp * v_wdp) / torch.where(prop, cdf2, 1.0)
-    good = prop & (kzw2 > mkz2min)
-    kzw2_s = torch.where(good, kzw2, 1.0)
-    v_kzw = torch.sqrt(kzw2_s)
-    cd = torch.sqrt(torch.where(good, cdf2, 1.0))
-    wdp = v_kxw * cd
-    v_wdi = kzw2_s * vueff[None, :, None] + ion
-    v_wdpc = torch.sqrt(wdp * wdp + v_wdi * v_wdi)
-    v_kzi = v_kzw * v_wdi / v_wdpc
-    ze1 = v_kzi * vzmet[None, :, None]
-    strong = ze1 >= 1.e-2
-    expdis = torch.where(strong, torch.clamp_min(torch.exp(-ze1), 0.01),
-                         flux.new_full((), 1.0) / (1. + torch.where(strong, 0.0, ze1)))
-    fdis = torch.where(good, flux * expdis * 1.0, 0.0)
-    fluxs = torch.where(good, fden_next[None, :, None] * cdf2 * 1.0, 0.0)
-    new = torch.where(fdis - fluxs > 0.0, fluxs, fdis)
-    new = torch.where(flux_m - new < 0.0, flux_m, new)
-    flux = torch.where(good, new, torch.where(live, -1.0, flux_m))
-    diff = flux_m - flux
-    vmdiff = torch.where(diff > 0.0, diff, 0.0)
-    vc = torch.where(vmdiff <= 0.0, flux_m, flux)
-    heat = wrk3[None, :, None] * cd
+    act2 = active[:, None]
+    fluxes = []
     fpu_new = heat_sum = flux.new_zeros(flux.shape[1:])
     for inc in range(flux.shape[0]):
-        keep = good[inc]
-        fpu_new = torch.where(keep, fpu_new + vc[inc] * zdci[inc], fpu_new)
-        heat_sum = torch.where(keep, heat_sum + heat[inc] * zdci[inc] * vmdiff[inc], heat_sum)
+        flux_m = flux[inc]
+        live = ~(flux_m < 0.0) & act2
+        v_cdp = zci[inc] - umfp
+        cdf2 = v_cdp * v_cdp - c2f2[:, None]
+        absorb = live & ((v_cdp <= ucrit[:, None]) | (cdf2 <= 0.0))
+        prop = live & ~absorb
+        v_wdp = v_kxw * v_cdp
+        kzw2 = (bn2_next[:, None] - v_wdp * v_wdp) / torch.where(prop, cdf2, 1.0)
+        good = prop & (kzw2 > mkz2min)
+        kzw2_s = torch.where(good, kzw2, 1.0)
+        v_kzw = torch.sqrt(kzw2_s)
+        cd = torch.sqrt(torch.where(good, cdf2, 1.0))
+        wdp = v_kxw * cd
+        v_wdi = kzw2_s * vueff[:, None] + ion
+        v_wdpc = torch.sqrt(wdp * wdp + v_wdi * v_wdi)
+        v_kzi = v_kzw * v_wdi / v_wdpc
+        ze1 = v_kzi * vzmet[:, None]
+        strong = ze1 >= 1.e-2
+        expdis = torch.where(strong, torch.clamp_min(torch.exp(-ze1), 0.01),
+                             flux.new_full((), 1.0) / (1. + torch.where(strong, 0.0, ze1)))
+        fdis = torch.where(good, flux_m * expdis * 1.0, 0.0)
+        fluxs = torch.where(good, fden_next[:, None] * cdf2 * 1.0, 0.0)
+        new = torch.where(fdis - fluxs > 0.0, fluxs, fdis)
+        new = torch.where(flux_m - new < 0.0, flux_m, new)
+        wave_flux = torch.where(good, new, torch.where(live, -1.0, flux_m))
+        diff = flux_m - wave_flux
+        vmdiff = torch.where(diff > 0.0, diff, 0.0)
+        vc = torch.where(vmdiff <= 0.0, flux_m, wave_flux)
+        heat = wrk3[:, None] * cd
+        fpu_new = torch.where(good, fpu_new + vc * zdci[inc], fpu_new)
+        heat_sum = torch.where(good, heat_sum + heat * zdci[inc] * vmdiff, heat_sum)
+        fluxes.append(wave_flux)
+    flux = torch.stack(fluxes, dim=0)
     sums = torch.stack((fpu_new, heat_sum), dim=-1)
     fpu_new, heat_sum = sums[..., 0], sums[..., 1]
     total = flux.new_zeros(flux.shape[1])
@@ -379,14 +397,12 @@ def _ngw_prepare(fields: Mapping[str, torch.Tensor], tau_ngw: torch.Tensor, *, d
     if type(nstab_cap) is not int or not 1 <= nstab_cap <= NSTAB_MAX or type(kstart) is not int \
             or not 3 <= kstart <= levs - 2:
         raise ValueError("UGWP v1 solver requires 1 <= nstab_cap <= 16 and 3 <= kstart <= levs-2")
-    nwav, nazd = s["nwav"], s["nazd"]
     one = atm.new_full((), 1.0)
     pad = lambda x: torch.cat((x[:, :1], x), dim=1)  # noqa: E731  one-based layers 1..levs
     T, U, V, Q, PL, ZM = (pad(x) for x in (atm, aum, avm, aqm, prsl, zmet))
     PI = pad(prsi)  # interfaces 1..levs+1
     ZI = pad(zmeti)
     zci = static_tensor(s["zci"], dtype=dt, device=dev)
-    zdci = s["zdci"]
     cosang, sinang = s["cosang"], s["sinang"]
     kvg = pad(static_tensor(s["kvg"], dtype=dt, device=dev)[None, :])  # interfaces 1..levs+1
     kion = pad(static_tensor(s["kion"], dtype=dt, device=dev)[None, :])
@@ -400,6 +416,9 @@ def _ngw_prepare(fields: Mapping[str, torch.Tensor], tau_ngw: torch.Tensor, *, d
     kfirst = torch.where(hit.any(dim=1), levels[hit.to(torch.int8).argmax(dim=1)], levs + 1)
     ksrc = torch.clamp_min(kfirst - 1, 3)
     zngw = ZM.gather(1, ksrc[:, None]).squeeze(1)
+    # tau_ngw already carries the gwd.tauamp scale (apply_ugwpv1_gsldrag, before ngwflux_update). This tau_min floor
+    # applies after the scale, so the scale reaches the launch flux, and has a nonzero gradient, only in columns where
+    # tau_ngw is above tau_min.
     taub_src = torch.clamp_min(tau_ngw, s["tau_min"])
     # Interface mean flow, jk = 2..levs (index jk), with ktop = levs+1 extrapolated.
     TV = T * (1. + CON_FVIRT * Q)
@@ -449,11 +468,31 @@ def _ngw_prepare(fields: Mapping[str, torch.Tensor], tau_ngw: torch.Tensor, *, d
     rstar2 = rstar * rstar
     zcin = zci[None, :] * rstar[:, None]
     flux1 = rstar[:, None] * (zcin * zcin) / (1. + working_power(zcin, atm.new_full((), s["nslope3"])))
+    cos_t = static_tensor(cosang, dtype=dt, device=dev)
+    sin_t = static_tensor(sinang, dtype=dt, device=dev)
+    uint_l, vint_l = UINT.t().contiguous(), VINT.t().contiguous()
+    bn2_l, vzmet_l, wrk3_l = (_aligned_rows(x.t()) for x in (BN2, VZMET, WRK3))
+    umfp_l = cos_t[None, None, :] * uint_l[:, :, None] + sin_t[None, None, :] * vint_l[:, :, None]
+    launch_levels = torch.arange(levs + 2, device=dev)[:, None]
+    fpu_seed = _aligned_rows(torch.where(ksrc[None, :] == launch_levels, taub_src[None, :], 0.0))
+    return (U, V, T, Q, ZM, WRK3, BN2, AKT, DZI, DZM, RHOM, RHOI, ksrc, zngw, taub_src,
+            _aligned_rows(VUEFF.t()), umfp_l, bn2_l, vzmet_l, wrk3_l, kion,
+            zci, c2f2, ucrit_max, (ZI[:, 1:] < ZSP_GW).all(), fpu_seed,
+            flux1, rstar, rstar2, bvi, gather(RHOI), BN)
+
+
+def _ngw_launch_flux(flux1, taub_src, rstar, rstar2, bvi, rhoi_src, RHOI, BN, *, zdci, nazd):
+    """The launch spectrum normalized to the launch flux, and the saturation density fden_bn (level-major).
+
+    Its own region: inside ``_ngw_prepare`` Inductor formed the wave sum as an epilogue of the launch-level
+    reduction and evaluated flux1's FP64 power there again, one column per program (3.1 ms per 60 km step on the
+    RTX PRO 6000, round 8)."""
+    ncol, nwav = flux1.shape
     fpu_src = torch.zeros_like(rstar)
     for inc in range(nwav):
         fpu_src = fpu_src + flux1[:, inc] * zdci[inc]
     flux_norm = taub_src / fpu_src
-    ze1 = flux_norm * bvi / gather(RHOI) * rstar * rstar2
+    ze1 = flux_norm * bvi / rhoi_src * rstar * rstar2
     FDEN = ze1[:, None] * RHOI / BN
     # The wave loop keeps waves leading ([nwav, ncol, nazd]: one wave's slice is contiguous) and reads
     # level-major profiles ([levs+2, ncol]: one level's row is contiguous); values are unchanged.
@@ -462,15 +501,7 @@ def _ngw_prepare(fields: Mapping[str, torch.Tensor], tau_ngw: torch.Tensor, *, d
     # the sign is wave_act. Compiled, a level is one kernel over the spectrum (the update) and one over
     # [ncol, nazd] (the wave-ordered integrals).
     flux = (flux_norm[:, None] * flux1).t()[:, :, None].expand(nwav, ncol, nazd)
-    cos_t = static_tensor(cosang, dtype=dt, device=dev)
-    sin_t = static_tensor(sinang, dtype=dt, device=dev)
-    uint_l, vint_l, bn2_l, vzmet_l, fden_l, wrk3_l = (x.t().contiguous() for x in (UINT, VINT, BN2, VZMET, FDEN, WRK3))
-    umfp_l = cos_t[None, None, :] * uint_l[:, :, None] + sin_t[None, None, :] * vint_l[:, :, None]
-    launch_levels = torch.arange(levs + 2, device=dev)[:, None]
-    fpu_seed = torch.where(ksrc[None, :] == launch_levels, taub_src[None, :], 0.0)
-    return (U, V, T, Q, ZM, WRK3, BN2, AKT, DZI, DZM, RHOM, RHOI, ksrc, zngw, taub_src,
-            flux, VUEFF.t().contiguous(), umfp_l, bn2_l, vzmet_l, fden_l, wrk3_l, kion,
-            zci, c2f2, ucrit_max, (ZI[:, 1:] < ZSP_GW).all(), fpu_seed)
+    return flux, _aligned_rows(FDEN.t())
 
 
 def ngw_solv2(fields: Mapping[str, torch.Tensor], tau_ngw: torch.Tensor, *, dtp: torch.Tensor,
@@ -483,10 +514,13 @@ def ngw_solv2(fields: Mapping[str, torch.Tensor], tau_ngw: torch.Tensor, *, dtp:
     prepare = compile_policy.compiled(_ngw_prepare) if _regional_compile else _ngw_prepare
     consumed = {name: fields[name] for name in ("t1", "u1", "v1", "q1", "prsl", "prsi", "zmet", "zmeti", "sinlat")}
     (U, V, T, Q, ZM, WRK3, BN2, AKT, DZI, DZM, RHOM, RHOI, ksrc, zngw, taub_src,
-     flux, vueff_rows, umfp_l, bn2_l, vzmet_l, fden_l, wrk3_l, kion, zci, c2f2, ucrit_max, below_sponge, fpu_seed) = prepare(
+     vueff_rows, umfp_l, bn2_l, vzmet_l, wrk3_l, kion, zci, c2f2, ucrit_max, below_sponge, fpu_seed,
+     flux1, rstar, rstar2, bvi, rhoi_src, BN) = prepare(
         consumed, tau_ngw, dtp=dtp, setup=s, nstab_cap=nstab_cap, kstart=kstart)
-    torch._assert_async((ksrc <= levs - 2).all(), "UGWP v1 launch level within two layers of the top")
-    torch._assert_async(below_sponge, "UGWP v1 wave sponge above 106.5 km is not ported")
+    launch_flux = compile_policy.compiled(_ngw_launch_flux) if _regional_compile else _ngw_launch_flux
+    flux, fden_l = launch_flux(flux1, taub_src, rstar, rstar2, bvi, rhoi_src, RHOI, BN, zdci=s["zdci"], nazd=nazd)
+    torch_compat.assert_async((ksrc <= levs - 2).all(), "UGWP v1 launch level within two layers of the top")
+    torch_compat.assert_async(below_sponge, "UGWP v1 wave sponge above 106.5 km is not ported")
     if kstart > 3:
         note_overflow("gwd.ugwp_v1_kstart", (ksrc < kstart).any())
     levels = torch.arange(1, levs + 1, device=dev).unbind(0)
@@ -510,14 +544,14 @@ def ngw_solv2(fields: Mapping[str, torch.Tensor], tau_ngw: torch.Tensor, *, dtp:
     post = compile_policy.compiled(_ngw_diffusion_prepare) if _regional_compile else _ngw_diffusion_prepare
     (uold, vold, told, bdif, bt_dif, adif, cdif, dtdif, inner, nstab, pdudt, pdvdt, pdtdt, dked, kvint, dzm) = post(
         tuple(fpu), tuple(dfdz), ksrc, U, V, T, Q, ZM, WRK3, BN2, AKT, DZI, DZM, RHOM, RHOI, dtp, s)
-    torch._assert_async((nstab <= NSTAB_MAX).all(), "UGWP v1 eddy-diffusion substeps above the ported cap")
+    torch_compat.assert_async((nstab <= NSTAB_MAX).all(), "UGWP v1 eddy-diffusion substeps above the ported cap")
     note_overflow("gwd.ugwp_v1_nstab", (nstab > nstab_cap).any())
     diffuse = compile_policy.compiled(_eddy_diffusion) if _regional_compile else _eddy_diffusion
     uold, vold, told = diffuse(uold, vold, told, bdif, bt_dif, adif, cdif, dtdif, inner, nstab,
                               nstab_cap=nstab_cap)
     finish = compile_policy.compiled(_ngw_finish) if _regional_compile else _ngw_finish
     pdudt, pdvdt, pdtdt = finish(uold, vold, told, U, V, T, dzm, kvint, inner, pdudt, pdvdt, pdtdt, dtp, s["rcpd"])
-    return {"pdudt": pdudt, "pdvdt": pdvdt, "pdtdt": pdtdt, "dked": dked[:, 1:],
+    return {"pdudt": pdudt, "pdvdt": pdvdt, "pdtdt": pdtdt, "dked": dked,
             "zngw": zngw, "ksrc": ksrc, "nstab": nstab}
 
 
@@ -614,7 +648,10 @@ def _ngw_diffusion_prepare(fpu, dfdz, ksrc, U, V, T, Q, ZM, WRK3, BN2, AKT, DZI,
     inner = (lev >= K) & (lev <= levs - 1)
     bdif = ze1d[:, None] - acdif
     bt_dif = ze1d[:, None] - acdif * IPR_KTGW
-    return uold, vold, told, bdif, bt_dif, adif, cdif, dtdif, inner, nstab, pdudt, pdvdt, pdtdt, dked, kvint, dzm
+    # The layers 1..levs of dked, stored as their own array: the interstitial carries it through three regions
+    # whose layout normalization would each copy a strided view.
+    return (uold, vold, told, bdif, bt_dif, adif, cdif, dtdif, inner, nstab, pdudt, pdvdt, pdtdt,
+            dked[:, 1:].contiguous(), kvint, dzm)
 
 
 def _ngw_finish(uold, vold, told, U, V, T, dzm, kvint, inner, pdudt, pdvdt, pdtdt, dtp, rcpd):
@@ -629,20 +666,25 @@ def _ngw_finish(uold, vold, told, U, V, T, dzm, kvint, inner, pdudt, pdvdt, pdtd
     uzf, vzf = nxtk(uold) - prev(uold), nxtk(vold) - prev(vold)
     zinv = one / (nxtk(dzm) + dzm)
     mf = rcpd * kvint[:, :levs + 1] * (uzf * uzf + vzf * vzf) * zinv * zinv
-    pdudt = torch.where(inner, ze2, pdudt)
-    pdvdt = torch.where(inner, ze1v, pdvdt)
-    pdtdt = torch.where(inner, heat_t + mf, pdtdt)
-    return pdudt[:, 1:], pdvdt[:, 1:], pdtdt[:, 1:]
+    # Layers 1..levs formed as their own arrays (as dked in _ngw_diffusion_prepare), not strided views: the
+    # selections on those layers only, so no full-height result is stored and copied (round 8 wave 4, 0.23 ms per
+    # 60 km step on the RTX PRO 6000). The same values per element.
+    layers, inner = slice(1, None), inner[:, 1:]
+    return (torch.where(inner, ze2[:, layers], pdudt[:, layers]), torch.where(inner, ze1v[:, layers], pdvdt[:, layers]),
+            torch.where(inner, (heat_t + mf)[:, layers], pdtdt[:, layers]))
 
 
 def ugwpv1_gsldrag(fields: Mapping[str, torch.Tensor], *, dtp: torch.Tensor, alpha_fd: torch.Tensor,
                    control: Mapping[str, Any], forecast_day: torch.Tensor,
-                   nstab_cap: int = NSTAB_MAX, kstart: int = 3) -> dict[str, torch.Tensor]:
+                   nstab_cap: int = NSTAB_MAX, kstart: int = 3, dx_factor_scale: torch.Tensor | None = None,
+                   tauamp_scale: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     """ugwpv1_gsldrag_run for do_ugwp_v1 with the PSL GSL drag (do_gwd_opt_psl), source order.
 
     Orographic drag (drag_suite_psl) consumes the original Statein winds; the non-stationary
     waves follow. The scheme's own dtend updates apply only without the generic GWD tendency.
-    nstab_cap and kstart bound the wave solver's loops (ngw_solv2).
+    nstab_cap and kstart bound the wave solver's loops (ngw_solv2). The parameter scales (0-d
+    tensors, None when absent) multiply the LS effective length (gwd.dx_factor, inside drag_suite_psl)
+    and the launch flux amplitude knob_ugwp_tauamp (gwd.tauamp, tau_ngw*s after slat_geos5_2020).
     """
     if not control["do_ugwp_v1"] or not control["do_gwd_opt_psl"] or control["do_ngw_ec"] \
             or control["do_ugwp_v1_orog_only"] or control["ldiag_ugwp"]:
@@ -658,7 +700,10 @@ def ugwpv1_gsldrag(fields: Mapping[str, torch.Tensor], *, dtp: torch.Tensor, alp
     dtend = fields["dtend"]
     if control["do_gsl_drag_ls_bl"] or control["do_gsl_drag_ss"] or control["do_gsl_drag_tofd"]:
         drag = compile_policy.compiled(drag_suite_psl) if _regional_compile else drag_suite_psl
-        psl = drag({**fields, "var": fields["hprime"]}, dtp=dtp, alpha_fd=alpha_fd, control=control)
+        # The scale enters the compiled region as a 1-element view on the numerical device
+        # (parameters.region_views: a 0-d CPU argument costs a guard host read per call); no kwarg when absent.
+        dx_scale = {} if dx_factor_scale is None else {"dx_factor_scale": parameters.region_view(dx_factor_scale, t)}
+        psl = drag({**fields, "var": fields["hprime"]}, dtp=dtp, alpha_fd=alpha_fd, control=control, **dx_scale)
         pdudt, pdvdt, pdtdt = psl["dudt"], psl["dvdt"], psl["dtdt"]
         dusfcg, dvsfcg, rdxzb = psl["dusfc"], psl["dvsfc"], psl["rdxzb"]
         dtend = psl.get("dtend", dtend)
@@ -668,6 +713,8 @@ def ugwpv1_gsldrag(fields: Mapping[str, torch.Tensor], *, dtp: torch.Tensor, alp
                              (pdudt * dtp, pdvdt * dtp, pdtdt * dtp))
     tau_amf = tau_amf_interp(fields["xlat_d"], forecast_day, setup)
     tau_ngw = slat_geos5_2020(fields["xlat_d"], setup["tamp_mpa"])
+    if tauamp_scale is not None:
+        tau_ngw = tau_ngw * tauamp_scale.to(device=t.device, dtype=t.dtype)  # gwd.tauamp: (tamp_mpa*flat)*s
     tau_ngw = ngwflux_update(tau_ngw, tau_amf, fields["xlat_d"], fields["rain"])
     ngw = ngw_solv2({**fields, "zmet": zmet, "zmeti": zmeti}, tau_ngw, dtp=dtp, setup=setup,
                     nstab_cap=nstab_cap, kstart=kstart)
@@ -696,12 +743,16 @@ def _add_process(dtend, dtidx, control, process, values):
     return dtend
 
 
-def apply_ugwpv1_gsldrag(statein, grid, prefix, hpbl, *, dtp, alpha_fd, dtidx, control, forecast_day):
+def apply_ugwpv1_gsldrag(statein, grid, prefix, hpbl, *, dtp, alpha_fd, dtidx, control, forecast_day,
+                         **scales):
     """Bind ugwpv1_gsldrag to Statein, the GWD_generic_pre statistics and the live PBL carries, with the
-    wave solver's loop bounds of ``runtime_policy.ugwp_v1_caps``."""
+    wave solver's loop bounds of ``runtime_policy.ugwp_v1_caps``. ``scales``: the present parameter scales
+    (dx_factor_scale, tauamp_scale) of ugwpv1_gsldrag."""
     work, sfcprop = prefix.interstitial, prefix.sfcprop
+    # q1 (the vapour slot of qgrs, a stride-ntrac view) stored once as its own array: the drag and wave-prepare
+    # regions each copied the view at entry (0.4 ms per 60 km step on the RTX PRO 6000, round 8 wave 4).
     fields = {
-        "t1": statein.tgrs, "u1": statein.ugrs, "v1": statein.vgrs, "q1": statein.qgrs[:, :, 0],
+        "t1": statein.tgrs, "u1": statein.ugrs, "v1": statein.vgrs, "q1": statein.qgrs[:, :, 0].contiguous(),
         **{n: getattr(statein, n) for n in ("prsi", "prsl", "prslk", "phil", "phii")},
         **{n: work[n] for n in ("del", "kpbl", "oc", "oa4", "clx", "theta", "sigma", "gamma", "elvmax",
                                 "varss", "oa4ss", "clxss")},
@@ -711,7 +762,7 @@ def apply_ugwpv1_gsldrag(statein, grid, prefix, hpbl, *, dtp, alpha_fd, dtidx, c
     nstab_cap, full_wave_loop = ugwp_v1_caps()
     kstart = 3 if full_wave_loop else wave_loop_start(control["ugwpv1"])
     result = ugwpv1_gsldrag(fields, dtp=dtp, alpha_fd=alpha_fd, control=control, forecast_day=forecast_day,
-                            nstab_cap=nstab_cap, kstart=kstart)
+                            nstab_cap=nstab_cap, kstart=kstart, **scales)
     diag_names = ("dudt_ogw", "dvdt_ogw", "dudt_obl", "dvdt_obl", "dudt_oss", "dvdt_oss", "dudt_ofd",
                   "dvdt_ofd", "du_ogwcol", "dv_ogwcol", "du_oblcol", "dv_oblcol", "du_osscol", "dv_osscol",
                   "du_ofdcol", "dv_ofdcol", "kdis_gw", "dtend")
@@ -734,7 +785,8 @@ def _apply_ugwpv1_regions(*args, **kwargs):
     global _regional_compile
     previous, _regional_compile = _regional_compile, True
     try:
-        return apply_ugwpv1_gsldrag(*args, **kwargs)
+        # Forward: the scheme orchestration compiles around its islands (compile_policy, orchestration).
+        return compile_policy.compiled(apply_ugwpv1_gsldrag, orchestration=True)(*args, **kwargs)
     finally:
         _regional_compile = previous
 

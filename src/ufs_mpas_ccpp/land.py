@@ -9,6 +9,7 @@ from dataclasses import replace
 from typing import Any, Mapping
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from noahmp_land_surface_torch.driver import (
     NOAHMP_DRIVER_PLAN_KEY,
     PREPARED_METADATA_KEY,
@@ -25,8 +26,19 @@ from noahmp_land_surface_torch.land_energy import (
 )
 from ufs_physics_common import compile_policy
 
+from . import parameters
 from .clock import _nint_nonnegative
 from .physics_prefix import PhysicsPrefixResult
+
+# Registry key -> name in the driver options' "parameter_scales" (land_body.state_from_case_after_g).
+NOAHMP_PARAMETER_KEYS = {"noahmp.czil": "czil", "noahmp.rsmin": "rsmin", "noahmp.rsurf": "rsurf",
+                         "noahmp.z0mvt": "z0mvt"}
+
+
+def noahmp_parameter_scales(parameter_scales: Mapping[str, torch.Tensor] | None) -> dict[str, torch.Tensor] | None:
+    """The registered Noah-MP scales present in ``parameter_scales`` by driver name; None when there are none."""
+    return parameters.select(parameter_scales, NOAHMP_PARAMETER_KEYS) or None
+
 
 SURFACE_BINDINGS = {
     **{
@@ -181,16 +193,6 @@ def noahmp_case_with_plan(prepared_case: Mapping[str, Any], *, device: torch.dev
     return hit[1]
 
 
-def release_noahmp_prepared_columns(prepared_case: Mapping[str, Any]) -> dict[str, Any]:
-    """``prepared_case`` without its resident prepared tensor columns, for a caller that keeps it.
-
-    ``apply_noahmp`` replaces them with the live host fields on every call, and its driver plan
-    comes from the host columns, so it never reads these full-grid copies (0.2 GB at x1.163842);
-    its results are the same bits. The offline driver re-prepares a case without them.
-    """
-    return {key: value for key, value in prepared_case.items() if key != PREPARED_TENSOR_COLUMNS_KEY}
-
-
 def apply_noahmp(
     statein,
     grid,
@@ -201,14 +203,17 @@ def apply_noahmp(
     julian: torch.Tensor,
     yearlen: torch.Tensor,
     water_budget: dict[str, torch.Tensor] | None = None,
+    parameter_scales: Mapping[str, torch.Tensor] | None = None,
 ) -> PhysicsPrefixResult:
     """Use the existing complete driver and its live per-pass activity mask.
 
     Preparation owns immutable grid/options and coefficient tables, not physics.
     All array arguments and both calendar values come from the live host state.
+    ``parameter_scales``: the trainable Noah-MP scales by driver name (``noahmp_parameter_scales``; 0-d
+    tensors; None: no op). They enter the driver options as the calendar does.
     """
     ctx = _apply_noahmp_begin(statein, grid, prefix, hpbl, prepared_case, julian=julian, yearlen=yearlen,
-                              water_budget=water_budget)
+                              water_budget=water_budget, parameter_scales=parameter_scales)
     if ctx["canopy"] is not None:
         ctx = {**ctx, "canopy": vege_flux_opt_sfc3_iterations(ctx["canopy"])}
     return _apply_noahmp_finish(prefix, ctx)
@@ -216,7 +221,8 @@ def apply_noahmp(
 
 def _apply_noahmp_begin(statein, grid, prefix: PhysicsPrefixResult, hpbl: torch.Tensor,
                         prepared_case: Mapping[str, Any], *, julian: torch.Tensor, yearlen: torch.Tensor,
-                        water_budget: dict[str, torch.Tensor] | None = None) -> dict[str, Any]:
+                        water_budget: dict[str, torch.Tensor] | None = None,
+                        parameter_scales: Mapping[str, torch.Tensor] | None = None) -> dict[str, Any]:
     """``apply_noahmp`` up to the canopy iteration loop (``noahmp_driver_begin``)."""
     live = noahmp_surface_inputs(statein, grid, prefix, hpbl)
     required = (prepared_case[_COUPLED_COLUMN_NAMES] if _COUPLED_COLUMN_NAMES in prepared_case
@@ -242,15 +248,19 @@ def _apply_noahmp_begin(statein, grid, prefix: PhysicsPrefixResult, hpbl: torch.
         **prepared_case,
         PREPARED_TENSOR_COLUMNS_KEY: prepared,
         SMOOTH_TENSOR_OVERRIDE_KEY: live,
-        "driver_options": _live_driver_options(prepared_case, julian, yearlen),
+        "driver_options": _live_driver_options(prepared_case, julian, yearlen, parameter_scales),
     }
     return noahmp_driver_begin(
         case, device=statein.pgr.device, activity=activity, water_budget=water_budget
     )
 
 
-def _live_driver_options(prepared_case: Mapping[str, Any], julian: torch.Tensor, yearlen: torch.Tensor) -> dict[str, Any]:
-    return {**prepared_case["driver_options"], "julian": julian, "iyrlen": yearlen}
+def _live_driver_options(prepared_case: Mapping[str, Any], julian: torch.Tensor, yearlen: torch.Tensor,
+                         parameter_scales: Mapping[str, torch.Tensor] | None = None) -> dict[str, Any]:
+    options = {**prepared_case["driver_options"], "julian": julian, "iyrlen": yearlen}
+    if parameter_scales:
+        options["parameter_scales"] = dict(parameter_scales)
+    return options
 
 
 def _apply_noahmp_finish(prefix: PhysicsPrefixResult, ctx: Mapping[str, Any]) -> PhysicsPrefixResult:
@@ -289,7 +299,8 @@ def _apply_noahmp_result(prefix: PhysicsPrefixResult, result: Mapping[str, torch
 
 def _apply_noahmp_compiled(statein, grid, prefix: PhysicsPrefixResult, hpbl: torch.Tensor,
                            prepared_case: Mapping[str, Any], *, julian: torch.Tensor, yearlen: torch.Tensor,
-                           water_budget: dict[str, torch.Tensor] | None = None) -> PhysicsPrefixResult:
+                           water_budget: dict[str, torch.Tensor] | None = None,
+                           parameter_scales: Mapping[str, torch.Tensor] | None = None) -> PhysicsPrefixResult:
     """The compiled form of ``apply_noahmp``.
 
     Without a recorded gradient: three exact-policy regions, the part before the canopy iteration
@@ -300,14 +311,16 @@ def _apply_noahmp_compiled(statein, grid, prefix: PhysicsPrefixResult, hpbl: tor
     from eager by up to 4 ulp (aot_eager, 80-column capture) where the single region's is exact.
     The prefix is bound outside the regions (no tensor work).
     """
-    # The calendar enters the regions as 1-element views: see _region_calendar.
+    # The calendar and the parameter scales enter the regions as 1-element views: see _region_calendar. The scales'
+    # views are on the working device and dtype (parameters.region_views).
     calendar = (julian.reshape(1), yearlen.reshape(1))
+    scales = None if not parameter_scales else parameters.region_views(parameter_scales, statein.pgr)
     if torch.is_grad_enabled():
         result = compile_policy.compiled(_apply_noahmp_region)(statein, grid, prefix, hpbl, prepared_case, calendar,
-                                                              water_budget=water_budget)
+                                                              water_budget=water_budget, scales=scales)
         return _apply_noahmp_result(prefix, result)
     ctx = compile_policy.compiled(_apply_noahmp_begin_region)(statein, grid, prefix, hpbl, prepared_case, calendar,
-                                                             water_budget=water_budget)
+                                                             water_budget=water_budget, scales=scales)
     if ctx["canopy"] is not None:
         ctx = {**ctx, "canopy": vege_flux_opt_sfc3_iterations(
             ctx["canopy"], step=compile_policy.compiled(_vege_flux_iteration))}
@@ -317,7 +330,7 @@ def _apply_noahmp_compiled(statein, grid, prefix: PhysicsPrefixResult, hpbl: tor
         prepared_case = {"driver_options": prepared_case["driver_options"],
             NOAHMP_DRIVER_PLAN_KEY: {"groups": prepared_case[NOAHMP_DRIVER_PLAN_KEY]["groups"]}}
         ctx = {**ctx, "case": {}}
-    result = compile_policy.compiled(_apply_noahmp_finish_region)(prepared_case, calendar, ctx)
+    result = compile_policy.compiled(_apply_noahmp_finish_region)(prepared_case, calendar, ctx, scales=scales)
     return _apply_noahmp_result(prefix, result)
 
 
@@ -334,19 +347,25 @@ def _region_calendar(calendar):
     return julian.reshape(()), yearlen.reshape(())
 
 
-def _apply_noahmp_region(statein, grid, prefix, hpbl, prepared_case, calendar, *, water_budget=None):
+def _region_scales(scales):
+    """The parameter scales from their 1-element region views (as ``_region_calendar``); None stays None."""
+    return None if scales is None else {name: value.reshape(()) for name, value in scales.items()}
+
+
+def _apply_noahmp_region(statein, grid, prefix, hpbl, prepared_case, calendar, *, water_budget=None, scales=None):
     julian, yearlen = _region_calendar(calendar)
     ctx = _apply_noahmp_begin(statein, grid, prefix, hpbl, prepared_case, julian=julian, yearlen=yearlen,
-                              water_budget=water_budget)
+                              water_budget=water_budget, parameter_scales=_region_scales(scales))
     if ctx["canopy"] is not None:
         ctx = {**ctx, "canopy": vege_flux_opt_sfc3_iterations(ctx["canopy"])}
     return noahmp_driver_finish(ctx)
 
 
-def _apply_noahmp_begin_region(statein, grid, prefix, hpbl, prepared_case, calendar, *, water_budget=None):
+def _apply_noahmp_begin_region(statein, grid, prefix, hpbl, prepared_case, calendar, *, water_budget=None,
+                               scales=None):
     julian, yearlen = _region_calendar(calendar)
     ctx = _apply_noahmp_begin(statein, grid, prefix, hpbl, prepared_case, julian=julian, yearlen=yearlen,
-                              water_budget=water_budget)
+                              water_budget=water_budget, parameter_scales=_region_scales(scales))
     host = (*_HOST_PARTITION_ENTRIES, "driver_options")
     groups = [(glacier, None if subset is None else {key: value for key, value in subset.items() if key not in host},
                selector) for glacier, subset, selector in ctx["groups"]]
@@ -359,8 +378,8 @@ def _apply_noahmp_begin_region(statein, grid, prefix, hpbl, prepared_case, calen
     return {**ctx, "groups": groups, "hij": hij, "case": live}
 
 
-def _apply_noahmp_finish_region(prepared_case, calendar, ctx):
-    options = _live_driver_options(prepared_case, *_region_calendar(calendar))
+def _apply_noahmp_finish_region(prepared_case, calendar, ctx, *, scales=None):
+    options = _live_driver_options(prepared_case, *_region_calendar(calendar), _region_scales(scales))
     templates = [template for _, template, _ in prepared_case[NOAHMP_DRIVER_PLAN_KEY]["groups"]]
     groups = [(glacier, None if subset is None else
                {**subset, **{key: template[key] for key in _HOST_PARTITION_ENTRIES}, "driver_options": options},
@@ -396,7 +415,7 @@ def skip_inactive_noahmp_pass(
     unchanged and its budget at zero, so the result is the same.
     """
     work = prefix.interstitial
-    torch._assert_async(
+    torch_compat.assert_async(
         ~(work["dry"] & work["flag_iter"]).any(), "second-pass Noah-MP column is active"
     )
     if water_budget is not None:

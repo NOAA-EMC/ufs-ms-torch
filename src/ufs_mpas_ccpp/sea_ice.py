@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from gfs_surface_layer_torch.driver import CP, EPS, EPSM1, RD, RVRDM1, fpvs
 
 from .physics_prefix import PhysicsPrefixResult, merge_prefix_writes
@@ -43,7 +44,6 @@ WORK_BINDINGS = {
     "hflxi": "hflx_ice",
     "hflxw": "hflx_water",
 }
-OUTPUT_FIELDS = tuple(SURFACE_BINDINGS) + tuple(WORK_BINDINGS)
 
 
 def sea_ice_fluxes(fields, table, *, thsfc_loc: bool):
@@ -79,7 +79,7 @@ def sea_ice_fluxes(fields, table, *, thsfc_loc: bool):
     }
     f = {n: torch.where(active, fields[n], d) for n, d in defaults.items()}
     f["tiice"] = torch.where(active[:, None], fields["tiice"], 260.0)
-    torch._assert_async(
+    torch_compat.assert_async(
         (~active | ((f["fice"] > 0.0) & (f["ch"] * f["wind"] > 0.0))).all(),
         "active sea ice needs nonzero concentration and heat exchange",
     )
@@ -325,7 +325,7 @@ def sfc_sice_run(fields, table, delt: torch.Tensor, *, thsfc_loc: bool):
         raise ValueError(
             "sea-ice timestep must be a scalar float32/float64 tensor on the numerical device"
         )
-    torch._assert_async(
+    torch_compat.assert_async(
         (torch.isfinite(delt) & (delt > 0.0)), "invalid sea-ice timestep"
     )
     flux = sea_ice_fluxes(fields, table, thsfc_loc=thsfc_loc)

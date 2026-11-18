@@ -9,6 +9,7 @@ import math
 from dataclasses import dataclass, fields, replace
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from .containers import Statein
 from .precision import WORKING_DTYPES
@@ -205,7 +206,7 @@ def initialize_surface(
             ),
         ),
     )
-    torch._assert_async(
+    torch_compat.assert_async(
         (torch.isfinite(x("ufs_sfc_znt")) & (x("ufs_sfc_znt") > 0.0)).all(),
         "invalid analyzed znt",
     )
@@ -337,7 +338,7 @@ def initialize_surface(
         )
 
     for name in ("sh2o", "smois", "tslb"):
-        torch._assert_async(
+        torch_compat.assert_async(
             (
                 torch.isfinite(x(name)[:, :4]) & (torch.abs(x(name)[:, :4]) <= 1.0e30)
             ).all(),
@@ -350,7 +351,7 @@ def initialize_surface(
         b = soil.bexp[soil_idx][:, None]
         maximum = soil.smcmax[soil_idx][:, None]
         psi = soil.psisat[soil_idx][:, None]
-        torch._assert_async(
+        torch_compat.assert_async(
             (~land_mask[:, None] | ((b > 0.0) & (maximum > 0.0) & (psi > 0.0))).all(),
             "invalid initialized Noah-MP soil parameters",
         )
@@ -413,18 +414,18 @@ def initialize_surface(
     theta, gamma, sigma, elevation = (
         x("gwd_" + name) for name in ("theta", "gamma", "sigma", "elvmax")
     )
-    torch._assert_async(
+    torch_compat.assert_async(
         (torch.isfinite(theta) & (torch.abs(theta) <= 0.5 * math.pi)).all(),
         "invalid GWD principal-axis angle",
     )
-    torch._assert_async(
+    torch_compat.assert_async(
         (torch.isfinite(gamma) & (gamma >= 0.0) & (gamma <= 1.0)).all(),
         "invalid GWD anisotropy",
     )
-    torch._assert_async(
+    torch_compat.assert_async(
         (torch.isfinite(sigma) & (sigma >= 0.0)).all(), "invalid GWD slope"
     )
-    torch._assert_async(
+    torch_compat.assert_async(
         (torch.isfinite(elevation) & (elevation >= x("ter"))).all(),
         "invalid GWD maximum elevation",
     )

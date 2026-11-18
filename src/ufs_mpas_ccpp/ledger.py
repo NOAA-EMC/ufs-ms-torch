@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from .containers import NativeAtmosphere, assert_all_finite, static_tensor
 from .distributed import global_rows, rank_values
@@ -51,7 +52,8 @@ class CommitLedgers:
 
 
 def _ordered_totals(values: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
-    # Prefix the source accumulator, including positive zero and restart carries.
+    # Prefix the source accumulator, including positive zero and restart carries. CPU only (_observer_totals):
+    # the CPU scan adds rows in order, and a level loop over every cell's rows would cost one op per row.
     rows = values.reshape(-1, initial.numel())
     return torch.cumsum(torch.cat((initial[None, :], rows), dim=0), dim=0)[-1]
 
@@ -216,7 +218,7 @@ def commit_ledgers(
         result.basis_reconciliation,
         cumulative_added,
     ):
-        torch._assert_async(
+        torch_compat.assert_async(
             torch.isfinite(value).all(), "nonfinite native commit ledger"
         )
     return result

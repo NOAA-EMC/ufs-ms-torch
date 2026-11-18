@@ -28,14 +28,6 @@ from mpas_pytorch.autodiff.checkpoint import (
     checkpoint_if_enabled,
     checkpoint_state_dict,
 )
-from mpas_pytorch.autodiff.tridiagonal_scan import (
-    TRIDIAG_SCAN_DEFAULT_POLICY,
-    canonical_tridiag_scan_shape_keys,
-    ensure_vertical_scan_plan,
-    normalize_tridiag_scan_policy,
-    tridiag_scan_plan_cache,
-    tridiag_scan_policy,
-)
 
 try:
     from torch.utils.checkpoint import (
@@ -70,6 +62,7 @@ from mpas_pytorch.dynamics.static_payloads import (
 )
 from mpas_pytorch.dynamics.stencil_ops import (
     _clone_for_grad,
+    _read_only_zeros,
     _replace_row_slice,
     _tensor_carries_autodiff,
     _tensor_version_cache_key,
@@ -84,10 +77,6 @@ from mpas_pytorch.precision import (
 )
 from mpas_pytorch.profiling import profile_section, profiled_call
 from mpas_pytorch.utils.checks import require_consistent_device
-
-# Boundary condition kernels for regional MPAS are imported lazily inside
-# config_apply_lbcs guards. The current package does not ship the boundary
-# module; regional/LBC readiness remains blocked until those kernels are restored.
 
 
 # =============================================================================
@@ -368,6 +357,21 @@ def _mapping_tensor_or_zeros(
     if isinstance(value, torch.Tensor):
         return value
     return torch.zeros(shape, dtype=dtype or floating_dtype(source), device=device)
+
+
+def _mapping_tensor_or_zero_view(
+    source: Mapping[str, Any],
+    key: str,
+    shape: tuple[int, ...],
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """``_mapping_tensor_or_zeros`` for a base that every consumer only reads: an absent entry is
+    ``stencil_ops._read_only_zeros``."""
+    value = source.get(key)
+    if isinstance(value, torch.Tensor):
+        return value
+    return _read_only_zeros(shape, dtype=floating_dtype(source), device=device)
 
 
 # Absent specified-zone masks are all zero: one read-only zero vector per
@@ -707,71 +711,6 @@ def _runner_owned_divergence_damping_plan(
         lambda: build_divergence_damping_plan(**plan_kwargs),
     )
 
-
-# =============================================================================
-# MEMORY OPTIMIZATION: Immutable mesh arrays
-# These arrays are never modified during time integration and can be referenced
-# without cloning to save memory (~3x reduction in mesh tensor memory).
-# =============================================================================
-IMMUTABLE_MESH_KEYS = frozenset(
-    {
-        # Connectivity arrays (integer indices)
-        "cellsOnEdge",
-        "edgesOnCell",
-        "verticesOnCell",
-        "cellsOnCell",
-        "verticesOnEdge",
-        "edgesOnVertex",
-        "cellsOnVertex",
-        "edgesOnEdge",
-        "advCellsForEdge",
-        "kiteForCell",
-        "nEdgesOnCell",
-        "nEdgesOnEdge",
-        "nAdvCellsForEdge",
-        # Horizontal geometry (fixed mesh properties)
-        "dvEdge",
-        "dcEdge",
-        "invAreaCell",
-        "areaCell",
-        "invDcEdge",
-        "invDvEdge",
-        "invAreaTriangle",
-        "meshScalingDel2",
-        "meshScalingDel4",
-        "fEdge",
-        "fVertex",
-        "latCell",
-        "latEdge",
-        "angleEdge",
-        "weightsOnEdge",
-        "kiteAreasOnVertex",
-        # Vertical coordinate (fixed vertical structure)
-        "fzm",
-        "fzp",
-        "rdzw",
-        "rdzu",
-        "dzu",
-        "dzw",
-        "fnm",
-        "fnp",
-        "rdnw",
-        "cf1",
-        "cf2",
-        "cf3",
-        "zgrid",
-        "zb",
-        "zb3",
-        # Scalar dimension info
-        "nCells",
-        "nEdges",
-        "nVertices",
-        "nVertLevels",
-        "maxEdges",
-        "vertexDegree",
-        "maxEdges2",
-    }
-)
 
 # =============================================================================
 # MESH-AUTHORITATIVE KEYS
@@ -1216,9 +1155,6 @@ def _validate_indexing_convention(
     - Values range from 0 (sentinel) to N (valid), or N+1 (boundary sentinel)
     - Data occupies rows 0..N-1; row N is trailing checkpoint padding
 
-    MESHState uses 0-based indexing (shape N, values -1 to N-1) which is
-    incompatible with kernels.
-
     Args:
         state_dict: Dictionary of state/mesh tensors
         strict: If True, raise ValueError on mismatch. If False, warn only.
@@ -1275,8 +1211,7 @@ def _validate_indexing_convention(
             "Indexing convention mismatch detected:\n"
             + "\n".join(f"  - {issue}" for issue in issues)
             + "\n\nKernels expect 1-based+padded arrays from Fortran-style raw input dictionaries. "
-            "Do not use the mesh-conversion helper that rewrites connectivity to 0-based. "
-            "See MESHState docstring for details."
+            "Zero-based connectivity (shape N, values -1 to N-1) is not accepted."
         )
         if strict:
             raise ValueError(msg)
@@ -1950,16 +1885,6 @@ def _cached_static_scalar(
     if cached is _STATIC_SCALAR_MISSING:
         return _STATIC_SCALAR_MISSING
     return cached
-
-
-def _extract_python_scalar_from_0d_tensor(value: torch.Tensor) -> Any:
-    if value.dtype == torch.bool:
-        return bool(value.item())
-    if value.dtype.is_floating_point:
-        return float(value.item())
-    if value.dtype.is_complex:
-        return complex(value.item())
-    return int(value.item())
 
 
 def _coerce_0d_tensor_scalars_inplace(
@@ -3024,8 +2949,20 @@ def atm_rk_integration_setup(
         # These are used when config_monotonic=True or config_positive_definite=True
         # Shape: (nCells+1, nVertLevels) - extract first scalar (typically water vapor qv)
         if state_dict["scalars"].shape[2] > 0:
-            result["scalar_old"] = state_dict["scalars"][:, :, 0].clone()
-            result["scalar_new"] = state_dict["scalars"][:, :, 0].clone()
+            # A caller that declares both step-local drops them from the step result, and inside the
+            # step the monotonic transport only passes them through or replaces them (its Fortran
+            # scratch, _MONOTONIC_SCALAR_TRANSPORT_SCRATCH_FIELDS); the no-grad step never writes the
+            # scalars in place (_time_level_copy). Then the first scalar's view holds the clone's
+            # values without a strided copy of the field.
+            first_scalar = state_dict["scalars"][:, :, 0]
+            if not torch.is_grad_enabled() and {"scalar_old", "scalar_new"}.issubset(
+                config.get("_step_local_fields", ())
+            ):
+                result["scalar_old"] = first_scalar
+                result["scalar_new"] = first_scalar
+            else:
+                result["scalar_old"] = first_scalar.clone()
+                result["scalar_new"] = first_scalar.clone()
         else:
             # If no scalars exist, create zero arrays with correct shape
             nCells_plus_1 = state_dict["scalars"].shape[0]
@@ -3128,8 +3065,8 @@ def atm_rk_integration_setup(
     # =========================================================================
     # Initialize boundary mask arrays for global MPAS.
     # For global simulations (not regional), bdyMaskCell and bdyMaskEdge are
-    # all zeros. These are required by large-step-recovery (recover_large_step) and vertical-velocity boundary adjustment-post-step scalar boundary setting
-    # (boundary conditions). Create them if missing to avoid lookup failures.
+    # all zeros. Large-step recovery (recover_large_step) reads them. Create them
+    # if missing to avoid lookup failures.
     # =========================================================================
     if "bdyMaskCell" not in result:
         result["bdyMaskCell"] = torch.zeros(
@@ -3350,53 +3287,6 @@ def _compiled_step_tensor_context(
     return str(DTYPE), "cpu"
 
 
-def _compiled_step_reference_tensor(
-    state_dict: Mapping[str, Any],
-    mesh_dict: Mapping[str, Any] | None,
-) -> torch.Tensor | None:
-    """Return a tensor whose device/dtype should own scan metadata."""
-    preferred_keys = (
-        "u",
-        "w",
-        "theta_m",
-        "rho_zz",
-        "scalars",
-        "a_tri",
-        "alpha_tri",
-        "gamma_tri",
-    )
-    for source in (state_dict, mesh_dict or {}):
-        for key in preferred_keys:
-            value = source.get(key)
-            if isinstance(value, torch.Tensor) and value.is_floating_point():
-                return value
-        for value in source.values():
-            if isinstance(value, torch.Tensor) and value.is_floating_point():
-                return value
-    return None
-
-
-def _prebuild_vertical_scan_plans(
-    *,
-    static_payloads: DycoreStaticPayloads,
-    state_dict: Mapping[str, Any],
-    mesh_dict: Mapping[str, Any] | None,
-    nVertLevels: int,
-) -> None:
-    """Populate runner-owned scan metadata before compiled numeric regions."""
-    reference = _compiled_step_reference_tensor(state_dict, mesh_dict)
-    if reference is None:
-        return
-    cache = static_payloads.vertical_scan_plan_cache()
-    levels = int(nVertLevels)
-    if levels <= 0:
-        ensure_vertical_scan_plan(reference, 0, cache=cache)
-        return
-    ensure_vertical_scan_plan(reference, levels, cache=cache)
-    if levels > 1:
-        ensure_vertical_scan_plan(reference, levels - 1, cache=cache)
-
-
 def _compiled_step_num_scalars(state_dict: Mapping[str, Any]) -> int:
     """Infer the scalar count used for stable chunk/tile compile keys."""
     value = state_dict.get("num_scalars")
@@ -3504,8 +3394,6 @@ class CompiledStepPlan:
     scalar_chunk_size: int
     monotonic_scalar_transport_reduction_slot_tile_width: int
     monotonic_scalar_transport_streaming_scalar_tile_width: int
-    acoustic_step_tridiag_scan_policy: str | None
-    acoustic_step_tridiag_scan_allowed_shapes: tuple[str, ...]
     namelist_key: tuple[tuple[str, Any], ...]
     rk_weights: Mapping[str, tuple[Any, ...]]
     dynamics_stage_configs: tuple[tuple[Mapping[str, Any], ...], ...]
@@ -3522,29 +3410,6 @@ class CompiledStepPlan:
         if rk_step < 1 or rk_step > len(self.transport_stage_configs):
             raise IndexError(f"transport rk_step out of range: {rk_step}")
         return self.transport_stage_configs[rk_step - 1]
-
-    def audit_snapshot(self) -> dict[str, Any]:
-        return {
-            "plan_key": repr(self.plan_key),
-            "mesh_shape_key": list(self.mesh_shape_key),
-            "dtype": self.dtype,
-            "device": self.device,
-            "split_coupled_mode": self.split_coupled_mode,
-            "dynamics_split": self.dynamics_split,
-            "scalar_chunk_size": self.scalar_chunk_size,
-            "monotonic_scalar_transport_reduction_slot_tile_width": self.monotonic_scalar_transport_reduction_slot_tile_width,
-            "monotonic_scalar_transport_streaming_scalar_tile_width": self.monotonic_scalar_transport_streaming_scalar_tile_width,
-            "acoustic_step_tridiag_scan_policy": self.acoustic_step_tridiag_scan_policy,
-            "acoustic_step_tridiag_scan_allowed_shapes": list(
-                self.acoustic_step_tridiag_scan_allowed_shapes
-            ),
-            "namelist_key_count": len(self.namelist_key),
-            "dynamics_stage_count": sum(
-                len(stage) for stage in self.dynamics_stage_configs
-            ),
-            "transport_stage_count": len(self.transport_stage_configs),
-            "rk_weights": {key: list(value) for key, value in self.rk_weights.items()},
-        }
 
 
 def build_compiled_step_plan(
@@ -3595,33 +3460,11 @@ def build_compiled_step_plan(
             else requested_monotonic_scalar_transport_streaming_scalar_tile_width,
         )
     )
-    acoustic_step_tridiag_scan_policy = normalize_tridiag_scan_policy(
-        get_config_value_safe(
-            config,
-            "config_acoustic_step_tridiag_scan_policy",
-            TRIDIAG_SCAN_DEFAULT_POLICY,
-        )
-    )
-    acoustic_step_tridiag_scan_allowed_shapes = tuple(
-        sorted(
-            canonical_tridiag_scan_shape_keys(
-                get_config_value_safe(
-                    config, "config_acoustic_step_tridiag_scan_allowed_shapes", ()
-                )
-            )
-        )
-    )
     normalized_config = dict(config)
     normalized_config["config_scalar_transport_chunk_size"] = int(scalar_chunk_size)
     normalized_config[
         "config_monotonic_scalar_transport_streaming_scalar_tile_width"
     ] = int(monotonic_scalar_transport_streaming_scalar_tile_width)
-    normalized_config["config_acoustic_step_tridiag_scan_policy"] = (
-        acoustic_step_tridiag_scan_policy
-    )
-    normalized_config["config_acoustic_step_tridiag_scan_allowed_shapes"] = (
-        acoustic_step_tridiag_scan_allowed_shapes
-    )
     split_coupled_mode = "split" if dynamics_split > 1 else "coupled"
     namelist_key = _compiled_step_namelist_key(normalized_config)
 
@@ -3670,11 +3513,6 @@ def build_compiled_step_plan(
             "monotonic_scalar_transport_streaming_scalar_tile_width",
             int(monotonic_scalar_transport_streaming_scalar_tile_width),
         ),
-        ("acoustic_step_tridiag_scan_policy", acoustic_step_tridiag_scan_policy),
-        (
-            "acoustic_step_tridiag_scan_allowed_shapes",
-            acoustic_step_tridiag_scan_allowed_shapes,
-        ),
         ("namelist", namelist_key),
         (
             "rk_weights",
@@ -3696,14 +3534,7 @@ def build_compiled_step_plan(
     base_config["_defer_diagnostic_solve_public_pack"] = True
     base_config["_timestep_scalars"] = timestep_scalars
     base_config["_dycore_static_payloads"] = static_payloads
-    base_config["_tridiag_scan_plan_cache"] = static_payloads.vertical_scan_plan_cache()
     base_config["_compiled_step_plan_key"] = plan_key
-    _prebuild_vertical_scan_plans(
-        static_payloads=static_payloads,
-        state_dict=state_dict,
-        mesh_dict=mesh_dict,
-        nVertLevels=timestep_scalars.nVertLevels,
-    )
     if workspace_obj is not None:
         base_config["_dycore_workspace"] = workspace_obj
     else:
@@ -3814,8 +3645,6 @@ def build_compiled_step_plan(
         monotonic_scalar_transport_streaming_scalar_tile_width=int(
             monotonic_scalar_transport_streaming_scalar_tile_width
         ),
-        acoustic_step_tridiag_scan_policy=acoustic_step_tridiag_scan_policy,
-        acoustic_step_tridiag_scan_allowed_shapes=acoustic_step_tridiag_scan_allowed_shapes,
         namelist_key=namelist_key,
         rk_weights=MappingProxyType(rk_weights),
         dynamics_stage_configs=tuple(dynamics_stage_configs),
@@ -3870,8 +3699,8 @@ def _atm_srk3_core(
                 7. Scalar advection (explicit-scalar-transport/monotonic-scalar-transport)
 
     Args:
-        state: Current model state (DycoreState or dict of tensors)
-        mesh: Mesh geometry and connectivity (MESHState or dict of tensors)
+        state: Current model state (dict of tensors)
+        mesh: Mesh geometry and connectivity (dict of tensors)
         config: Configuration dictionary with model parameters:
             - nAcousticSteps: Total number of acoustic substeps per large step
             - time_integration_order: 2 or 3 (default 3)
@@ -3891,29 +3720,7 @@ def _atm_srk3_core(
         ValueError: If strict=True and required kernel inputs are missing,
                     or state/mesh validation fails, or dynamics split settings are invalid.
     """
-    # =========================================================================
-    # VALIDATE STATE AND MESH
-    # Call validate() if available to catch shape/dtype errors early.
-    # This provides helpful error messages before cryptic index errors in kernels.
-    # =========================================================================
     compute_dtype = floating_dtype(state)
-    if hasattr(state, "validate") and callable(state.validate):
-        try:
-            state.validate()
-        except ValueError as e:
-            if strict:
-                raise ValueError(f"DycoreState validation failed: {e}") from e
-            else:
-                warnings.warn(f"DycoreState validation warning: {e}", RuntimeWarning)
-
-    if hasattr(mesh, "validate") and callable(mesh.validate):
-        try:
-            mesh.validate()
-        except ValueError as e:
-            if strict:
-                raise ValueError(f"MESHState validation failed: {e}") from e
-            else:
-                warnings.warn(f"MESHState validation warning: {e}", RuntimeWarning)
 
     # Attach the runner-owned static payload store before the local copy so
     # warmed runs can reuse successful static-input validation across timesteps.
@@ -3923,23 +3730,10 @@ def _atm_srk3_core(
     # Local config copy to avoid mutating caller-owned scalar/config values.
     config = dict(config)
     static_payloads_at_boundary = ensure_static_payload_store(config)
-    config["_tridiag_scan_plan_cache"] = (
-        static_payloads_at_boundary.vertical_scan_plan_cache()
-    )
 
-    # Handle DycoreState vs dict input
-    if hasattr(state, "__dict__"):
-        # DycoreState - convert to dict
-        state_dict = dict(state.__dict__)
-    else:
-        # Already a dict - clone to avoid mutation
-        state_dict = dict(state)
-
-    # Handle mesh dict
-    if hasattr(mesh, "__dict__"):
-        mesh_dict = dict(mesh.__dict__)
-    else:
-        mesh_dict = dict(mesh)
+    # Shallow copies: the step never mutates the caller's dicts.
+    state_dict = dict(state)
+    mesh_dict = dict(mesh)
 
     # =========================================================================
     # PROPAGATE DIMENSION SCALARS FROM MESH TO STATE
@@ -4035,7 +3829,6 @@ def _atm_srk3_core(
     # 2. Indexing convention validation (0-based vs 1-based) is handled by
     #    _validate_indexing_convention in execute_rk_step, which runs on the
     #    merged state+mesh dict.
-    # 3. If mesh has a validate() method (MESHState), that's called above.
 
     # Geometry and prognostics must share the explicitly selected precision.
     if mesh_dict is not None:
@@ -4183,7 +3976,6 @@ def _atm_srk3_core(
             static_scalar_store,
         )
         static_payloads = ensure_static_payload_store(config)
-        config["_tridiag_scan_plan_cache"] = static_payloads.vertical_scan_plan_cache()
 
     with profile_section("mpas.compiled_step_plan", config):
         compiled_step_plan = build_compiled_step_plan(
@@ -4423,9 +4215,6 @@ def _atm_srk3_core(
                         current_state["rho_zz_old"] = _clone_for_grad(
                             current_state["rho_zz_old_split"]
                         )
-
-    if bool(config.get("_return_after_dynamics_substeps", False)):
-        return cast(dict[str, Any], current_state)
 
     # =========================================================================
     # GAP-4: Split transport RK3 loop
@@ -4715,6 +4504,7 @@ def _atm_srk3_core(
                             num_scalars=num_scalars_t,
                             dt=dt_scalar_t,
                             coef_3rd_order=coef_3rd_t,
+                            coef_3rd_scale=_parameter_scale(config, "config_coef_3rd_order"),
                             nCellsSolve=nCellsSolve_t,
                             cellStart=cellStart_t,
                             cellEnd=cellEnd_t,
@@ -4806,8 +4596,9 @@ def _atm_srk3_core(
                                     device=device_t,
                                 )
                             ),
+                            # Only read (the source tendency zeroes its rows into a new field).
                             scalar_tend=_clone_for_grad(
-                                _mapping_tensor_or_zeros(
+                                _mapping_tensor_or_zero_view(
                                     current_state,
                                     "scalar_tend",
                                     (nCells_t + 1, nVertLevels_t, num_scalars_t),
@@ -5123,6 +4914,7 @@ def _atm_srk3_core(
                             nAdvCellsMax=nAdvCellsMax_t,
                             dt=dt_scalar_t,
                             coef_3rd_order=coef_3rd_t,
+                            coef_3rd_scale=_parameter_scale(config, "config_coef_3rd_order"),
                             edgeStart=edgeStart_t,
                             edgeEnd=edgeEnd_t,
                             cellSolveStart=cellSolveStart_t,
@@ -5152,7 +4944,10 @@ def _atm_srk3_core(
                             advCellsForEdge=current_state["advCellsForEdge"],
                             adv_coefs=current_state["adv_coefs"],
                             adv_coefs_3rd=current_state["adv_coefs_3rd"],
-                            horiz_flux_arr=_mapping_tensor_or_zeros(
+                            # Only read (the packed flux takes its rows outside the owned edges, and any
+                            # gather outside the patch, from it): an absent base is one zero element
+                            # broadcast, not a written [nEdges+1, levels, scalars] field.
+                            horiz_flux_arr=_mapping_tensor_or_zero_view(
                                 current_state,
                                 "horiz_flux_arr",
                                 (nEdges_t + 1, nVertLevels_t, num_scalars_t),
@@ -5296,67 +5091,6 @@ def _atm_srk3_core(
         current_state["scalars"] = torch.where(scalars < 0.0, 0.0, scalars)
 
     # =========================================================================
-    # BOUNDARY SCALAR SETTING (post-step scalar boundary setting)
-
-    # Called AFTER all RK dynamics substeps complete.
-    # Directly sets scalar values in specified zone from driving data.
-    # =========================================================================
-    config_apply_lbcs = config.get("config_apply_lbcs", False)
-    config_apply_lbcs = _coerce_bool(config_apply_lbcs, "config_apply_lbcs")
-
-    if config_apply_lbcs:
-        from mpas_pytorch.boundary.set_scalars import (  # type: ignore[import-not-found]
-            atm_bdy_set_scalars,
-        )
-
-        # Check for required fields
-        scalars_driving_key = (
-            "scalars_driving" if "scalars_driving" in current_state else "scalars_bdy"
-        )
-        has_set_scalars_data = (
-            scalars_driving_key in current_state
-            and "bdyMaskCell" in current_state
-            and "scalars" in current_state
-        )
-
-        if has_set_scalars_data:
-            nRelaxZone = current_state.get("nRelaxZone", config.get("nRelaxZone", 10))
-            nRelaxZone = _coerce_int(nRelaxZone, "nRelaxZone")
-
-            # Get dimensions from scalars shape: (nCells+1, nVertLevels, nScalars)
-            scalars_shape = current_state["scalars"].shape
-            nCells_scalars = scalars_shape[0] - 1  # Shape is (nCells+1, ...)
-            nScalars = scalars_shape[2] if len(scalars_shape) > 2 else 1
-
-            set_scalars_result = atm_bdy_set_scalars(
-                scalars=current_state["scalars"],
-                scalars_bdy=current_state[scalars_driving_key],
-                bdyMaskCell=current_state["bdyMaskCell"],
-                nRelaxZone=nRelaxZone,
-                nCells=nCells_scalars,
-                nScalars=nScalars,
-            )
-            current_state["scalars"] = set_scalars_result["scalars"]
-        elif strict:
-            missing_fields = []
-            if scalars_driving_key not in current_state:
-                missing_fields.append("scalars_driving or scalars_bdy")
-            if "bdyMaskCell" not in current_state:
-                missing_fields.append("bdyMaskCell")
-            if "scalars" not in current_state:
-                missing_fields.append("scalars")
-            raise ValueError(
-                f"config_apply_lbcs=True but required fields missing for post-step scalar boundary setting set_scalars: {missing_fields}. "
-                f"Either provide boundary data or set config_apply_lbcs=False."
-            )
-        else:
-            warnings.warn(
-                "Skipping boundary scalar setting (post-step scalar boundary setting): missing required fields. "
-                "Regional boundary conditions will not be applied to scalars.",
-                RuntimeWarning,
-            )
-
-    # =========================================================================
     # OPTIONAL: Timestep diagnostic summary
     # =========================================================================
     print_timestep_summary = config.get("print_timestep_summary", False)
@@ -5446,33 +5180,6 @@ def _atm_srk3_core(
 
 
 def atm_srk3(
-    state: Mapping[str, Any],
-    mesh: Mapping[str, Any],
-    config: Mapping[str, Any],
-    dt: float,
-    strict: bool = True,
-    differentiable: bool = False,
-    experimental: bool = False,
-) -> dict[str, Any]:
-    """Dual-mode wrapper for split-explicit RK3 integration.
-
-    ``config_vertical_sweep_layout`` (``auto``, ``column`` or ``level_major``)
-    selects the storage of the Thomas sweeps for this step; absent, ``auto``.
-    """
-    layout = (config or {}).get("config_vertical_sweep_layout")
-    if layout is None:
-        return _atm_srk3_entry(
-            state, mesh, config, dt, strict, differentiable, experimental
-        )
-    from mpas_pytorch.autodiff.tridiagonal_scan import vertical_sweep_layout_policy
-
-    with vertical_sweep_layout_policy(layout):
-        return _atm_srk3_entry(
-            state, mesh, config, dt, strict, differentiable, experimental
-        )
-
-
-def _atm_srk3_entry(
     state: Mapping[str, Any],
     mesh: Mapping[str, Any],
     config: Mapping[str, Any],
@@ -5572,9 +5279,6 @@ def _dynamics_tendency_ordered_ad_transpose_required(
     ad_mode = ad_mode.strip().lower().replace("-", "_")
     return (
         ad_mode != "native_autograd"
-        and bool(
-            config.get("_dynamics_tendency_normal_velocity_tendency_ordered_vjp", True)
-        )
         and any(_tensor_carries_autodiff(tensor) for tensor in dynamic_tensors)
     )
 
@@ -5588,7 +5292,6 @@ def _dynamics_tendency_edge_advective_ad_transpose_required(
     ad_mode = ad_mode.strip().lower().replace("-", "_")
     return (
         ad_mode != "native_autograd"
-        and bool(config.get("_dynamics_tendency_edge_advective_ordered_vjp", True))
         and any(_tensor_carries_autodiff(tensor) for tensor in dynamic_tensors)
     )
 
@@ -5602,6 +5305,21 @@ def _resolve_pre_dynamics_tendency_diagnostic_sources(
         result.get("u", state_dict.get("u")),
         result.get("rho_zz", state_dict.get("rho_zz")),
     )
+
+
+def _use_deferred_acoustic_edge_forms(
+    rtheta_pp_old_damping_only: bool, edge_start: int, edge_end: int, n_edges: int
+) -> bool:
+    """Whether the acoustic loop leaves edge writes that the next substep only reads back to that substep.
+
+    Outside autograd, on the full edge range, the small_step 1 ruAvg (small_step 2 forms it again
+    from tend_ru) and the divergence damping of substep k < nAcousticSteps (substep k + 1 forms
+    ru_p + damp before it reads ru_p; nothing reads ru_p in between) move into the next substep's
+    momentum update (atm_advance_acoustic_step_work), with the same expressions on the same values.
+    This saves one edge-field write and read per substep; the results are the same bits as the
+    immediate schedule.
+    """
+    return rtheta_pp_old_damping_only and edge_start == 1 and edge_end == n_edges
 
 
 def execute_rk_step(
@@ -5951,20 +5669,6 @@ def execute_rk_step(
             strict_indexing=bool(strict_indexing),
         )
 
-    # =========================================================================
-    # Warn when regional boundary conditions are enabled. The public release
-    # supports global meshes only, so regional boundary treatment is unsupported.
-    # Only warn on rk_step==1 to avoid flooding with duplicate warnings.
-    # =========================================================================
-    config_apply_lbcs_early = get_config_value_safe(config, "config_apply_lbcs", False)
-    if config_apply_lbcs_early and rk_step == 1:
-        warnings.warn(
-            "Regional boundary treatment is outside the supported global-mesh "
-            "release configuration.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-
     # Extract dimensions with validation
     required_dims = ["nCells", "nVertLevels"]
     for dim in required_dims:
@@ -5977,15 +5681,6 @@ def execute_rk_step(
     nCells = _scalar_int(state_dict, "nCells")
     nVertLevels = _scalar_int(state_dict, "nVertLevels")
     static_payloads_for_step = ensure_static_payload_store(config)
-    config["_tridiag_scan_plan_cache"] = (
-        static_payloads_for_step.vertical_scan_plan_cache()
-    )
-    _prebuild_vertical_scan_plans(
-        static_payloads=static_payloads_for_step,
-        state_dict=state_dict,
-        mesh_dict=None,
-        nVertLevels=nVertLevels,
-    )
 
     # nEdges: resolve from explicit value, edge array shapes, or hexagonal approximation
     nEdges = _resolve_nEdges(state_dict, nCells)
@@ -6212,49 +5907,36 @@ def execute_rk_step(
     )
     if should_recompute and can_compute_vert_coefs:
         # Compute vertical coefficients via vertical-implicit-coefficients
-        vertical_implicit_coefficients_tridiag_scan_policy = (
-            normalize_tridiag_scan_policy(
-                get_config_value_safe(
-                    config,
-                    "config_vertical_implicit_coefficients_tridiag_scan_policy",
-                    None,
-                )
-            )
+        vert_coefs = profiled_call(
+            "mpas.vertical_implicit_coefficients_vert_imp_coefs",
+            config,
+            atm_compute_vert_imp_coefs_work,
+            nCells=nCells,
+            nVertLevels=nVertLevels,
+            moist_start=_scalar_int(state_dict, "moist_start", 1),
+            moist_end=_scalar_int(state_dict, "moist_end", 0),
+            dts=dts,
+            epssm=epssm,
+            cellSolveStart=_scalar_int(state_dict, "cellSolveStart", 1),
+            cellSolveEnd=_scalar_int(state_dict, "cellSolveEnd", nCells),
+            zz=state_dict["zz"],
+            cqw=result["cqw"],
+            p=state_dict["p"],
+            t=state_dict["t"],
+            rb=state_dict["rb"],
+            rtb=state_dict["rtb"],
+            pb=state_dict["pb"],
+            rt=state_dict["rt"],
+            rdzw=state_dict["rdzw"],
+            fzm=state_dict["fzm"],
+            fzp=state_dict["fzp"],
+            rdzu=state_dict["rdzu"],
+            qtot=result["qtot"],
+            gravity=constants.G,
+            rgas=constants.RD,
+            cp=constants.CP,
+            pack_public=publish_vert_coefs_in_region,
         )
-        with (
-            tridiag_scan_plan_cache(config.get("_tridiag_scan_plan_cache")),
-            tridiag_scan_policy(vertical_implicit_coefficients_tridiag_scan_policy),
-        ):
-            vert_coefs = profiled_call(
-                "mpas.vertical_implicit_coefficients_vert_imp_coefs",
-                config,
-                atm_compute_vert_imp_coefs_work,
-                nCells=nCells,
-                nVertLevels=nVertLevels,
-                moist_start=_scalar_int(state_dict, "moist_start", 1),
-                moist_end=_scalar_int(state_dict, "moist_end", 0),
-                dts=dts,
-                epssm=epssm,
-                cellSolveStart=_scalar_int(state_dict, "cellSolveStart", 1),
-                cellSolveEnd=_scalar_int(state_dict, "cellSolveEnd", nCells),
-                zz=state_dict["zz"],
-                cqw=result["cqw"],
-                p=state_dict["p"],
-                t=state_dict["t"],
-                rb=state_dict["rb"],
-                rtb=state_dict["rtb"],
-                pb=state_dict["pb"],
-                rt=state_dict["rt"],
-                rdzw=state_dict["rdzw"],
-                fzm=state_dict["fzm"],
-                fzp=state_dict["fzp"],
-                rdzu=state_dict["rdzu"],
-                qtot=result["qtot"],
-                gravity=constants.G,
-                rgas=constants.RD,
-                cp=constants.CP,
-                pack_public=publish_vert_coefs_in_region,
-            )
         if publish_vert_coefs_in_region:
             vert_coefs[_VERT_IMP_COEFS_PUBLIC_FROM] = vert_coefs[
                 "_vertical_implicit_coefficients_cofwr_active"
@@ -6745,7 +6427,6 @@ def execute_rk_step(
             _dynamics_tendency_connectivity_payload,
             _dynamics_tendency_connectivity_payload_cache_key,
             _dynamics_tendency_whole_stage_specialization_key,
-            atm_compute_dyn_tend_work,
             build_dynamics_tendency_numeric_plan,
             build_dynamics_tendency_section_ops,
             pack_dynamics_tendency_numeric_outputs,
@@ -7220,6 +6901,7 @@ def execute_rk_step(
             "visc4_scale": _parameter_scale(config, "config_visc4_2dsmag"),
             "smagorinsky_scale": _parameter_scale(config, "config_smagorinsky_coef"),
             "del4u_div_scale": _parameter_scale(config, "config_del4u_div_factor"),
+            "coef_3rd_scale": _parameter_scale(config, "config_coef_3rd_order"),
             "_connectivity_payload": dynamics_tendency_connectivity_payload,
         }
         dynamics_tendency_section_plan_key = _compiled_kernel_specialization_key(
@@ -7253,7 +6935,6 @@ def execute_rk_step(
             bool(config.get("config_profile_sections", False))
             and not compile_whole_dynamics_tendency
         )
-        section_observer = config.get("_dynamics_tendency_section_observer")
 
         def build_section_ops() -> Any:
             return build_dynamics_tendency_section_ops(
@@ -7263,11 +6944,10 @@ def execute_rk_step(
                 compile_backend=compile_backend,
                 stage_key=dynamics_tendency_section_plan_key,
                 profile_sections=section_profile,
-                section_observer=section_observer,
             )
 
         section_store = config.get("_dycore_static_payloads")
-        if section_observer is None and isinstance(section_store, DycoreStaticPayloads):
+        if isinstance(section_store, DycoreStaticPayloads):
             # The section-op table depends only on these static choices; build
             # (and look up its compiled wrappers) once, not on every RK stage.
             dynamics_tendency_call_arguments["_section_ops"] = (
@@ -7286,93 +6966,70 @@ def execute_rk_step(
             )
         else:
             dynamics_tendency_call_arguments["_section_ops"] = build_section_ops()
-        debug_tap_sink = config.get("_dynamics_tendency_debug_tap_sink")
-        if debug_tap_sink is not None:
-            if not callable(debug_tap_sink):
-                raise TypeError("_dynamics_tendency_debug_tap_sink must be callable")
-            if (
-                compile_whole_dynamics_tendency
-                or dynamics_tendency_compile_region_names
-            ):
-                raise ValueError(
-                    "dynamics-tendency debug taps are an eager-only diagnostic and cannot be "
-                    "combined with compiled dynamics-tendency targets"
-                )
-            debug_taps: dict[str, dict[str, Any]] = {}
-            debug_call_arguments = dict(dynamics_tendency_call_arguments)
-            debug_call_arguments["_debug_taps"] = debug_taps
-            tend_result = profiled_call(
-                "mpas.dynamics_tendency_dyn_tend",
+        numeric_stage_key = dynamics_tendency_section_plan_key
+        if compile_whole_dynamics_tendency:
+            numeric_stage_key = _compiled_kernel_specialization_key(
                 config,
-                atm_compute_dyn_tend_work,
-                **debug_call_arguments,
-            )
-            debug_tap_sink(dynamics_tendency_rk_step, debug_taps)
-        else:
-            numeric_stage_key = dynamics_tendency_section_plan_key
-            if compile_whole_dynamics_tendency:
-                numeric_stage_key = _compiled_kernel_specialization_key(
-                    config,
-                    _DYNAMICS_TENDENCY_WHOLE_STAGE_COMPILE_TARGET,
-                    *_dynamics_tendency_whole_stage_specialization_key(
-                        dynamics_tendency_call_arguments
-                    ),
-                    "dt",
-                    dt_dynamics_tendency,
-                    "split",
-                    _resolve_dynamics_split(config),
-                    "theta_m_alias",
-                    theta_m_alias_dynamics_tendency,
-                )
-            static_payload_store = config.get("_dycore_static_payloads")
-            candidate_dynamics_tendency_numeric_plan = (
-                build_dynamics_tendency_numeric_plan(
-                    dynamics_tendency_call_arguments,
-                    stage_key=numeric_stage_key,
-                    require_canonical_section_ops=compile_whole_dynamics_tendency,
-                )
-            )
-            if isinstance(static_payload_store, DycoreStaticPayloads):
-                dynamics_tendency_numeric_plan = (
-                    static_payload_store.get_or_build_numeric_plan(
-                        "dynamics_tendency_numeric_composition",
-                        candidate_dynamics_tendency_numeric_plan.key,
-                        lambda: candidate_dynamics_tendency_numeric_plan,
-                    )
-                )
-            else:
-                dynamics_tendency_numeric_plan = (
-                    candidate_dynamics_tendency_numeric_plan
-                )
-            dynamics_tendency_callable = dynamics_tendency_numeric_plan.numeric_callable
-            if compile_whole_dynamics_tendency:
-                dynamics_tendency_callable = _maybe_compile_kernel(
-                    _DYNAMICS_TENDENCY_WHOLE_STAGE_COMPILE_TARGET,
-                    dynamics_tendency_numeric_plan.numeric_callable,
-                    enabled=True,
-                    mode=compile_mode,
-                    backend=compile_backend,
-                    specialization_key=dynamics_tendency_numeric_plan.key,
-                    allow_reverse_autodiff=_kernel_compiled_reverse_ad_enabled_for_device(
-                        _DYNAMICS_TENDENCY_WHOLE_STAGE_COMPILE_TARGET,
-                        config,
-                        device=device,
-                    ),
-                )
-            compact_tend_result = profiled_call(
-                "mpas.dynamics_tendency_dyn_tend",
-                config,
-                dynamics_tendency_callable,
-                *dynamics_tendency_numeric_plan.dynamic_values(
+                _DYNAMICS_TENDENCY_WHOLE_STAGE_COMPILE_TARGET,
+                *_dynamics_tendency_whole_stage_specialization_key(
                     dynamics_tendency_call_arguments
                 ),
+                "dt",
+                dt_dynamics_tendency,
+                "split",
+                _resolve_dynamics_split(config),
+                "theta_m_alias",
+                theta_m_alias_dynamics_tendency,
             )
-            tend_result = pack_dynamics_tendency_numeric_outputs(
-                compact_tend_result,
+        static_payload_store = config.get("_dycore_static_payloads")
+        candidate_dynamics_tendency_numeric_plan = (
+            build_dynamics_tendency_numeric_plan(
                 dynamics_tendency_call_arguments,
-                workspace=config.get("_dycore_workspace"),
-                take_unchanged_ownership=True,
+                stage_key=numeric_stage_key,
+                require_canonical_section_ops=compile_whole_dynamics_tendency,
             )
+        )
+        if isinstance(static_payload_store, DycoreStaticPayloads):
+            dynamics_tendency_numeric_plan = (
+                static_payload_store.get_or_build_numeric_plan(
+                    "dynamics_tendency_numeric_composition",
+                    candidate_dynamics_tendency_numeric_plan.key,
+                    lambda: candidate_dynamics_tendency_numeric_plan,
+                )
+            )
+        else:
+            dynamics_tendency_numeric_plan = (
+                candidate_dynamics_tendency_numeric_plan
+            )
+        dynamics_tendency_callable = dynamics_tendency_numeric_plan.numeric_callable
+        if compile_whole_dynamics_tendency:
+            dynamics_tendency_callable = _maybe_compile_kernel(
+                _DYNAMICS_TENDENCY_WHOLE_STAGE_COMPILE_TARGET,
+                dynamics_tendency_numeric_plan.numeric_callable,
+                enabled=True,
+                mode=compile_mode,
+                backend=compile_backend,
+                specialization_key=dynamics_tendency_numeric_plan.key,
+                allow_reverse_autodiff=_kernel_compiled_reverse_ad_enabled_for_device(
+                    _DYNAMICS_TENDENCY_WHOLE_STAGE_COMPILE_TARGET,
+                    config,
+                    device=device,
+                ),
+            )
+        compact_tend_result = profiled_call(
+            "mpas.dynamics_tendency_dyn_tend",
+            config,
+            dynamics_tendency_callable,
+            *dynamics_tendency_numeric_plan.dynamic_values(
+                dynamics_tendency_call_arguments
+            ),
+        )
+        tend_result = pack_dynamics_tendency_numeric_outputs(
+            compact_tend_result,
+            dynamics_tendency_call_arguments,
+            workspace=config.get("_dycore_workspace"),
+            take_unchanged_ownership=True,
+        )
         # Update result with tendency outputs
         # Map dynamics-tendency outputs to the expected result keys for acoustic step
         result["tend_ru"] = tend_result["tend_u"]  # Horizontal momentum tendency
@@ -7547,6 +7204,7 @@ def execute_rk_step(
             _compile_backend=compile_backend,
             _numeric_plan=small_step_perturbation_numeric_plan,
             _take_w_tend_ownership=True,
+            coef_3rd_scale=_parameter_scale(config, "config_coef_3rd_order"),
         )
 
         # Update tend_rw with the modified w_tend from small-step-perturbation
@@ -7556,146 +7214,6 @@ def execute_rk_step(
 
     # Chain tap: small-step-perturbation-adjusted tendencies entering acoustic loop.
     sync_chain_tendency_aliases()
-
-    # =========================================================================
-    # Step 2.6: Boundary Tendency Adjustments (Regional MPAS only)
-
-    # MUST happen BEFORE acoustic step loop for regional runs.
-    # 1. adjust_speczone_tend: Zeros tendencies in specified zone
-    # 2. adjust_relaxzone_tend: Applies Rayleigh damping in relaxation zone
-    # =========================================================================
-    config_apply_lbcs = config.get("config_apply_lbcs", False)
-    config_apply_lbcs = _coerce_bool(config_apply_lbcs, "config_apply_lbcs")
-
-    if config_apply_lbcs:
-        from mpas_pytorch.boundary.boundary_tendencies import (  # type: ignore[import-not-found]
-            adjust_relaxzone_tend,
-            adjust_speczone_tend,
-        )
-
-        # Check for required boundary tendency fields
-        required_tend_bdy_fields = [
-            "bdyMaskEdge",
-            "bdyMaskCell",
-            "ru_driving",
-            "rtheta_m_driving",
-            "rho_zz_driving",
-            "rw_driving",
-            "meshScalingRegionalEdge",
-            "meshScalingRegionalCell",
-        ]
-        missing_tend_bdy = [f for f in required_tend_bdy_fields if f not in state_dict]
-        has_tend_bdy_data = len(missing_tend_bdy) == 0
-
-        # Also need tendencies from dynamics-tendency
-        has_tend_outputs = all(
-            k in result for k in ["tend_ru", "tend_rtheta_m", "tend_rho_zz", "tend_rw"]
-        )
-        # Fallback: tend_rtheta_m might be called tend_rt, tend_rho_zz might be called tend_rho
-        if not has_tend_outputs:
-            has_tend_outputs = all(
-                k in result for k in ["tend_ru", "tend_rt", "tend_rho", "tend_rw"]
-            )
-
-        if has_tend_bdy_data and has_tend_outputs:
-            nRelaxZone = _scalar_int(state_dict, "nRelaxZone", 10)
-
-            # Get dt values
-            dts_val = config.get(
-                "dts",
-                config.get("dt", 720.0) / nAcousticSteps if nAcousticSteps > 0 else 1.0,
-            )
-            dt_full = config.get(
-                "dt", dts_val * nAcousticSteps if nAcousticSteps > 0 else 720.0
-            )
-            dt_rk = dts_val
-
-            # Map tendency names (dynamics-tendency uses tend_rt, tend_rho; boundary uses tend_rtheta_m, tend_rho_zz)
-            tend_ru = result.get("tend_ru")
-            tend_rtheta_m = result.get("tend_rtheta_m", result.get("tend_rt"))
-            tend_rho_zz = result.get("tend_rho_zz", result.get("tend_rho"))
-            tend_rw = result.get("tend_rw")
-
-            # 1. Zero tendencies in specified zone (innermost boundary ring)
-            speczone_result = adjust_speczone_tend(
-                tend_ru=tend_ru,
-                tend_rtheta_m=tend_rtheta_m,
-                tend_rho_zz=tend_rho_zz,
-                tend_rw=tend_rw,
-                bdyMaskEdge=state_dict["bdyMaskEdge"],
-                bdyMaskCell=state_dict["bdyMaskCell"],
-                nRelaxZone=nRelaxZone,
-                nEdges=nEdges,
-                nCells=nCells,
-                nVertLevels=nVertLevels,
-                nVertLevelsP1=nVertLevels + 1,
-            )
-
-            # Update result with speczone-adjusted tendencies
-            result["tend_ru"] = speczone_result["tend_ru"]
-            if "tend_rtheta_m" in result:
-                result["tend_rtheta_m"] = speczone_result["tend_rtheta_m"]
-            else:
-                result["tend_rt"] = speczone_result["tend_rtheta_m"]
-            if "tend_rho_zz" in result:
-                result["tend_rho_zz"] = speczone_result["tend_rho_zz"]
-            else:
-                result["tend_rho"] = speczone_result["tend_rho_zz"]
-            result["tend_rw"] = speczone_result["tend_rw"]
-
-            # 2. Apply Rayleigh damping in relaxation zone
-            relaxzone_result = adjust_relaxzone_tend(
-                tend_ru=result["tend_ru"],
-                tend_rtheta_m=result.get("tend_rtheta_m", result.get("tend_rt")),
-                tend_rho_zz=result.get("tend_rho_zz", result.get("tend_rho")),
-                tend_rw=result["tend_rw"],
-                ru=state_dict["ru"],
-                rtheta_m=state_dict.get(
-                    "rtheta_m", state_dict["theta_m"] * state_dict["rho_zz"]
-                ),
-                rho_zz=state_dict["rho_zz"],
-                rw=state_dict["rw"],
-                ru_driving=state_dict["ru_driving"],
-                rtheta_m_driving=state_dict["rtheta_m_driving"],
-                rho_zz_driving=state_dict["rho_zz_driving"],
-                rw_driving=state_dict["rw_driving"],
-                bdyMaskEdge=state_dict["bdyMaskEdge"],
-                bdyMaskCell=state_dict["bdyMaskCell"],
-                nRelaxZone=nRelaxZone,
-                dt=dt_full,
-                dt_rk=dt_rk,
-                meshScalingRegionalEdge=state_dict["meshScalingRegionalEdge"],
-                meshScalingRegionalCell=state_dict["meshScalingRegionalCell"],
-                nEdges=nEdges,
-                nCells=nCells,
-                nVertLevels=nVertLevels,
-                nVertLevelsP1=nVertLevels + 1,
-            )
-
-            # Update result with relaxzone-adjusted tendencies
-            result["tend_ru"] = relaxzone_result["tend_ru"]
-            if "tend_rtheta_m" in result:
-                result["tend_rtheta_m"] = relaxzone_result["tend_rtheta_m"]
-            else:
-                result["tend_rt"] = relaxzone_result["tend_rtheta_m"]
-            if "tend_rho_zz" in result:
-                result["tend_rho_zz"] = relaxzone_result["tend_rho_zz"]
-            else:
-                result["tend_rho"] = relaxzone_result["tend_rho_zz"]
-            result["tend_rw"] = relaxzone_result["tend_rw"]
-
-        elif config_apply_lbcs and not has_tend_bdy_data:
-            if strict:
-                raise ValueError(
-                    f"config_apply_lbcs=True but required boundary tendency fields missing: {missing_tend_bdy}. "
-                    f"Either provide boundary data or set config_apply_lbcs=False."
-                )
-            else:
-                warnings.warn(
-                    f"Skipping boundary tendency adjustment: missing fields {missing_tend_bdy}. "
-                    f"Regional boundary conditions will not be applied to tendencies.",
-                    RuntimeWarning,
-                )
 
     # =========================================================================
     # Step 3: Acoustic substep loop (acoustic-step)
@@ -7865,23 +7383,6 @@ def execute_rk_step(
                 nCells + 1, nVertLevels + 1, dtype=compute_dtype, device=device
             )
         workspace_local = config.get("_dycore_workspace")
-        acoustic_step_tridiag_scan_policy = normalize_tridiag_scan_policy(
-            get_config_value_safe(
-                config,
-                "config_acoustic_step_tridiag_scan_policy",
-                TRIDIAG_SCAN_DEFAULT_POLICY,
-            )
-        )
-        acoustic_step_tridiag_scan_allowed_shapes = tuple(
-            sorted(
-                canonical_tridiag_scan_shape_keys(
-                    get_config_value_safe(
-                        config, "config_acoustic_step_tridiag_scan_allowed_shapes", ()
-                    )
-                )
-            )
-        )
-
         acoustic_step_compile_region_names: tuple[str, ...] = ()
         compile_whole_acoustic_step = False
         if compile_on:
@@ -7963,10 +7464,6 @@ def execute_rk_step(
                 stage_key=(
                     "rk_step",
                     int(rk_step),
-                    "scan_policy",
-                    acoustic_step_tridiag_scan_policy,
-                    "scan_shapes",
-                    acoustic_step_tridiag_scan_allowed_shapes,
                 ),
             )
             acoustic_step_acoustic_solve_plan = (
@@ -8098,6 +7595,27 @@ def execute_rk_step(
                 (nCells + 1, nVertLevels),
             )
 
+        # The config_xnutr scale multiplies the Rayleigh coefficient dss once per stage. The product is never written
+        # back: dss is static carried state and part of the restart identity.
+        xnutr_scale = _parameter_scale(config, "config_xnutr")
+        dss_acoustic = (
+            state_dict["dss"]
+            if xnutr_scale is None
+            else state_dict["dss"] * xnutr_scale
+        )
+
+        deferred_edge_forms = _use_deferred_acoustic_edge_forms(
+            rtheta_pp_old_damping_only, edgeStart, edgeEnd, nEdges
+        )
+        defer_ru_avg = deferred_edge_forms and nAcousticSteps >= 2
+        damping_static_arguments = (
+            dict(divergence_numeric_plan.static_arguments)
+            if deferred_edge_forms and divergence_numeric_plan is not None
+            else None
+        )
+        smdiv_scale = _parameter_scale(config, "config_smdiv")
+        pending_damping: dict[str, Any] | None = None
+
         # Acoustic substep loop
         # Halo schedule (communication only; values are unchanged):
         # mpas_atm_time_integration.F exchanges rho_pp before every acoustic
@@ -8141,10 +7659,6 @@ def execute_rk_step(
                         nAcousticSteps,
                         "dts",
                         dts,
-                        "tridiag_scan_policy",
-                        acoustic_step_tridiag_scan_policy,
-                        "tridiag_scan_shapes",
-                        acoustic_step_tridiag_scan_allowed_shapes,
                     ),
                 )
 
@@ -8165,26 +7679,19 @@ def execute_rk_step(
                 tend_rt_bound: torch.Tensor = tend_rt_local,
                 tend_rw_bound: torch.Tensor = tend_rw_local,
                 cqu_bound: torch.Tensor = result["cqu"],
+                pending_damping_local: dict[str, Any] | None = pending_damping,
             ) -> dict[str, Any]:
                 # Keep non-checkpoint tensor inputs closure-captured and immutable:
                 # mesh/state geometry and dynamics-tendency tendencies are fixed over the
                 # acoustic substep loop and are not mutated between forward and
                 # checkpoint recompute.
 
-                def _acoustic_kernel_with_scan_plan_cache(
-                    **kwargs: Any,
-                ) -> dict[str, Any]:
-                    with tridiag_scan_plan_cache(
-                        config.get("_tridiag_scan_plan_cache")
-                    ):
-                        return acoustic_kernel_local(**kwargs)
-
                 return cast(
                     dict[str, Any],
                     profiled_call(
                         "mpas.acoustic_step_acoustic_step",
                         config,
-                        _acoustic_kernel_with_scan_plan_cache,
+                        acoustic_kernel_local,
                         # Dimensions
                         nCells=nCells,
                         nEdges=nEdges,
@@ -8250,7 +7757,7 @@ def execute_rk_step(
                         cofwt=vert_coefs.get("cofwt"),
                         cofwr=vert_coefs.get("cofwr"),
                         cofwz=vert_coefs.get("cofwz"),
-                        dss=state_dict["dss"],
+                        dss=dss_acoustic,
                         # Edge-based arrays
                         # Capturing result would retain this checkpoint's later outputs.
                         cqu=cqu_bound,
@@ -8282,8 +7789,6 @@ def execute_rk_step(
                         _compile_backend=compile_backend,
                         _connectivity_payload=acoustic_step_connectivity_payload,
                         _acoustic_solve_plan=acoustic_step_acoustic_solve_plan,
-                        _tridiag_scan_policy=acoustic_step_tridiag_scan_policy,
-                        _tridiag_scan_allowed_shapes=acoustic_step_tridiag_scan_allowed_shapes,
                         _vertical_implicit_coefficients_active_cell_start=vert_coefs.get(
                             "_vertical_implicit_coefficients_active_cell_start"
                         ),
@@ -8312,8 +7817,16 @@ def execute_rk_step(
                             "_vertical_implicit_coefficients_gamma_tri_active"
                         ),
                         _rtheta_pp_old_damping_only=rtheta_pp_old_damping_only,
+                        # With a deferred ruAvg, small_step 2 still reads the seed.
                         _preserve_average_inputs=shared_average_seeds
-                        and small_step_local == 1,
+                        and (
+                            small_step_local == 1
+                            or (defer_ru_avg and small_step_local == 2)
+                        ),
+                        _pending_divergence_damping=pending_damping_local,
+                        _ru_avg_deferred=defer_ru_avg and small_step_local == 1,
+                        _ru_avg_from_first_step=defer_ru_avg
+                        and small_step_local == 2,
                     ),
                 )
 
@@ -8362,11 +7875,18 @@ def execute_rk_step(
             # Fortran calls this UNCONDITIONALLY; damping is controlled by smdiv and
             # len_disp: coef_divdamp = 2.0 * smdiv * len_disp * rdts
             # If smdiv=0 or len_disp=0, the damping coefficient naturally becomes zero.
-            # Removed incorrect gating on apply_lbcs and 3d_div_damp.
             # -----------------------------------------------------------------
-            # Gate on smdiv and len_disp, NOT on apply_lbcs or 3d_div_damp
             # Damping runs when the coefficient is non-zero.
-            if divergence_enabled:
+            pending_damping = None
+            if damping_static_arguments is not None and small_step < nAcousticSteps:
+                # The arguments of the call below; substep small_step + 1 adds the damping into ru_p.
+                pending_damping = {
+                    **damping_static_arguments,
+                    "theta_m": state_dict.get("theta_m_init", state_dict["theta_m"]),
+                    "rtheta_pp_old": None if small_step == 1 else rtheta_pp_old,
+                    "coefficient_scale": smdiv_scale,
+                }
+            elif divergence_enabled:
                 div_damp_result = profiled_call(
                     "mpas.divergence_damping",
                     config,
@@ -8397,7 +7917,7 @@ def execute_rk_step(
                     _numeric_plan=divergence_numeric_plan,
                     _rtheta_pp_old_zero=rtheta_pp_old_damping_only
                     and small_step == 1,
-                    smdiv_scale=_parameter_scale(config, "config_smdiv"),
+                    smdiv_scale=smdiv_scale,
                 )
                 ru_p = div_damp_result["ru_p"]
 
@@ -8730,6 +8250,7 @@ def execute_rk_step(
             _compile_mode=compile_mode,
             _compile_backend=compile_backend,
             _recovery_plan=large_step_recovery_recovery_plan,
+            coef_3rd_scale=_parameter_scale(config, "config_coef_3rd_order"),
         )
 
         # Update result with recovery outputs
@@ -8749,11 +8270,7 @@ def execute_rk_step(
             result["uhAvg"] = _clone_for_grad(result["ruAvg"])
 
     if "u" in result:
-        exchange_halo_group(
-            config,
-            "u_123" if bool(config.get("config_apply_lbcs", False)) else "u_3",
-            result,
-        )
+        exchange_halo_group(config, "u_3", result)
 
     # Chain tap: recovered prognostic state after large-step-recovery.
     sync_chain_tendency_aliases()
@@ -8789,7 +8306,6 @@ def execute_rk_step(
     config_split_dynamics_transport = (
         _resolve_dynamics_split(config) > 1 if split_keys_present else False
     )
-    config_apply_lbcs = get_config_value_safe(config, "config_apply_lbcs", False)
 
     # Check if explicit-scalar-transport/monotonic-scalar-transport required inputs are available
     # explicit-scalar-transport (explicit) requires: scalar_old, scalar_new, uhAvg, wwAvg, etc.
@@ -8817,7 +8333,7 @@ def execute_rk_step(
 
     # Honor config_scalar_advection/config['advect_scalars'] gate exactly.
     # Fortran only calls scalar transport when config_scalar_advection is true.
-    # When false, both explicit-scalar-transport/monotonic-scalar-transport (and downstream scalar boundary adjustment)
+    # When false, both explicit-scalar-transport/monotonic-scalar-transport
     # must be skipped in the coupled RK loop.
     if not advect_scalars_requested:
         pass
@@ -8825,7 +8341,7 @@ def execute_rk_step(
     # is deferred to a separate transport RK3 loop after all dynamics
     # substeps complete. Skip it here inside the dynamics RK loop.
     elif config_split_dynamics_transport:
-        # Scalar advection (explicit-scalar-transport/monotonic-scalar-transport) and boundary adjustment (transported-scalar boundary adjustment)
+        # Scalar advection (explicit-scalar-transport/monotonic-scalar-transport)
         # will be handled in the split transport path in atm_srk3.
         pass
     elif use_limiters:
@@ -9136,6 +8652,7 @@ def execute_rk_step(
                 num_scalars=num_scalars,
                 dt=dt_scalar,
                 coef_3rd_order=coef_3rd,
+                coef_3rd_scale=_parameter_scale(config, "config_coef_3rd_order"),
                 nCellsSolve=nCellsSolve,
                 cellStart=cellStart,
                 cellEnd=cellEnd,
@@ -9499,6 +9016,7 @@ def execute_rk_step(
                 nAdvCellsMax=nAdvCellsMax,
                 dt=dt_scalar,
                 coef_3rd_order=coef_3rd,
+                coef_3rd_scale=_parameter_scale(config, "config_coef_3rd_order"),
                 edgeStart=edgeStart,
                 edgeEnd=edgeEnd,
                 cellSolveStart=cellSolveStart,
@@ -9562,103 +9080,6 @@ def execute_rk_step(
             result.update(scalar_result)
             if "scalars_new" in result:
                 result["scalars"] = _clone_for_grad(result["scalars_new"])
-
-    # =========================================================================
-    # Step 5.5: Scalar boundary adjustment (transported-scalar boundary adjustment - regional MPAS only)
-    # Called after scalar advection to apply Davies relaxation in boundary zone.
-
-    # Only applies when config_apply_lbcs=true (regional MPAS).
-    # For global MPAS (config_apply_lbcs=false), this is a no-op.
-    # GAP-4: Also skipped when split dynamics-transport is active (handled
-    # in the split transport path).
-    # =========================================================================
-
-    if (
-        advect_scalars_requested
-        and not config_split_dynamics_transport
-        and config_apply_lbcs
-        and "scalars_new" in result
-    ):
-        # Check for required boundary data for scalar adjustment (Laplacian + Rayleigh)
-        # Required mesh arrays for full implementation
-        required_scalar_bdy_fields = [
-            "bdyMaskCell",
-            "scalars_driving",  # or fallback to 'scalars_bdy'
-            "meshScalingRegionalCell",
-            "cellsOnCell",
-            "nEdgesOnCell",
-            "areaCell",
-            "dvEdge",
-            "dcEdge",
-            "edgesOnCell",
-        ]
-        missing_bdy_scalar = [
-            f for f in required_scalar_bdy_fields if f not in state_dict
-        ]
-        # Allow fallback: scalars_bdy -> scalars_driving
-        if "scalars_driving" not in state_dict and "scalars_bdy" in state_dict:
-            missing_bdy_scalar = [
-                f for f in missing_bdy_scalar if f != "scalars_driving"
-            ]
-        has_bdy_data_scalars = len(missing_bdy_scalar) == 0
-
-        if has_bdy_data_scalars:
-            nRelaxZone_scalar = _scalar_int(state_dict, "nRelaxZone", 10)
-            num_scalars_bdy = result["scalars_new"].shape[
-                2
-            ]  # (nCells+1, nVertLevels, nScalars)
-
-            # Loop bounds (1-based Fortran indices)
-            cellStart_scalar = _scalar_int(state_dict, "cellStart", 1)
-            cellEnd_scalar = _scalar_int(state_dict, "cellEnd", nCells)
-
-            # Get dt values for Rayleigh damping calculation
-            dt_full = config.get("dt", dts * nAcousticSteps)
-            dt_rk = dts  # acoustic substep dt
-
-            # Get scalars_driving (with fallback to scalars_bdy for backward compatibility)
-            scalars_driving_key = (
-                "scalars_driving" if "scalars_driving" in state_dict else "scalars_bdy"
-            )
-
-            from mpas_pytorch.boundary.adjust_scalars import (  # type: ignore[import-not-found]
-                atm_bdy_adjust_scalars,
-            )
-
-            bdy_scalar_result = atm_bdy_adjust_scalars(
-                scalars=result["scalars_new"],
-                scalars_driving=state_dict[scalars_driving_key],
-                bdyMaskCell=state_dict["bdyMaskCell"],
-                nRelaxZone=nRelaxZone_scalar,
-                dt=dt_full,
-                dt_rk=dt_rk,
-                meshScalingRegionalCell=state_dict["meshScalingRegionalCell"],
-                cellsOnCell=state_dict["cellsOnCell"],
-                nEdgesOnCell=state_dict["nEdgesOnCell"],
-                areaCell=state_dict["areaCell"],
-                dvEdge=state_dict["dvEdge"],
-                dcEdge=state_dict["dcEdge"],
-                edgesOnCell=state_dict["edgesOnCell"],
-                nCells=nCells,
-                nScalars=num_scalars_bdy,
-                nVertLevels=nVertLevels,
-                cellStart=cellStart_scalar,
-                cellEnd=cellEnd_scalar,
-            )
-            result["scalars_new"] = bdy_scalar_result["scalars"]
-        else:
-            # Missing boundary data for regional MPAS
-            if strict:
-                raise ValueError(
-                    f"config_apply_lbcs=True but required boundary fields missing for transported-scalar boundary adjustment: {missing_bdy_scalar}. "
-                    f"Either provide boundary data or set config_apply_lbcs=False."
-                )
-            else:
-                warnings.warn(
-                    f"Skipping scalar boundary adjustment (transported-scalar boundary adjustment): missing fields {missing_bdy_scalar}. "
-                    f"Regional boundary conditions will not be applied to scalars.",
-                    RuntimeWarning,
-                )
 
     # =========================================================================
     # Step 6: Compute solve diagnostics (diagnostic-solve)
@@ -10008,58 +9429,6 @@ def execute_rk_step(
 
     # Chain tap: diagnostics ready for the next RK stage's dynamics-tendency.
     sync_chain_tendency_aliases()
-
-    # =========================================================================
-    # Step 6.5: Zero-gradient w boundary condition (vertical-velocity boundary adjustment - regional MPAS only)
-    # Called after diagnostic-solve diagnostics.
-
-    # Only applies when config_apply_lbcs=true (regional MPAS).
-    # For global MPAS (config_apply_lbcs=false), this is a no-op.
-    # =========================================================================
-
-    if config_apply_lbcs and "w" in result:
-        # Check for required boundary data
-        has_bdy_data_w = "bdyMaskCell" in state_dict and "nRelaxZone" in state_dict
-        if has_bdy_data_w:
-            nRelaxZone_bdy = _scalar_int(state_dict, "nRelaxZone", 0)
-            nVertLevelsP1 = nVertLevels + 1
-
-            # Loop bounds (1-based Fortran indices)
-            cellStart_bdy = _scalar_int(state_dict, "cellStart", 1)
-            cellEnd_bdy = _scalar_int(state_dict, "cellEnd", nCells)
-
-            from mpas_pytorch.boundary.zero_gradient_w import (  # type: ignore[import-not-found]
-                atm_zero_gradient_w_bdy,
-            )
-
-            bdy_w_result = atm_zero_gradient_w_bdy(
-                w=result["w"],
-                bdyMaskCell=state_dict["bdyMaskCell"],
-                nRelaxZone=nRelaxZone_bdy,
-                nCells=nCells,
-                nVertLevelsP1=nVertLevelsP1,
-                cellStart=cellStart_bdy,
-                cellEnd=cellEnd_bdy,
-            )
-            result["w"] = bdy_w_result["w"]
-        else:
-            # Missing boundary data for regional MPAS
-            missing_bdy = []
-            if "bdyMaskCell" not in state_dict:
-                missing_bdy.append("bdyMaskCell")
-            if "nRelaxZone" not in state_dict:
-                missing_bdy.append("nRelaxZone")
-            if strict:
-                raise ValueError(
-                    f"config_apply_lbcs=True but required boundary fields missing for vertical-velocity boundary adjustment: {missing_bdy}. "
-                    f"Either provide boundary data or set config_apply_lbcs=False."
-                )
-            else:
-                warnings.warn(
-                    f"Skipping boundary w adjustment (vertical-velocity boundary adjustment): missing fields {missing_bdy}. "
-                    f"Regional boundary conditions will not be applied to w.",
-                    RuntimeWarning,
-                )
 
     return result
 

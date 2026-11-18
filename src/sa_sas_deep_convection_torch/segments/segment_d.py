@@ -9,20 +9,9 @@ import torch
 
 from sa_sas_deep_convection_torch.compile import run_compile_island
 from sa_sas_deep_convection_torch.ops import stored
-from sa_sas_deep_convection_torch.constants import EPS, EPSM1, GRAV, KM, NTR
+from sa_sas_deep_convection_torch.constants import EPS, EPSM1, GRAV
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
 from sa_sas_deep_convection_torch.thermo import NXPVS, PVS_XMAX, PVS_XMIN, _fpvs_table_for_device
-
-CHECKPOINT_FIELDS = (
-    "kb",
-    "kb1",
-    "kbcon",
-    "kbcon1",
-    "cnvflg",
-    "kcnv",
-    "return_stage",
-    "boundary_reached",
-)
 
 
 def _gather_column(field: torch.Tensor, one_based_index: torch.Tensor) -> torch.Tensor:
@@ -250,5 +239,3 @@ def _fpvs_from_table(temperature: torch.Tensor, table: torch.Tensor) -> torch.Te
     return table[jx - 1] + (xj - jx.to(xj.dtype)) * (table[jx] - table[jx - 1])
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

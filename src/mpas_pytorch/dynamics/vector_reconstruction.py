@@ -309,24 +309,6 @@ def _infer_cell_padding_offset(
     return _cache_and_return(0)
 
 
-def _resolve_cell_row(
-    i_cell_1based: int,
-    n_cells: int,
-    first_dim: int,
-    name: str,
-    padding_offset: int,
-) -> int:
-    """Map Fortran-style 1-based cell index to a valid tensor row."""
-    if first_dim == n_cells + 1:
-        return i_cell_1based - 1 + padding_offset
-    if first_dim == n_cells:
-        return i_cell_1based - 1
-    raise ValueError(
-        f"{name} first dimension must be nCells ({n_cells}) or nCells+1 ({n_cells + 1}), "
-        f"got {first_dim}"
-    )
-
-
 def mpas_reconstruct_2d(
     nCells: int,
     nEdges: int,

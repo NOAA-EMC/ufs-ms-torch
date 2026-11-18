@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 StepFn = Callable[[dict[str, Any]], dict[str, Any]]
 # Host values compared and restored by name, e.g. storage/version receipts.
@@ -272,7 +273,7 @@ class TimestepGraph:
             if any(_storage(value) in self._protected for value in destinations):
                 raise RuntimeError("timestep graph would overwrite a protected input")
             if destinations:
-                torch._foreach_copy_(list(destinations), list(sources))
+                torch_compat.foreach_copy_(list(destinations), list(sources))
             self._written = destinations
 
         self._recorded_view = dict(self._host_view(recorded)) if self._host_view else {}

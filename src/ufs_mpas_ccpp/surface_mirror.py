@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, replace
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from .projection import _working_on_device
 from .surface_containers import NativeSurface, Sfcprop
@@ -105,11 +106,11 @@ def mirror_surface(
     skin_upper = torch.where(
         land, torch.full_like(skin, 400.0), torch.full_like(skin, 350.0)
     )
-    torch._assert_async(
+    torch_compat.assert_async(
         (torch.isfinite(skin) & (skin >= 150.0) & (skin <= skin_upper)).all(),
         "invalid CCPP surface temperature",
     )
-    torch._assert_async(
+    torch_compat.assert_async(
         (
             ~ocean
             | (
@@ -132,7 +133,7 @@ def mirror_surface(
     snowc = torch.where(
         land, sfcprop.sncovr[:n], torch.where(ice, sfcprop.sncovr_ice[:n], 0.0)
     )
-    torch._assert_async(
+    torch_compat.assert_async(
         (
             torch.isfinite(snow)
             & (snow >= 0.0)
@@ -155,7 +156,7 @@ def mirror_surface(
     smc, slc, stc = (
         getattr(sfcprop, name)[:n, :levels] for name in ("smc", "slc", "stc")
     )
-    torch._assert_async(
+    torch_compat.assert_async(
         (
             ~land[:, None]
             | (

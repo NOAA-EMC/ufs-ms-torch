@@ -9,7 +9,6 @@ vendored fpvsx and gpvs implementations, including mixed-phase weighting.
 """
 from functools import lru_cache
 import math
-import functools
 
 import torch
 

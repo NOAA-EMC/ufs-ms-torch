@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, replace
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from mpas_pytorch.constants import UFS_CONSTANTS
 
 from .precision import WORKING_DTYPES
@@ -80,7 +81,7 @@ def project_grid(
             or value.device != device
         ):
             raise ValueError("invalid native grid input shape/dtype/device")
-        torch._assert_async(
+        torch_compat.assert_async(
             torch.isfinite(value[:n]).all(), "nonfinite native grid input"
         )
     if (
@@ -104,10 +105,10 @@ def project_grid(
         if config_len_disp > 0.0
         else nominal_min_dc.reshape(())
     )
-    torch._assert_async(
+    torch_compat.assert_async(
         torch.isfinite(length) & (length > 0.0), "invalid grid length scale"
     )
-    torch._assert_async((mesh_density[:n] > 0.0).all(), "nonpositive mesh density")
+    torch_compat.assert_async((mesh_density[:n] > 0.0).all(), "nonpositive mesh density")
     lat, lon = lat_cell[:n], lon_cell[:n]
     sine = torch.sin(lat)
     updates = {

@@ -14,16 +14,6 @@ Subroutine: atm_compute_vert_imp_coefs_work
 
 import torch
 
-from mpas_pytorch.autodiff.tridiagonal_factor import (
-    tridiagonal_factorize,
-    tridiagonal_factorize_scan,
-)
-from mpas_pytorch.autodiff.tridiagonal_scan import (
-    ORDERED_VERTICAL_BLOCK_LEVELS,
-    run_ordered_vertical_block,
-    tridiag_scan_preferred,
-    vertical_sweep_level_major,
-)
 from mpas_pytorch.dynamics.stencil_ops import (
     _compiled_stencil_reducer,
     _replace_row_slice,
@@ -112,8 +102,6 @@ def _tridiag_factor_active_thomas(
     b_tri: torch.Tensor,
     c_tri: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if vertical_sweep_level_major(a_tri.device.type) and a_tri.shape[1] > 0:
-        return _tridiag_factor_active_thomas_level_major(a_tri, b_tri, c_tri)
     compiled = _compiled_stencil_reducer(
         "column_ordered_factor",
         _tridiag_factor_active_thomas_packed,
@@ -123,55 +111,6 @@ def _tridiag_factor_active_thomas(
     )
     program = compiled if compiled is not None else _tridiag_factor_active_thomas_packed
     return program(a_tri, b_tri, c_tri)
-
-
-def _tridiag_factor_active_thomas_level_major(
-    a_tri: torch.Tensor,
-    b_tri: torch.Tensor,
-    c_tri: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Factor contiguous level rows of transposed copies (same recurrence order)."""
-    compile_blocks = torch.compiler.is_compiling()
-    rows = (a_tri.t().contiguous(), b_tri.t().contiguous(), c_tri.t().contiguous())
-    # Inside a compiled parent region the breaks give the sweep its own graph.
-    torch._dynamo.graph_break()
-    alpha_rows, gamma_rows = _tridiag_factor_level_rows_packed(*rows, compile_blocks=compile_blocks)
-    torch._dynamo.graph_break()
-    return alpha_rows.t().contiguous(), gamma_rows.t().contiguous()
-
-
-@torch.compiler.disable
-def _tridiag_factor_level_rows_packed(
-    a_rows: torch.Tensor,
-    b_rows: torch.Tensor,
-    c_rows: torch.Tensor,
-    *,
-    compile_blocks: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``_tridiag_factor_active_thomas_packed`` on ``(nLevels, nCells)`` storage."""
-    n_levels, n_cells = a_rows.shape
-    alpha = [a_rows.new_zeros((1, n_cells))]
-    gamma = [a_rows.new_zeros((1, n_cells))]
-    for start in range(1, n_levels, ORDERED_VERTICAL_BLOCK_LEVELS):
-        stop = min(start + ORDERED_VERTICAL_BLOCK_LEVELS, n_levels)
-        aa, gg = run_ordered_vertical_block(
-            _tridiag_factor_level_block,
-            a_rows[start:stop], b_rows[start:stop], c_rows[start:stop], gamma[-1][-1],
-            compiled=compile_blocks,
-        )
-        alpha.append(aa)
-        gamma.append(gg)
-    return torch.cat(alpha, dim=0), torch.cat(gamma, dim=0)
-
-
-def _tridiag_factor_level_block(a_rows, b_rows, c_rows, previous_gamma):
-    alpha, gamma = [], []
-    for k in range(a_rows.shape[0]):
-        alpha_k = 1.0 / (b_rows[k] - a_rows[k] * previous_gamma)
-        previous_gamma = c_rows[k] * alpha_k
-        alpha.append(alpha_k)
-        gamma.append(previous_gamma)
-    return torch.stack(alpha), torch.stack(gamma)
 
 
 def _tridiag_factor_active_thomas_packed(
@@ -213,19 +152,6 @@ def _tridiag_factor_active_thomas_columns(
         alpha_cols.append(alpha_k)
         gamma_cols.append(gamma_k)
     return tuple(alpha_cols), tuple(gamma_cols)
-
-
-def _tridiag_factor_active(
-    a_tri: torch.Tensor,
-    b_tri: torch.Tensor,
-    c_tri: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Factor vertical-implicit-coefficients active coefficients with Thomas/reference or scan policy."""
-    if tridiag_scan_preferred(a_tri):
-        if torch.is_grad_enabled():
-            return tridiagonal_factorize(a_tri, b_tri, c_tri)
-        return tridiagonal_factorize_scan(a_tri, b_tri, c_tri)
-    return _tridiag_factor_active_thomas(a_tri, b_tri, c_tri)
 
 
 def pack_vert_imp_coefs_public(
@@ -539,7 +465,7 @@ def atm_compute_vert_imp_coefs_work(
                 n_cols=nVertLevels,
             )
 
-        alpha_tri_s, gamma_tri_s = _tridiag_factor_active(
+        alpha_tri_s, gamma_tri_s = _tridiag_factor_active_thomas(
             a_tri_s,
             b_tri_s,
             c_tri_s,

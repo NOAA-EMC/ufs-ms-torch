@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 from sa_sas_deep_convection_torch.constants import FV, GRAV
 from sa_sas_deep_convection_torch.ops import sqrt_zero_grad
+from sa_sas_deep_convection_torch.samf_interstitials import evaporate_convective_rain
 from ufs_physics_common.ordered_sum import masked_sum
 
 
@@ -73,13 +74,18 @@ def seed_updraft(active, kb, levels, heo, uo, vo, ctro, hcko, ucko, vcko, ecko, 
     return hcko, ucko, vcko, ecko, ercko, torch.where(active, torch.zeros_like(pwavo), pwavo)
 
 
-def _rows(x):
-    # Level-major contiguous copy: row ``offset`` holds the level slice ``x[:, offset]``.
-    return x.transpose(0, 1).contiguous()
-
-
 def pack_profiles(*values):
-    """One contiguous [level, profile, column, ...] packet for repeated bounded regions."""
+    """One contiguous [level, profile, column, ...] packet for repeated bounded regions.
+
+    A compiled island (one tiled transpose kernel): eager, the stack of level-leading views was a strided
+    batched copy (G4a, CatArrayBatchedCopy). Values are copies, unchanged.
+    """
+    from sa_sas_deep_convection_torch.compile import run_compile_island
+
+    return run_compile_island("g_ordered_chunks", "pack_profiles", _pack_profiles, values)
+
+
+def _pack_profiles(values):
     return torch.stack(tuple(value.movedim(1, 0) for value in values), dim=1)
 
 
@@ -773,8 +779,8 @@ def rain_total(active, kmax, ktcon, kb, jmin, first, profile_rows, edto, xmb, de
     return masked_sum(rntot, layer, increment, descending=True)
 
 
-def evaporation(active, kmax, ktcon, kb, jmin, first, profile_rows, carry, rntot, edto, xmb, delt, evef, el2orc, grav, elocp):
-    del_, q1, t1, q_sat, pwo, pwdo = profile_rows.unbind(1)
+def evaporation(active, kmax, ktcon, kb, jmin, first, profile_rows, carry, rntot, edto, xmb, delt, evef, el2orc, grav, cp, rd, rv):
+    del_, q1, t1, q_sat, pwo, pwdo, entry_q, entry_t = profile_rows.unbind(1)
     rn, qevap, delqev, delq2, qcond, delqbar, deltbar, flg = carry
     width = q1.shape[0]
     level = _levels(first, width)
@@ -805,11 +811,11 @@ def evaporation(active, kmax, ktcon, kb, jmin, first, profile_rows, carry, rntot
         qevap = torch.where(cap, cap_scale[offset] * (rntot - delqev), qevap)
         flg = torch.where(cap, False, flg)
         apply_evap = evap_layer & (rn > 0.0) & (qevap > 0.0)
-        qvalues[offset] = torch.where(apply_evap, q1[offset] + qevap, q1[offset])
-        tvalues[offset] = torch.where(apply_evap, t1[offset] - elocp * qevap, t1[offset])
+        qvalues[offset], tvalues[offset], cooling = evaporate_convective_rain(q1[offset], t1[offset],
+            qevap, entry_q[offset], entry_t[offset], apply_evap, cp, rd, rv)
         removed = 0.001 * qevap * tem1[offset]
         rn = torch.where(apply_evap, rn - removed, rn)
-        deltv = torch.where(apply_evap, -elocp * qevap / delt, 0.0)
+        deltv = torch.where(apply_evap, -cooling / delt, 0.0)
         delq = torch.where(apply_evap, qevap / delt, 0.0)
         delqev = torch.where(apply_evap, delqev + removed, delqev)
         delqbar = torch.where(evap_layer, delqbar + delq * tem1[offset], delqbar)

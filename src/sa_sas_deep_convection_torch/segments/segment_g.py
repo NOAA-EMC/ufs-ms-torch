@@ -10,11 +10,8 @@ import torch
 from sa_sas_deep_convection_torch import recurrence_chunks as chunks
 
 from sa_sas_deep_convection_torch.compile import run_compile_island, run_recurrence_chunk, recurrence_chunk_size, ordered_chunks_enabled
-from sa_sas_deep_convection_torch.constants import KM, NTC, NTR
 from sa_sas_deep_convection_torch.segments.segment_d import _gather_column
-from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
-
-CHECKPOINT_FIELDS = ("eta", "hcko", "qcko", "ecko", "ercko", "chem_c", "chem_pw", "xlamue")
+from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real, tracer_layout
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -81,7 +78,7 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
     hwrf_samfdeep = bool(state.config.get("hwrf_samfdeep", False))
     itc = int(state.config.get("itc", 0))
     ntc = int(state.config.get("ntc", 0))
-    ntk = int(state.config.get("ntk", 0))
+    ntk = tracer_layout(state).ntk
     ntr = int(state.config.get("ntr", NTR))
     do_aerosols = False if hwrf_samfdeep else (itc > 0 and ntc > 0 and ntr > 0 and ntr >= itc + ntc - 3)
 
@@ -367,10 +364,6 @@ def _advance_aerosols(ecko, ercko, chem_c, chem_pw, ctro, xlamue, zi, eta,
             _replace_tracer_block(ercko, results[1], begin, end),
             _replace_tracer_block(chem_c, results[2], 0, count),
             _replace_tracer_block(chem_pw, results[3], 0, count))
-
-
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}
 
 
 def _recurrence_coordinator(category, name, fn, *args):

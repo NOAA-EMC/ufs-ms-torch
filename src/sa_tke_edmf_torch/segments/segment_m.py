@@ -11,10 +11,8 @@ from ufs_physics_common.precision import working_power
 from sa_tke_edmf_torch.autodiff import safe_positive_denominator, safe_sqrt_nonnegative
 from sa_tke_edmf_torch.compile import run_compile_island
 from sa_tke_edmf_torch.segments.segment_g import levels_over
-from sa_tke_edmf_torch.constants import F32_0P19, F32_0P2, F32_0P4, F32_0P51, F32_ONE_THIRD, IM, KM, NTKE, source_real
+from sa_tke_edmf_torch.constants import F32_0P19, F32_0P2, F32_0P4, F32_0P51, F32_ONE_THIRD, source_real
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
-
-CHECKPOINT_FIELDS = ("prod", "diss", "te", "tke")
 
 
 def _tke_production_inputs(
@@ -295,8 +293,8 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     vcko = state.fields.get("vcko")
     if vcko is None:
         vcko = torch.zeros_like(v1)
-    qcko = state.require("qcko").clone()
-    qcdo = state.require("qcdo").clone()
+    qcko = state.require("qcko")
+    qcdo = state.require("qcdo")
     xlamue = state.require("xlamue")
     xlamde = state.require("xlamde")
     zi = state.require("zi")
@@ -337,7 +335,6 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     dtype = te.dtype
     device = te.device
     km1 = KM - 1
-    kmpbl = KM // 2
     tte_edmf = bool(state.config.get("tte_edmf", False))
     sa3dtke = bool(state.config.get("sa3dtke", False))
     tc_pbl = bool(state.config.get("tc_pbl", False))
@@ -445,21 +442,19 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
         pcnvflg,
         scuflg,
     )
-    qcko[:, :, NTKE - 1] = qcko_tke
-    qcdo[:, :, NTKE - 1] = qcdo_tke
-
+    # The updated TKE plumes are their own fields; qcko and qcdo keep their other slots. Their only reader after
+    # this segment is segment O (P reads the slots below the TKE slot): writing them back into the TKE slot cost
+    # two full [ncol, KM, NTRAC] passes and O's two strided slot copies, 1.4 ms per 60 km step (round 8 wave 4).
     return state.with_updates(
         {
             "prod": prod,
             "diss": diss,
             "te": te,
             "tke": tke,
-            "qcko": qcko,
-            "qcdo": qcdo,
+            "qcko_tke": qcko_tke,
+            "qcdo_tke": qcdo_tke,
             "tkmnz": tkmnz,
         }
     )
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

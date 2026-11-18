@@ -16,6 +16,9 @@ with the native state, mesh, configuration and cycle arguments also works. Every
   fhzero bucket ``totprcpb``, ``cnvprcpb``, in m), ``t2m``, ``q2m``, ``u10m``, ``v10m``, surface
   pressure (Pa), OLR (``topflw_upfxc``, W m-2, from the last longwave call) and precipitable water
   (kg m-2, vapour mass of the physics column).
+Each file holds the rows a rank owns in ascending global cell and edge ID, whatever the owned order of the run
+in memory: on one rank that is the MPAS mesh order, and distributed files also carry ``global_cell_id`` and
+``global_edge_id``.
 Values retain the state's working dtype (float64 or float32). The fields are staged to host memory
 (pinned on CUDA, stream-ordered copies) and one background thread writes the files, so the next
 interval runs while the previous one is written; the driver waits for the writer at the end and
@@ -25,9 +28,9 @@ the driver checks planned names before cold initialization, on every distributed
 
 ``operational_profile`` sets the runtime switches of a forecast: observers off, the shortwave
 daylit bound of the run, step graphs on (CUDA graphs on GPU, the eager emulator on CPU; one
-``StepGraphRunner`` for the whole forecast, so each step variant records once), and the
-qualified compile policy (whole-scheme compile off by default; on CPU float64 compiled equals eager
-bitwise). Overflowed compaction buffers rerun one rung up (``on_overflow="rerun"``).
+``StepGraphRunner`` for the whole forecast, so each step variant records once), no column chunk (every
+scheme full batch over the owned columns, radiation included), and the qualified compile policy
+(whole-scheme compile off by default; on CPU float64 compiled equals eager bitwise). Overflowed compaction buffers rerun one rung up (``on_overflow="rerun"``).
 With step graphs disabled, global and CPU-partitioned forecasts retain native-five phases across output times.
 """
 
@@ -42,6 +45,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from mpas_pytorch.utils.atomic_output import atomic_output
 
 from . import cycle, runtime_policy
@@ -54,8 +58,6 @@ from .radiation import sw_daylit_bound
 from .step_graphs import StepGraphRunner, flatten_state
 
 GRAVITY = 9.80665  # GFS con_g
-FULL_BATCH_SCHEMES = frozenset({"run_pbl_sequence", "apply_convection", "apply_unified_gwd",
-                                 "apply_ugwpv1_gsldrag", "apply_tempo"})
 # The HDF5 library under netCDF4 is not thread-safe (concurrent files crash it): the stream writer thread
 # and the driver's reads take this lock. The schemes read their NetCDF tables at their first call (step 1),
 # before the first output, and nothing else in the forecast loop opens NetCDF.
@@ -97,8 +99,7 @@ def operational_profile(state: CoupledCycleState, *, duration_seconds: int, argu
         "step_graphs": runtime_policy.set_step_graphs(True),
         "sw_daylit_fraction": runtime_policy.set_sw_daylit_fraction(share),
         "scheme_compile": runtime_policy.set_scheme_compile(scheme_compile),
-        "unchunked_schemes": runtime_policy.set_unchunked_schemes(FULL_BATCH_SCHEMES),
-        "column_chunk": runtime_policy.set_column_chunk(min(runtime_policy.column_chunk() or 25600, 25600)),
+        "column_chunk": runtime_policy.set_column_chunk(None),  # every scheme full batch, radiation included
     }
 
 
@@ -134,42 +135,82 @@ def diagnostic_fields(state: CoupledCycleState) -> dict[str, torch.Tensor]:
     }
 
 
-def output_fields(fields: Mapping[str, torch.Tensor], partition) -> dict[str, torch.Tensor]:
-    """Write owned rows only; global IDs make rank-local files reconstructible."""
+@dataclasses.dataclass(frozen=True)
+class OutputOrder:
+    """The owned rows a rank writes, in ascending global ID (``output_order``, built once at setup).
+
+    ``cells`` and ``edges`` index the owned cell and edge rows; ``cell_ids`` and ``edge_ids`` are their 1-based
+    global IDs in that order. ``labeled`` files (distributed runs) also carry the IDs as variables.
+    """
+
+    cells: torch.Tensor
+    edges: torch.Tensor
+    cell_ids: torch.Tensor
+    edge_ids: torch.Tensor
+    labeled: bool
+
+
+def output_order(partition, *, labeled: bool = True, device: torch.device | str | None = None) -> OutputOrder | None:
+    """The output row order of ``partition`` (None for an unpartitioned run, whose rows are already in mesh order).
+
+    Host setup, once per forecast: the owned rows sorted by global ID, so every file is in global-ID order and one
+    rank writes the MPAS mesh order. ``device`` places the row indices beside the fields they gather."""
     if partition is None:
-        return dict(fields)
-    out = {}
-    for name, value in fields.items():
-        count = partition.edges.owned_count if name == "u" else partition.cells.owned_count
-        out[name] = value[:count] if value.ndim else value
-    out["global_cell_id"] = partition.cells.global_ids[:partition.cells.owned_count] + 1
-    if "u" in fields:
-        out["global_edge_id"] = partition.edges.global_ids[:partition.edges.owned_count] + 1
+        return None
+    cells = partition.cells.global_ids[:partition.cells.owned_count]
+    edges = partition.edges.global_ids[:partition.edges.owned_count]
+    cell_rows, edge_rows = torch.argsort(cells), torch.argsort(edges)
+    return OutputOrder(cell_rows.to(device), edge_rows.to(device), cells[cell_rows] + 1, edges[edge_rows] + 1,
+                       labeled)
+
+
+def output_fields(fields: Mapping[str, torch.Tensor], order: OutputOrder | None, *, n_cells: int | None = None,
+                  n_edges: int | None = None) -> dict[str, torch.Tensor]:
+    """The owned rows of ``fields`` in ascending global ID (``output_order``); without an order the first
+    ``n_cells`` cell and ``n_edges`` edge rows (the padding row stays out). Labeled files also get the global IDs."""
+    def rows(name, value):
+        if not value.ndim or name == "pressure_level":
+            return value
+        if order is None:
+            return value[:n_edges if name == "u" else n_cells]
+        return value[order.edges if name == "u" else order.cells]
+
+    out = {name: rows(name, value) for name, value in fields.items()}
+    if order is not None and order.labeled:
+        out.setdefault("global_cell_id", order.cell_ids)
+        if "u" in fields:
+            out.setdefault("global_edge_id", order.edge_ids)
     return out
 
 
 def write_stream(path: Path, fields: Mapping[str, torch.Tensor], *, attributes: Mapping[str, Any]) -> None:
-    """One NetCDF file; dimensions are named by size (nCells, nEdges, nVertLevels, nVertLevelsP1, ...)."""
+    """One NetCDF file with named native cell, edge and vertical axes; nonfinite values raise."""
     import netCDF4
 
-    names = {}
-    for name in ("nCells", "nEdges", "nVertLevels"):
-        size = attributes.get(name)
-        if size is not None:
-            names.setdefault(int(size), name)
-    if attributes.get("nVertLevels") is not None:
-        names.setdefault(int(attributes["nVertLevels"]) + 1, "nVertLevelsP1")
     with _NETCDF_LOCK, atomic_output(path, clobber=False) as temporary, netCDF4.Dataset(temporary, "w") as out:
         for key, value in attributes.items():
             out.setncattr(key, value)
+        for name in ("nCells", "nEdges", "nVertLevels"):
+            if name in attributes:
+                out.createDimension(name, int(attributes[name]))
+        if "nVertLevels" in attributes:
+            out.createDimension("nVertLevelsP1", int(attributes["nVertLevels"]) + 1)
         for name, tensor in fields.items():
+            if tensor.is_floating_point():
+                torch_compat.assert_async(torch.isfinite(tensor).all(), f"{name}: nonfinite forecast output")
             array = tensor.cpu().numpy()  # host output boundary (no-grad forecast state)
-            dims = []
-            for size in array.shape:
-                dim = names.get(size, f"dim{size}")
+            first = "nEdges" if name in ("u", "global_edge_id") else "nCells"
+            dims = [first] if array.ndim else []
+            if name in ("u", "theta_m", "rho_zz", "scalars"):
+                dims += ["nVertLevels"]
+            elif name in ("w", "rw"):
+                dims += ["nVertLevelsP1"]
+            dims += [f"{name}_dim{axis}" for axis in range(len(dims), array.ndim)]
+            for dim, size in zip(dims, array.shape):
                 if dim not in out.dimensions:
                     out.createDimension(dim, size)
-                dims.append(dim)
+                if len(out.dimensions[dim]) != size:
+                    raise ValueError(f"{name}: {dim} has {size} rows, expected {len(out.dimensions[dim])}")
             out.createVariable(name, array.dtype, tuple(dims))[...] = array
 
 
@@ -272,17 +313,20 @@ def _prepare_output(output_dir: Path, *, start: dt_.datetime, total: int, interv
 def run_forecast(case: Mapping[str, Any] | str | Path, output_dir: str | Path, *, hours: float,
                  output_hours: float = 1.0, device: str = "cpu", scheme_compile: bool = False,
                  dycore_compile: bool = False, step_graphs: bool = True,
-                 memory_plan: runtime_policy.MemoryPlan | None = None,
                  dtype: torch.dtype | str | None = None, setup_group=None,
-                 partition_path: str | Path | None = None) -> CoupledCycleState:
+                 partition_path: str | Path | None = None, owned_order: str = "hilbert") -> CoupledCycleState:
     """Cold-start ``case``, run ``hours`` with the operational profile, write the two streams every
     ``output_hours``; return the final state.
 
-    ``memory_plan`` (``runtime_policy.plan_memory``) sets the column chunk and the dycore tracer tile; on a
-    CUDA device without one the driver plans for 90 % of the device memory. ``step_graphs=False`` uses
-    ordinary intervals without graph-pool memory; compilation of physics and dycore stays independent.
+    Every step runs every scheme full batch over the owned columns (``operational_profile``); no memory
+    plan applies to the forward. ``step_graphs=False`` uses ordinary intervals without graph-pool memory;
+    compilation of physics and dycore stays independent.
     ``partition_path`` (a ``graph.info.part.N`` file, N = world size) sets the cell owners when this call
-    loads the case; one rank checks a ``part.1`` file."""
+    loads the case; one rank checks a ``part.1`` file. ``owned_order="hilbert"`` (the default) orders the owned rows
+    of every entity in memory along a Hilbert curve of their centres (``mpas_pytorch.distributed.partition``), so
+    neighbouring cells sit close in memory: on one rank the case is renumbered once at setup. ``"global"`` keeps the
+    mesh order in memory. Either way every file holds the owned rows in ascending global ID (``output_order``): one
+    rank writes the same files in both orders, and distributed files carry the global cell and edge IDs."""
     target = torch.device(device)
     runtime_policy.use_expandable_segments(target)  # before the first device allocation
     import torch.distributed as dist
@@ -292,13 +336,22 @@ def run_forecast(case: Mapping[str, Any] | str | Path, output_dir: str | Path, *
     parallel = dist.is_initialized() and dist.get_world_size() > 1
     if partition_path is not None and not owned:
         raise ValueError("partition_path applies only when run_forecast loads the case")
+    renumbered = None
     if owned and parallel:
         case = load_distributed_case(case, dtype=dtype, device=target, setup_group=setup_group,
-                                     partition_path=partition_path)
+                                     partition_path=partition_path, owned_order=owned_order)
     else:
         if owned:
             from .case_io import load_cpu_case
             case = load_cpu_case(case)
+        if owned_order != "global" and not parallel:  # one rank: renumber the rows once at setup
+            from mpas_pytorch.distributed.partition import build_mesh_partition
+            from .distributed import partition_coupled_case
+
+            case = prepare_case(case, dtype=dtype)
+            owners = torch.zeros(int(case["mesh"]["nCells"]), dtype=torch.int64)
+            renumbered = build_mesh_partition(case["mesh"], owners, rank=0, world_size=1, owned_order=owned_order)
+            case = partition_coupled_case(case, [renumbered], 0)
         case = prepare_case(case, dtype=dtype, device=target)
         if partition_path is not None:  # one rank: the file must give every cell to rank 0
             from mpas_pytorch.distributed.partition import cell_owners
@@ -312,8 +365,9 @@ def run_forecast(case: Mapping[str, Any] | str | Path, output_dir: str | Path, *
         raise ValueError("the numerical backend must match CPU/Gloo or CUDA/NCCL")
     if exchanger is not None and (not parallel or exchanger.transport.device != native["u"].device):
         raise ValueError("the halo exchanger must match the active process group and case device")
-    partition = exchanger.partition if exchanger is not None else None
-    if partition is not None and step_graphs:
+    partition = exchanger.partition if exchanger is not None else renumbered
+    order = output_order(partition, labeled=parallel, device=native["u"].device)
+    if parallel and step_graphs:
         raise ValueError("distributed CUDA Graph replay is not qualified; use --no-step-graphs")
     arguments = case["arguments"]
     if dycore_compile:
@@ -324,27 +378,20 @@ def run_forecast(case: Mapping[str, Any] | str | Path, output_dir: str | Path, *
     if total <= 0 or interval <= 0 or total % interval or interval % dt:
         raise ValueError("hours and output_hours must be whole positive multiples of the timestep")
     output_dir = Path(output_dir)
-    if partition is not None:
+    if parallel:
         output_dir /= f"rank{partition.rank:05d}"
     start = _initial_date(arguments)
     _prepare_output(output_dir, start=start, total=total, interval=interval, parallel=parallel,
                     setup_group=exchanger.setup_group if parallel else None)
     sizes = {"nCells": int(arguments["n_cells_global"]), "nEdges": int(native["u"].shape[0]) - 1,
              "nVertLevels": int(native["theta_m"].shape[1])}
-    if partition is not None:
+    if parallel:
         sizes.update(nCells=partition.cells.owned_count, nEdges=partition.edges.owned_count,
                      nCellsGlobal=partition.cells.global_count, nEdgesGlobal=partition.edges.global_count,
                      rank=partition.rank, world_size=dist.get_world_size())
-    if memory_plan is None and target.type == "cuda":
-        memory_plan = runtime_policy.plan_memory(
-            ncol=int(arguments["global_ids"].numel()), nlev=sizes["nVertLevels"], differentiable=False, graph=step_graphs,
-            budget_bytes=int(0.9 * torch.cuda.get_device_properties(target).total_memory))
-    planned, previous = {}, {}
+    common = {"initial_time": start.isoformat(), "working_dtype": str(native["u"].dtype), **sizes}
+    previous = {}
     try:
-        if memory_plan is not None:  # the tracer tile enters the configuration the cold boundary binds
-            config = runtime_policy.planned_config(config, memory_plan)
-            arguments = {**arguments, "config": config}
-            planned = runtime_policy.apply_memory_plan(memory_plan)
         with torch.no_grad():
             state = initialize_cold_cycle(native, mesh, config=config, **case["cold_arguments"]).state
             mark_cold_boundary(state.native_state, mesh=mesh, config=config, dt=float(dt))
@@ -371,14 +418,11 @@ def run_forecast(case: Mapping[str, Any] | str | Path, output_dir: str | Path, *
                 def emit(state):
                     elapsed = (state.step_index - 1) * dt
                     valid = start + dt_.timedelta(seconds=elapsed)
-                    attributes = {"initial_time": start.isoformat(), "valid_time": valid.isoformat(),
-                                  "forecast_seconds": elapsed, "working_dtype": str(state.native_state["u"].dtype),
-                                  "full_batch_schemes": ",".join(sorted(FULL_BATCH_SCHEMES)), **sizes}
+                    attributes = {**common, "valid_time": valid.isoformat(), "forecast_seconds": elapsed}
                     stamp = valid.strftime("%Y-%m-%d_%H.%M.%S")
-                    writer.submit(output_dir / f"history.{stamp}.nc", output_fields(history_fields(state), partition),
-                                  attributes=attributes)
-                    writer.submit(output_dir / f"diag.{stamp}.nc", output_fields(diagnostic_fields(state), partition),
-                                  attributes=attributes)
+                    for stream, fields in (("history", history_fields(state)), ("diag", diagnostic_fields(state))):
+                        writer.submit(output_dir / f"{stream}.{stamp}.nc", output_fields(fields, order,
+                                      n_cells=sizes["nCells"], n_edges=sizes["nEdges"]), attributes=attributes)
 
                 if native_phases:
                     initial = handed.pop()
@@ -417,12 +461,7 @@ def run_forecast(case: Mapping[str, Any] | str | Path, output_dir: str | Path, *
             runtime_policy.set_step_graphs(previous["step_graphs"])
             runtime_policy.set_sw_daylit_fraction(previous["sw_daylit_fraction"])
             runtime_policy.set_scheme_compile(previous["scheme_compile"])
-            runtime_policy.set_unchunked_schemes(previous["unchunked_schemes"])
             runtime_policy.set_column_chunk(previous["column_chunk"])
-        if planned:
-            runtime_policy.set_column_chunk(planned["column_chunk"])
-            runtime_policy.set_saved_tensor_offload(planned["offload"])
-            runtime_policy.set_cycle_observers(planned["cycle_observers"])
     return state
 
 
@@ -436,6 +475,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--dtype", choices=("f64", "f32", "float64", "float32"), default="f64")
     parser.add_argument("--distributed-timeout", type=int, default=300, help="process-group timeout in seconds")
     parser.add_argument("--partition", type=Path, help="MPAS graph.info.part.N cell owners (default: spatial bisection)")
+    parser.add_argument("--owned-order", choices=("global", "hilbert"), default="hilbert",
+                        help="order of each rank's owned rows in memory (hilbert: along a Hilbert curve); output files "
+                             "hold the owned rows in ascending global ID either way")
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--scheme-compile", action="store_true")
     parser.add_argument("--dycore-compile", action="store_true")
@@ -443,6 +485,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--no-step-graphs", dest="step_graphs", action="store_false",
                         help="run ordinary intervals without CUDA graph capture")
     options = parser.parse_args(argv)
+    if torch.get_num_interop_threads() != 1:
+        torch.set_num_interop_threads(1)
     if options.threads:
         torch.set_num_threads(options.threads)
     from .distributed import forecast_processes
@@ -452,7 +496,7 @@ def main(argv: list[str] | None = None) -> None:
                      device=device, dtype=options.dtype, setup_group=setup_group,
                      scheme_compile=options.scheme_compile or options.compile,
                      dycore_compile=options.dycore_compile or options.compile, step_graphs=options.step_graphs,
-                     partition_path=options.partition)
+                     partition_path=options.partition, owned_order=options.owned_order)
 
 
 if __name__ == "__main__":

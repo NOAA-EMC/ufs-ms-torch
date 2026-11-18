@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, replace
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from mpas_pytorch.constants import UFS_CONSTANTS, ConstantsProfile
 from mpas_pytorch.diagnostics import physics_interface_surface_pressure
 from ufs_physics_common.precision import working_power
@@ -190,16 +191,16 @@ def hydrostatic_pressure(
         ("zgrid", zgrid),
     ):
         _working_on_device(name, value, rho_zz.device, rho_zz.dtype)
-        torch._assert_async(
+        torch_compat.assert_async(
             torch.isfinite(value).all(), f"nonfinite hydrostatic {name}"
         )
     dz = zgrid[:, 1:] - zgrid[:, :-1]
-    torch._assert_async((dz > 0.0).all(), "nonpositive geometric layer thickness")
-    torch._assert_async(
+    torch_compat.assert_async((dz > 0.0).all(), "nonpositive geometric layer thickness")
+    torch_compat.assert_async(
         (rdzw > 0.0).all(), "nonpositive coordinate reciprocal thickness"
     )
-    torch._assert_async((rho_zz > 0.0).all(), "nonpositive dry mass density")
-    torch._assert_async((qv > -1.0).all(), "invalid hydrostatic water-vapor mass basis")
+    torch_compat.assert_async((rho_zz > 0.0).all(), "nonpositive dry mass density")
+    torch_compat.assert_async((qv > -1.0).all(), "invalid hydrostatic water-vapor mass basis")
 
     dpdry = constants.G * rho_zz / rdzw
     water_mass = 1.0 + qv
@@ -336,11 +337,11 @@ def project_atmosphere(
     for index, binding in enumerate(bindings):
         if binding.ccpp_owned:
             value = values[..., index]
-            torch._assert_async(
+            torch_compat.assert_async(
                 (torch.isfinite(value) & (value.abs() <= 1.0e30)).all(),
                 f"invalid MPAS tracer {binding.name}",
             )
-            torch._assert_async(
+            torch_compat.assert_async(
                 (value >= roundoff_floor(binding.negative_floor, value)).all(),
                 f"negative MPAS tracer {binding.name}",
             )
@@ -368,7 +369,7 @@ def project_atmosphere(
         constants=constants,
     )
     for name, value in (("prsl", hydrostatic.pmid), ("prsi", hydrostatic.pint)):
-        torch._assert_async(
+        torch_compat.assert_async(
             (torch.isfinite(value) & (value > 0.0)).all(), f"invalid projected {name}"
         )
     surface_pressure = physics_interface_surface_pressure(
@@ -402,7 +403,7 @@ def project_atmosphere(
     # Unowned rows (halo) keep their previous values; a fully owned domain needs no copy.
     full = owned == target.tgrs.shape[0]
     for name, active in values.items():
-        torch._assert_async(torch.isfinite(active).all(), f"nonfinite projected {name}")
+        torch_compat.assert_async(torch.isfinite(active).all(), f"nonfinite projected {name}")
         if not full:
             values[name] = torch.cat((active, getattr(target, name)[owned:]), dim=0)
     return AtmosphericProjection(

@@ -349,11 +349,13 @@ def forecast_processes(device: str, *, timeout_seconds: int = 300):
             dist.destroy_process_group()
 
 
-def load_distributed_case(path, *, dtype, device, setup_group=None, physics_overrides=None, partition_path=None):
+def load_distributed_case(path, *, dtype, device, setup_group=None, physics_overrides=None, partition_path=None,
+                          owned_order="global"):
     """Load once on CPU root, then place only each rank's spatial shard on its device.
 
     ``partition_path`` names an MPAS ``graph.info.part.N`` file (N = world size) that sets the cell
-    owners, as METIS writes it; without one, balanced spatial bisection decides."""
+    owners, as METIS writes it; without one, balanced spatial bisection decides. ``owned_order`` orders each
+    rank's owned rows (``mpas_pytorch.distributed.partition.OWNED_ORDERS``)."""
     from mpas_pytorch.distributed.dynamics import DynamicsHaloExchange
     from mpas_pytorch.distributed.halo import HaloTransport
     from mpas_pytorch.distributed.partition import build_mesh_partition, cell_owners
@@ -383,7 +385,7 @@ def load_distributed_case(path, *, dtype, device, setup_group=None, physics_over
             case = _partition_input(load_cpu_case(path, physics_overrides=physics_overrides))
             case = prepare_case(case, dtype=dtype)
             owners = cell_owners(case["mesh"], world, partition_path)
-            partitions = [build_mesh_partition(case["mesh"], owners, rank=r, world_size=world)
+            partitions = [build_mesh_partition(case["mesh"], owners, rank=r, world_size=world, owned_order=owned_order)
                           for r in range(world)]
             payload = [(partition_coupled_case(case, partitions, r), partitions) for r in range(world)]
             del case

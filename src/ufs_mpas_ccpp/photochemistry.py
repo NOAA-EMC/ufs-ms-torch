@@ -6,6 +6,7 @@
 from dataclasses import replace
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 from .containers import assert_all_finite
 
@@ -27,7 +28,7 @@ def photochemistry_2015(fields, *, log_pressure, forcing, dtp, ntoz, h2o=None):
     area = fields["area"]
     if area.shape != (q.shape[0],) or area.dtype != q.dtype or area.device != q.device:
         raise ValueError("invalid ozone2015 cell area")
-    torch._assert_async(torch.isfinite(area).all() & (area > 0.).all(), "invalid ozone2015 cell area")
+    torch_compat.assert_async(torch.isfinite(area).all() & (area > 0.).all(), "invalid ozone2015 cell area")
     result = ozone_2015(fields["prsl"], temperature, fields["dp"], q[:, :, ntoz - 1],
         log_pressure=log_pressure, forcing=forcing, dtp=dtp)
     tendency = (result["oz"] - q[:, :, ntoz - 1]) / dtp
@@ -55,7 +56,7 @@ def photochemistry_post(fields, *, dtp, mode):
         raise ValueError("invalid photochemistry post dimensions")
     if dtp.dtype not in WORKING_DTYPES or dtp.device != q.device:
         raise ValueError("photochemistry post requires a colocated float32/float64 timestep")
-    torch._assert_async(torch.isfinite(dtp) & (dtp > 0.), "invalid photochemistry post timestep")
+    torch_compat.assert_async(torch.isfinite(dtp) & (dtp > 0.), "invalid photochemistry post timestep")
     result = {}
     triples = (("gt0", "dtdt", "ten_t"), ("gu0", "dudt", "ten_u"), ("gv0", "dvdt", "ten_v"), ("gq0", "dqdt", "ten_q"))
     assert_all_finite({name: fields[name] for triple in triples for name in triple}, "photochemistry post")

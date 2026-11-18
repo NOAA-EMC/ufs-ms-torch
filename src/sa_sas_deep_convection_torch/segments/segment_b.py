@@ -8,21 +8,7 @@ from __future__ import annotations
 import torch
 
 from sa_sas_deep_convection_torch.compile import run_compile_island
-from sa_sas_deep_convection_torch.constants import KM, NTC, NTR
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
-
-CHECKPOINT_FIELDS = (
-    "ps",
-    "prsl",
-    "del",
-    "do_aerosols",
-    "cnvw",
-    "cnvc",
-    "QLCN",
-    "QICN",
-    "w_upi",
-    "cf_upi",
-)
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -281,5 +267,3 @@ def _workspace_seed_block(
     )
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

@@ -29,7 +29,7 @@ The TEMPO import-time configuration must be what ``mp_tempo_init`` sets up: the
 CCPP host constants (``TEMPO_TORCH_HOST_CONSTANTS=ufs_physcons``) and
 ``tempo_init(hailaware_flag=.false.)`` (``TEMPO_TORCH_HAIL_AWARE_INIT=0``), see
 ``segments/_host_constants.py``; the entry raises otherwise. Semi-Lagrangian
-sedimentation runs in the opt-in ``fortran_ordered`` mode by default.
+sedimentation follows the Fortran operation order.
 
 The sedimentation loops use the static substep bound from ``min_layer_depth``,
 the host grid's thinnest layer in m (a grid property known when the caller
@@ -40,6 +40,9 @@ substep count would exceed the loop is flagged in
 ``diagnostics["sedimentation_substep_overflow"]`` without a host read, and the
 bound's overflow region (``torch_native.SEDIMENTATION_BOUND_*``) is set, so a driver
 reruns the step with a higher ceiling instead of keeping a truncated result.
+
+The compaction and substep-region settings of ``torch_native`` are module state, so a process runs one
+TEMPO configuration at a time; ``mp_tempo_run`` sets them for its call and restores them afterwards.
 """
 
 from __future__ import annotations
@@ -51,6 +54,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
+from ufs_physics_common import compaction
+from ufs_physics_common.compile_policy import stored
 
 from tempo_torch import torch_native
 from tempo_torch import host_constants as _host_constants
@@ -82,7 +88,6 @@ TENDENCY_SLOTS: Mapping[str, str] = {
     "dni": "ntinc",
     "dnr": "ntrnc",
 }
-PRECIP_FIELDS = ("prcp", "rain", "graupel", "ice", "snow")
 
 
 @dataclass(frozen=True)
@@ -102,6 +107,15 @@ class MpTempoResult:
     inner_steps: int
     inner_dt: float
     diagnostics: dict[str, torch.Tensor] = field(default_factory=dict)
+
+    @property
+    def compaction_overflow(self) -> torch.Tensor:
+        """Device bool: a TEMPO compaction buffer (substep tiers, lane groups, source window or substep bound;
+        regions ``tempo.*``) overflowed since the last ``ufs_physics_common.compaction.reset_overflow``. Check it when
+        compaction is set: an overflowed call's results are not exact, and the call runs again with larger buffers.
+        Reads no host value."""
+        mask = sum(1 << bit for name, bit in compaction._bits.items() if name.startswith("tempo."))
+        return (compaction.overflow_flag(self.ten_t.device) & mask) != 0
 
 
 def fortran_nint(value: float) -> int:
@@ -163,7 +177,7 @@ def mp_tempo_init(*, spechum: torch.Tensor, tables: torch_native.TorchFrozenTabl
     require_host_constants(False)
     if spechum.ndim != 2 or min(spechum.shape) < 1 or spechum.dtype not in torch_native.WORKING_DTYPES:
         raise ValueError("TEMPO initialization requires column-first float32/float64 humidity")
-    torch._assert_async(torch.isfinite(spechum).all(),"nonfinite TEMPO initial humidity")
+    torch_compat.assert_async(torch.isfinite(spechum).all(),"nonfinite TEMPO initial humidity")
     if not isinstance(tables,torch_native.TorchFrozenTables):
         raise TypeError("TEMPO initialization requires prepared tensor tables")
     if set(tables.arrays) != {spec.name for spec in TABLE_SPECS}:
@@ -214,35 +228,49 @@ def mp_tempo_run(
     tracer_index: Mapping[str, int] = MPAS_TRACER_INDEX,
     is_aerosol_aware: bool = False,
     is_hail_aware: bool = False,
-    semi_lagrangian_mode: str | None = "fortran_ordered",
     sedimentation_compaction: Mapping[str, tuple[tuple[int, float], ...]] | None = None,
+    semi_lagrangian_window_sources: int | None = None,
+    lane_compaction: Mapping[str, float] | None = None,
     max_sedimentation_fall_speed: float = torch_native.DEFAULT_MAX_SEDIMENTATION_FALL_SPEED,
     max_snow_sedimentation_fall_speed: float | None = None,
     return_tendencies: bool = True,
     sedimentation_substep_region: bool = False,
+    parameter_scales: Mapping[str, torch.Tensor] | None = None,
+    spechum_entry: torch.Tensor | None = None,
+    tgrs_entry: torch.Tensor | None = None,
 ) -> MpTempoResult:
     """Run ``mp_tempo_run`` for one ``[ncol, nlev]`` block (``phii`` is ``[ncol, nlev+1]``).
 
+    ``spechum_entry`` fixes the pressure-mass basis of phase heat before convection.
+    ``tgrs_entry`` anchors native vapor/liquid calorics at the same group entry.
+    Without a host group, use this wrapper's entry humidity and temperature.
     ``dt_inner`` defaults to ``dtp`` (``GFS_typedefs``). Precipitation accumulators and
     ``refl_10cm`` default to the zero values the CCPP interstitial reset provides.
-    ``semi_lagrangian_mode`` selects the torch-native semi-Lagrangian evaluation for the
-    call (restored afterwards); ``"fortran_ordered"`` follows the Fortran operation order,
-    ``None`` keeps the process-wide setting. ``sedimentation_compaction`` sets the substep
-    compaction tiers for the call (``torch_native.set_sedimentation_compaction``; restored
-    afterwards); ``None`` keeps the process-wide setting. ``return_tendencies=False`` leaves
+    The compaction arguments hold for the call only (restored afterwards); ``None`` means the dense or unbounded
+    default, never a process-wide setting. ``sedimentation_compaction`` sets the substep compaction tiers
+    (``torch_native.set_sedimentation_compaction``; ``None``: every substep on every column).
+    ``semi_lagrangian_window_sources`` bounds the sources a semi-Lagrangian destination spans (a wider one sets
+    overflow region ``tempo.window``; ``None``: unbounded). ``lane_compaction`` sets the lane buffers
+    {group: fraction} of the masked FP64 groups (``torch_native.set_lane_compaction``; a buffer too small sets overflow
+    region ``tempo.lanes.<group>``; ``None``: every lane). With any of them set, check
+    ``MpTempoResult.compaction_overflow``. ``return_tendencies=False`` leaves
     ``MpTempoResult.tendencies`` empty (the per-species tendencies are in ``ten_q``); a
     compiled caller then does not write them as graph outputs. ``sedimentation_substep_region``
     makes a compiled call run each rain/graupel semi-Lagrangian substep in one separately compiled
     region reused across substeps (``torch_native.set_sedimentation_substep_region``); eager calls
-    are unaffected.
+    are unaffected. ``parameter_scales`` holds trainable scales by name, 0-d or 1-element
+    (``torch_native.run_tempo_native``: ``nt_c``, ``demott_nuc_ssati``, ``av_s``, ``av_g``); None: no op.
     """
 
     if is_aerosol_aware or is_hail_aware:
         raise NotImplementedError("mp_tempo port covers the oracle suite: is_aerosol_aware=F, is_hail_aware=F")
     require_host_constants(is_hail_aware)
-    with (_semi_lagrangian_mode(semi_lagrangian_mode), _sedimentation_compaction(sedimentation_compaction),
+    with (_sedimentation_compaction(sedimentation_compaction),
+          _semi_lagrangian_window(semi_lagrangian_window_sources), _lane_compaction(lane_compaction),
           _sedimentation_substep_region(sedimentation_substep_region)):
         return _mp_tempo_run(
+            spechum_entry=spechum_entry,
+            tgrs_entry=tgrs_entry,
             spechum=spechum, qc=qc, qr=qr, qi=qi, qs=qs, qg=qg, ni=ni, nr=nr, tgrs=tgrs, prsl=prsl,
             phii=phii, omega=omega, dtp=dtp, min_layer_depth=min_layer_depth, tables=tables,
             semi_sedi=semi_sedi, dt_inner=dt_inner, convert_dry_rho=convert_dry_rho,
@@ -251,19 +279,8 @@ def mp_tempo_run(
             max_sedimentation_fall_speed=max_sedimentation_fall_speed,
             max_snow_sedimentation_fall_speed=max_snow_sedimentation_fall_speed,
             return_tendencies=return_tendencies,
+            **({} if parameter_scales is None else {"parameter_scales": parameter_scales}),
         )
-
-
-@contextmanager
-def _semi_lagrangian_mode(mode: str | None) -> Iterator[None]:
-    if mode is None:
-        yield
-        return
-    previous = torch_native.set_semi_lagrangian_compute_mode(mode)
-    try:
-        yield
-    finally:
-        torch_native.set_semi_lagrangian_compute_mode(previous)
 
 
 @contextmanager
@@ -276,11 +293,26 @@ def _sedimentation_substep_region(enabled: bool) -> Iterator[None]:
 
 
 @contextmanager
-def _sedimentation_compaction(tiers: Mapping[str, tuple[tuple[int, float], ...]] | None) -> Iterator[None]:
-    if tiers is None:
+def _semi_lagrangian_window(sources: int | None) -> Iterator[None]:
+    previous = torch_native.set_semi_lagrangian_window_sources(sources)
+    try:
         yield
-        return
-    previous = torch_native.set_sedimentation_compaction(tiers)
+    finally:
+        torch_native.set_semi_lagrangian_window_sources(previous)
+
+
+@contextmanager
+def _lane_compaction(fractions: Mapping[str, float] | None) -> Iterator[None]:
+    previous = torch_native.set_lane_compaction({} if fractions is None else fractions)
+    try:
+        yield
+    finally:
+        torch_native.set_lane_compaction(previous)
+
+
+@contextmanager
+def _sedimentation_compaction(tiers: Mapping[str, tuple[tuple[int, float], ...]] | None) -> Iterator[None]:
+    previous = torch_native.set_sedimentation_compaction({} if tiers is None else tiers)
     try:
         yield
     finally:
@@ -321,9 +353,18 @@ def _mp_tempo_run(
     max_sedimentation_fall_speed: float,
     max_snow_sedimentation_fall_speed: float | None,
     return_tendencies: bool,
+    parameter_scales: Mapping[str, torch.Tensor] | None = None,
+    spechum_entry: torch.Tensor | None = None,
+    tgrs_entry: torch.Tensor | None = None,
 ) -> MpTempoResult:
     if spechum.ndim != 2 or phii.shape != (spechum.shape[0], spechum.shape[1] + 1):
         raise ValueError("mp_tempo_run expects [ncol, nlev] fields and phii [ncol, nlev+1]")
+    if spechum_entry is not None and (spechum_entry.shape != spechum.shape
+            or spechum_entry.dtype != spechum.dtype or spechum_entry.device != spechum.device):
+        raise ValueError("mp_tempo_run entry humidity must match the column fields")
+    if tgrs_entry is not None and (tgrs_entry.shape != tgrs.shape
+            or tgrs_entry.dtype != tgrs.dtype or tgrs_entry.device != tgrs.device):
+        raise ValueError("mp_tempo_run entry temperature must match the column fields")
     ndt, dt = inner_timestep(dtp, dtp if dt_inner is None else dt_inner)
 
     accum = {
@@ -337,10 +378,16 @@ def _mp_tempo_run(
     refl_out = torch.zeros_like(spechum) if refl_10cm is None else refl_10cm
 
     one = 1.0
-    qv = spechum / (one - spechum)
+    # The host passes the tracers as views of one [column, level, tracer] array; about 45 kernels of the
+    # compiled TEMPO step read these ratios. Stored, they read contiguous fields instead of re-forming each
+    # ratio from strided tracer reads (same values: ``stored`` is an identity view).
+    qv = stored(spechum / (one - spechum))
+    entry_specific = spechum if spechum_entry is None else spechum_entry
+    terminal_heat_mass_scale = one / (one - entry_specific)
+    phase_heat_reference_temperature = tgrs if tgrs_entry is None else tgrs_entry
     species_in = {"qc": qc, "qr": qr, "qi": qi, "qs": qs, "qg": qg, "ni": ni, "nr": nr}
     if convert_dry_rho:
-        state_species = {name: value / (one - spechum) for name, value in species_in.items()}
+        state_species = {name: stored(value / (one - spechum)) for name, value in species_in.items()}
     else:
         state_species = dict(species_in)
     dz = (phii[:, 1:] - phii[:, :-1]) / con_g
@@ -355,7 +402,9 @@ def _mp_tempo_run(
     for _ in range(ndt):
         rho = roverrv * prsl / (rdry * temperature * (qv + roverrv))
         w = -omega / (rho * con_g)
-        state = {"t": temperature, "p": prsl, "w": w, "dz": dz, "qv": qv, **state_species}
+        state = {"t": temperature, "p": prsl, "w": w, "dz": dz, "qv": qv,
+                 "terminal_heat_mass_scale": terminal_heat_mass_scale,
+                 "phase_heat_reference_temperature": phase_heat_reference_temperature, **state_species}
         result = torch_native.run_tempo_native(
             state,
             dt=dt,
@@ -373,6 +422,7 @@ def _mp_tempo_run(
                                                else float(max_snow_sedimentation_fall_speed)),
             # Effective radii are never read here and reflectivity only with do_radar_ref.
             radar_and_effective_radii=bool(do_radar_ref),
+            **({} if parameter_scales is None else {"parameter_scales": parameter_scales}),
         )
         out = result.state
         temperature = out["t"]

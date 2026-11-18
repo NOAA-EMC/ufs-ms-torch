@@ -17,12 +17,27 @@ from dataclasses import dataclass, replace
 from typing import Mapping
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from rrtmgp_radiation_torch.radiation_group import (
     CON_PI,
     CZLIMT_DAY,
     RadiationConfig,
     _longwave_absorption_v17,
     _longwave_sources_tensor,
+    _lw_band_transport,
+    _lw_down_levels,
+    _lw_finish_levels,
+    _lw_scatter_down_levels,
+    _lw_scatter_up_levels,
+    _lw_up_levels,
+    _mcica_layer_dcorr,
+    _mcica_layer_maxrand,
+    _sw_adding_levels,
+    _sw_band_layer_levels,
+    _sw_daylit_optics,
+    _sw_edge_sums,
+    _sw_flux_levels,
+    _sw_layer_levels,
     _lw_columns,
     _sw_daylit_columns,
     coszmn_with_daily,
@@ -31,6 +46,7 @@ from rrtmgp_radiation_torch.radiation_group import (
 from rrtmgp_radiation_torch.setup import _solar_state
 from rrtmgp_radiation_torch.tables import RrtmgpTableBundle
 
+from . import parameters
 from .clock import StepClock, _nint_nonnegative, advance_utc_date
 from .containers import Statein, Stateout
 from .grid import Grid
@@ -38,14 +54,24 @@ from .radiation_seeds import RadiationSeeds
 from ufs_physics_common.compile_policy import compiled
 from ufs_physics_common import compile_policy
 
-from .column_chunks import run_column_chunks
+from .column_chunks import rows_view, run_column_chunks, take
 from .runtime_policy import (scheme_column_chunk, cycle_observers_enabled, scheme_compile_selected, step_graphs_enabled,
     sw_daylit_fraction)
 from .surface_containers import Sfcprop
 
+# Registry key -> name in the radiation group's scales (rrtmgp_radiation_torch.radiation_group._group_head).
+RADIATION_PARAMETER_KEYS = {"tempo.nt_c_land": "nt_c_land", "tempo.nt_c_ocean": "nt_c_ocean",
+                            "rad.reliq_conv": "reliq_conv", "rad.reice_conv": "reice_conv", "rad.alpha0": "alpha0",
+                            "rad.decorr": "decorr"}
+
+
+def radiation_parameter_scales(parameter_scales: Mapping[str, torch.Tensor] | None) -> dict[str, torch.Tensor] | None:
+    """The registered radiation scales present in ``parameter_scales`` by group name; None when there are none."""
+    return parameters.select(parameter_scales, RADIATION_PARAMETER_KEYS) or None
+
 
 def _sw_column_regions(*args, **kwargs):
-    return _sw_daylit_columns(*args, **kwargs, region=compiled)
+    return _sw_daylit_columns(*args, **kwargs, region=_radiation_tensor_region)
 
 
 _sw_column_regions.__wrapped__ = _sw_daylit_columns
@@ -53,17 +79,29 @@ _sw_column_regions.warm = lambda *args, **kwargs: None
 compile_policy._compiled[_sw_daylit_columns] = _sw_column_regions
 
 
-def _lw_tensor_region(fn):
-    # Avoid repeated forward copies of call-local preparation. AD keeps the
-    # canonical layouts: strided reductions need a separate adjoint envelope.
-    borrowed = (not torch.is_grad_enabled()
-                and fn in (_longwave_absorption_v17, _longwave_sources_tensor))
+# The McICA layer steps read their layer's words as slices of the tempered twist block, in place. The LW and SW
+# sweep blocks and the SW band layer chunks read layer slices and band rows of whole-column or whole-spectrum arrays:
+# normalization copied 9,155 of them per 60 km radiation step (85 ms of RTX PRO 6000 kernels, round 8; the same
+# cost round 6 removed for the former lazy sweeps). The LW band transport reads each band's g-point rows of the
+# level-major inference gas optics (strided views, which normalization would copy).
+_BORROWED_INPUTS = (_longwave_absorption_v17, _longwave_sources_tensor, _sw_daylit_optics, _mcica_layer_maxrand,
+                    _mcica_layer_dcorr, _lw_down_levels, _lw_up_levels, _lw_scatter_up_levels, _lw_scatter_down_levels,
+                    _lw_finish_levels, _sw_layer_levels, _sw_adding_levels, _sw_flux_levels, _sw_band_layer_levels,
+                    _lw_band_transport, _sw_edge_sums)
+
+
+def _radiation_tensor_region(fn):
+    # Avoid repeated forward copies of call-local preparation: the interpolation plan and band Planck tables
+    # are views into buffers their compiled producer shares, and layout normalization copied them at every
+    # call while the originals stayed live (6.2 GiB at the 60 km LW absorption peak, round-4 G4a). These
+    # islands only read their inputs. AD keeps the canonical layouts: strided reductions need a separate
+    # adjoint envelope.
+    borrowed = not torch.is_grad_enabled() and fn in _BORROWED_INPUTS
     return compiled(fn, normalize_layouts=not borrowed)
 
 
 def _lw_column_regions(columns, **kwargs):
-    region = _lw_tensor_region if columns["p_lay"].device.type == "mps" else compiled
-    return _lw_columns(columns, **kwargs, region=region)
+    return _lw_columns(columns, **kwargs, region=_radiation_tensor_region)
 
 
 _lw_column_regions.__wrapped__ = _lw_columns
@@ -337,11 +375,11 @@ def reset_radiation_diagnostics(
                 raise ValueError("radiation reset decision disagrees with step_index")
             reset = decided
             if not step_graphs_enabled():
-                torch._assert_async(kdt == step_index, "radiation reset step_index disagrees with kdt")
+                torch_compat.assert_async(kdt == step_index, "radiation reset step_index disagrees with kdt")
         if type(reset) is not bool:
             raise TypeError("radiation reset decision must be a static bool")
         if step_graphs_enabled():  # the device clock must make the same decision (no step number)
-            torch._assert_async((torch.fmod(kdt.to(torch.int64), _radiation_reset_divisor(
+            torch_compat.assert_async((torch.fmod(kdt.to(torch.int64), _radiation_reset_divisor(
                 fhzero=fhzero, fhswr=fhswr, fhlwr=fhlwr, dtp=dtp, nszero=nszero)) == 1) == reset,
                 "radiation reset step disagrees with kdt")
         if not reset:
@@ -358,7 +396,7 @@ def reset_radiation_diagnostics(
         (), min(fhswr, fhlwr) / dtp, dtype=torch.float64, device=kdt.device
     )
     rad_steps = _nint_nonnegative(short)
-    torch._assert_async(rad_steps > 0, "radiation reset interval rounds to zero")
+    torch_compat.assert_async(rad_steps > 0, "radiation reset interval rounds to zero")
     divisor = torch.where(
         _nint_nonnegative(hours) >= _nint_nonnegative(rad), nszero, rad_steps
     )
@@ -403,11 +441,11 @@ def reset_physics_diagnostics(
                 raise ValueError("physics reset decision disagrees with step_index")
             reset = decided
             if not step_graphs_enabled():
-                torch._assert_async(kdt == step_index, "physics reset step_index disagrees with kdt")
+                torch_compat.assert_async(kdt == step_index, "physics reset step_index disagrees with kdt")
         if type(reset) is not bool:
             raise TypeError("physics reset decision must be a static bool")
         if step_graphs_enabled():  # the device clock must make the same decision (no step number)
-            torch._assert_async((torch.remainder(kdt.to(torch.int64)-1,nszero) == 0) == reset,
+            torch_compat.assert_async((torch.remainder(kdt.to(torch.int64)-1,nszero) == 0) == reset,
                                 "physics reset step disagrees with kdt")
         if not reset:
             return carry
@@ -456,6 +494,12 @@ for _reset in (reset_radiation_diagnostics, reset_physics_diagnostics):
     compile_policy._compiled[_reset] = _regions
 
 
+def _level_major_copies(prsi, prsl, prslk, gt0, gq0, cnvw):
+    """The column-major inputs radiation computes from, copied level-major (columns innermost) once."""
+    return (prsi.T.contiguous(), prsl.T.contiguous(), prslk.T.contiguous(), gt0.T.contiguous(),
+            gq0.permute(2, 1, 0).contiguous(), cnvw.T.contiguous())
+
+
 def radiation_group_inputs(
     statein: Statein,
     stateout: Stateout,
@@ -483,12 +527,25 @@ def radiation_group_inputs(
             for name in ("xlat", "xlon", "sinlat", "coslat", "dx")
         }
     )
-    state.update({name: getattr(statein, name).T for name in ("prsi", "prsl", "prslk")})
-    state.update({name: getattr(stateout, name).T for name in ("gt0", "gu0", "gv0")})
+    # Radiation works level-major ([nlev, ncol], columns contiguous). The views its computation reads are copied
+    # once into that layout: every array radiation derives from them (interpolation plans, the g-point arrays)
+    # then shares one layout, and no fused kernel mixes column-strided and column-contiguous operands (plan
+    # FORWARD_PERF_ROUND2, M2). Inputs already in that layout (state in Fortran order) are not copied. Fields
+    # radiation only passes on (winds, the previous heating rates, fluxr, phy_f3d) stay views. Values unchanged.
+    # With the radiation compiled and no gradient, the copies are one compiled region: Inductor tiles each transpose
+    # (an eager transposing copy reads with a column stride; gq0's took 6 ms per 60 km radiation step on the RTX PRO
+    # 6000, round 8).
+    copies = (compiled(_level_major_copies)
+              if scheme_compile_selected("run_native_radiation") and not torch.is_grad_enabled()
+              else _level_major_copies)
+    prsi, prsl, prslk, gt0, gq0, cnvw = copies(statein.prsi, statein.prsl, statein.prslk, stateout.gt0,
+                                               stateout.gq0, carry.cnvw)
+    state.update(prsi=prsi, prsl=prsl, prslk=prslk)
+    state.update(gt0=gt0, gu0=stateout.gu0.T, gv0=stateout.gv0.T)
     state.update(
-        gq0=stateout.gq0.permute(2, 1, 0),
+        gq0=gq0,
         hprime=sfcprop.hprime[:, 0],
-        cnvw=carry.cnvw.T,
+        cnvw=cnvw,
         phy_f3d_prev=carry.phy_f3d.permute(2, 1, 0),
         icsdsw=seeds.icsdsw,
         icsdlw=seeds.icsdlw,
@@ -534,7 +591,32 @@ def radiation_group_inputs(
     return state
 
 
-def _radiation_group(inputs, config, tables):
+# The LW and SW column work runs on a multiple of this many columns (FP32: 16-byte column rows).
+COLUMN_ALIGNMENT = 4
+
+
+def _aligned_columns(call, columns, **options):
+    """``call(columns)`` on the columns padded to a multiple of ``COLUMN_ALIGNMENT`` (copies of the last column),
+    returning the real columns.
+
+    The column work slices its column-innermost arrays by band and level, and its sweep regions read those slices
+    in place. With a column count that is not a multiple of four, most slices start off a 16-byte boundary, which
+    a GPU kernel reads at a fraction of its aligned bandwidth. Each column is computed from its own values, so the
+    real columns are unchanged. The padding runs on every device, so CPU and GPU run one form and the CPU checks
+    cover the code the GPU runs. Calls with gradients keep their columns: their whole-column forms read no slices in place. The padding is 1 to
+    4 columns (4 for a count already a multiple of four), so every count takes the same gathers and copies and the
+    work per column does not depend on the count (checks/test_efficiency.py).
+    """
+    ncol = columns["p_lay"].shape[-1]
+    pad = COLUMN_ALIGNMENT - ncol % COLUMN_ALIGNMENT
+    if torch.is_grad_enabled():
+        return call(columns, **options)
+    device = columns["p_lay"].device
+    index = torch.cat((torch.arange(ncol, device=device), torch.full((pad,), ncol - 1, device=device)))
+    return rows_view(call(take(columns, index, axis=-1, ncol=ncol), **options), 0, ncol, axis=-1, ncol=ncol + pad)
+
+
+def _radiation_group(inputs, config, tables, scales=None):
     """The radiation group; with column chunks (runtime_policy.set_column_chunk) its two mains run
     their column work over chunks of that size.
 
@@ -543,6 +625,7 @@ def _radiation_group(inputs, config, tables):
     radiation entry selected for compile, column work uses the same tensor regions with or without
     column chunks. The whole-mesh parts before and after the mains (setup to cloud diagnostics;
     post and fluxr) compile only without gradients (their compiled reverse is not qualified).
+    ``scales``: the radiation parameter scales by group name (``radiation_parameter_scales``; None: no op).
     """
     chunk = scheme_column_chunk("run_native_radiation")
     fraction = sw_daylit_fraction()
@@ -551,12 +634,13 @@ def _radiation_group(inputs, config, tables):
     def blocks(fn, columns, **options):
         call = compiled(fn) if compile_blocks else fn
         if chunk is None:
-            return call(columns, **options)
+            return _aligned_columns(call, columns, **options)
         return run_column_chunks(lambda part: call(part, **options), columns,
                                  ncol=columns["p_lay"].shape[-1], size=chunk, axis=-1, views=True,
                                  warm=(lambda part: call.warm(part, **options)) if compile_blocks else None)
 
     return run_radiation_group(inputs, config, tables=tables, sw_day_fraction=fraction, blocks=blocks,
+                                      **({} if scales is None else {"parameter_scales": scales}),
                                       region=compiled if compile_blocks and not torch.is_grad_enabled() else None)
 
 
@@ -614,6 +698,7 @@ def run_native_radiation(
     *,
     clock: StepClock,
     tables: RrtmgpTableBundle | None,
+    parameter_scales: Mapping[str, torch.Tensor] | None = None,
 ) -> NativeRadiationResult:
     """Dispatch the source radiation group, preserving carry on skipped steps.
 
@@ -622,13 +707,15 @@ def run_native_radiation(
     full physics_init remain unsupported; both-off calls execute no radiation.
     Scratch tendencies die with this group, as in CCPP_driver; held Radtend survives.
     Active outputs can share unchanged input fields; callers treat both as immutable.
+    ``parameter_scales``: the 0-d tensor scales of ``ufs_mpas_ccpp.parameters``; the registered radiation keys
+    (``RADIATION_PARAMETER_KEYS``) reach the cloud microphysics and overlap; absent keys: no op.
     """
     if any(type(flag) is not bool for flag in (config.lsswr, config.lslwr)):
         raise TypeError("native radiation entry requires static active-wave selection")
     for flag in (clock.lsswr, clock.lslwr):
         if flag.shape != () or flag.dtype != torch.bool or flag.device != statein.prsl.device:
             raise ValueError("radiation clock flags must be scalar device-local booleans")
-    torch._assert_async(
+    torch_compat.assert_async(
         (clock.lsswr == config.lsswr) & (clock.lslwr == config.lslwr),
         "static radiation selection disagrees with the device clock",
     )
@@ -659,7 +746,9 @@ def run_native_radiation(
     # The radiation group reads these buffers and constructs functional replacements.
     stateout = Stateout(statein.ugrs, statein.vgrs, statein.tgrs, statein.qgrs)
     inputs = radiation_group_inputs(statein, stateout, grid, sfcprop, carry, seeds)
-    stages = _radiation_group(inputs, config, tables)
+    # The scales enter the compiled group head as 1-element views on the numerical device (parameters.region_views).
+    stages = _radiation_group(inputs, config, tables,
+                              parameters.region_views(radiation_parameter_scales(parameter_scales), inputs["prsl"]))
     pre, surface, cloud, lw, post = (
         stages[name] for name in ("pre", "surface", "cloud_mp", "lw", "post")
     )

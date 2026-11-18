@@ -9,6 +9,7 @@ import math
 from dataclasses import dataclass, replace
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from gfs_surface_layer_torch.driver import CP, EPS, EPSM1, RD, RVRDM1, fpvs
 from ufs_physics_common.precision import working_power
 
@@ -169,7 +170,7 @@ def sfc_nst_run(fields, solhr, table, control: NSSTControl):
         result[name] = torch.where(active, value, result[name])
     result["qrain"] = torch.where(active, qrain, result["qrain"])
     norm = thermal.positive_sqrt(f["u1"] * f["u1"] + f["v1"] * f["v1"])
-    torch._assert_async(
+    torch_compat.assert_async(
         ((~active) | (norm > 0.0)).all(), "NSST wind direction is undefined"
     )
     inverse = 1.0 / torch.where(active, norm, 1.0)

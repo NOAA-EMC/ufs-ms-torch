@@ -9,15 +9,11 @@ import torch
 
 from sa_sas_deep_convection_torch import recurrence_chunks as chunks
 from sa_sas_deep_convection_torch.compile import (
-    masked_sum_chunk_size, run_compile_island, run_recurrence_chunk, recurrence_chunk_size,
+    run_compile_island, run_recurrence_chunk, recurrence_chunk_size,
     ordered_chunks_enabled,
 )
-from sa_sas_deep_convection_torch.constants import KM
-from sa_sas_deep_convection_torch.ops import sqrt_zero_grad
 from sa_sas_deep_convection_torch.segments.segment_d import _gather_column
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
-
-CHECKPOINT_FIELDS = ("omegac", "sigmab", "scaldfunc", "sigmagfm", "xmbmax", "ktcon", "ktcon1")
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -225,7 +221,7 @@ def _shear_downdraft_seed_block(
         omegac_work = torch.zeros_like(omegac)
         sumx_work = torch.zeros_like(sumx_input)
         sigma_rows = chunks.pack_profiles(del_, omega_u)
-        sum_size = masked_sum_chunk_size()
+        sum_size = recurrence_chunk_size()
         for start in range(1, KM - 1, sum_size):
             end = min(start + sum_size, KM - 1)
             omegac_work, sumx_work = run_recurrence_chunk(
@@ -271,7 +267,7 @@ def _shear_downdraft_seed_block(
 
     vshear = torch.where(active, torch.zeros_like(vshear), vshear)
     shear_rows = chunks.pack_profiles(uo, vo)
-    sum_size = masked_sum_chunk_size()
+    sum_size = recurrence_chunk_size()
     for start in range(1, KM, sum_size):
         end = min(start + sum_size, KM)
         vshear = run_recurrence_chunk(
@@ -321,14 +317,3 @@ def _shear_downdraft_seed_block(
     return cnvflg, omegac, zeta, ktcon, ktcon1, qcko, zdqca, qlko_ktcon, vshear, edt, edto, edtx, sumx, xlamd, etad
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {
-        name: state.fields.get("omegac_k_checkpoint", state.require("omegac"))
-        if name == "omegac"
-        else state.fields.get("scaldfunc_k_checkpoint", state.require("scaldfunc"))
-        if name == "scaldfunc"
-        else state.fields.get("sigmagfm_k_checkpoint", state.require("sigmagfm"))
-        if name == "sigmagfm"
-        else state.require(name)
-        for name in CHECKPOINT_FIELDS
-    }

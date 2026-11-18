@@ -6,12 +6,12 @@
 The coupled model runs in the floating dtype of its case. Float64 is the default and the parity
 dtype (cases are prepared in float64 and stay bitwise to the Fortran-derived references); float32
 is separately qualified. Runtime code takes its working dtype from a state tensor it already
-holds (``x.dtype``). CPU FP32 uses FP64 evaluation at selected powers, then rounds once;
-PyTorch 2.8 scalar/SIMD power differences otherwise change results with spatial ownership.
-CUDA retains native FP32 powers. ``ufs_physics_common.precision.working_power`` defines this
+holds (``x.dtype``). FP32 uses FP64 evaluation at selected powers, then rounds once, on CPU and
+CUDA alike; PyTorch 2.8 scalar/SIMD power differences otherwise change results with spatial ownership.
+``ufs_physics_common.precision.working_power`` defines this
 on-device, differentiable precision policy. It does not change FP64 arithmetic.
 
-``case_as_dtype`` makes a case of another precision from a prepared case in memory: every floating
+``prepare_case`` makes a case of another precision from a prepared case in memory: every floating
 tensor of the whole case, including configuration tensors, is rounded to ``dtype``
 (integer and boolean tensors, Python scalars and strings are kept). The native MPAS boundary marker
 is rebound to the converted tensors with its configuration digest and timestep, so the first step
@@ -135,23 +135,6 @@ def move_tree(tree: Any, *, dtype: torch.dtype | str | None = None,
         return out
 
     return build(tree)
-
-
-def cast_floating(tree: Any, dtype: torch.dtype) -> Any:
-    """``tree`` with each floating tensor in ``dtype``; dicts, lists, tuples and dataclasses are rebuilt.
-
-    Tensors shared by several leaves stay shared. Other leaves are returned unchanged.
-    """
-    return move_tree(tree, dtype=dtype)
-
-
-def case_as_dtype(case: Mapping[str, Any], dtype: torch.dtype) -> dict[str, Any]:
-    """A prepared coupled case (``native``, ``mesh``, ``config``, ``arguments``, ``cold_arguments``) in ``dtype``.
-
-    Returns a shallow copy of ``case`` when it already has that dtype. The arguments' ``mesh`` is the
-    converted case mesh and their ``config`` the case config, as in the prepared case.
-    """
-    return prepare_case(case, dtype=dtype)
 
 
 def prepare_case(case: Mapping[str, Any], *, dtype: torch.dtype | str | None = None,

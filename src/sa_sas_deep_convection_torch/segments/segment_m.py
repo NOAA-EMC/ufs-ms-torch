@@ -8,10 +8,7 @@ from __future__ import annotations
 import torch
 
 from sa_sas_deep_convection_torch.compile import run_compile_island
-from sa_sas_deep_convection_torch.constants import KM, NTR
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
-
-CHECKPOINT_FIELDS = ("dellah", "dellaq", "dellau", "dellav", "dellae", "delubar", "delvbar")
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -323,5 +320,3 @@ def _conditioned_heat_feedback(heo, hcko, hcdo, eta, etad, aup, adw, edto,
         + anchor * residual) * factor
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

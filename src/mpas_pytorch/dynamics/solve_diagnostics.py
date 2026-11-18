@@ -32,7 +32,6 @@ from mpas_pytorch.dynamics.static_payloads import (
 )
 from mpas_pytorch.dynamics.stencil_ops import (
     _active_slot_count,
-    _compile_active,
     _pinned_identity,
     _static_connectivity_cache_allowed,
     _static_mask_all_true,

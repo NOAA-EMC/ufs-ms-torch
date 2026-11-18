@@ -10,23 +10,7 @@ import torch
 from sa_tke_edmf_torch.autodiff import safe_positive_denominator, safe_sqrt_nonnegative
 from sa_tke_edmf_torch.compile import run_compile_island
 from sa_tke_edmf_torch.segments.segment_g import levels_over
-from sa_tke_edmf_torch.constants import IM, KM, NTRAC
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
-
-CHECKPOINT_FIELDS = (
-    "scuflg",
-    "kcld",
-    "krad",
-    "radmin",
-    "tcko",
-    "qcko",
-    "tcdo",
-    "qcdo",
-    "xmf",
-    "xlamue",
-    "buou",
-    "wush",
-)
 
 
 def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
@@ -134,7 +118,6 @@ def _cloud_search_seed_block(
     zeros_2 = torch.zeros((ncol, KM), dtype=dtype, device=device)
     zeros_3 = torch.zeros((ncol, KM, NTRAC), dtype=dtype, device=device)
     scuflg = torch.ones((ncol,), dtype=torch.bool, device=device)
-    flg = scuflg.clone()
     lcld = torch.full((ncol,), km1, dtype=torch.int64, device=device)
     kcld = torch.full((ncol,), km1, dtype=torch.int64, device=device)
     krad = torch.ones((ncol,), dtype=torch.int64, device=device)
@@ -199,5 +182,3 @@ def _cloud_search_seed_block(
     )
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

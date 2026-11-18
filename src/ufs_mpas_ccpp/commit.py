@@ -191,18 +191,17 @@ def commit_mpas_state(
     )
     atmosphere = result.state.atmosphere
     if phase is CommitPhase.RADIATION_PHYSICS:
-        dt = config["config_dt"]
-        # The dycore's no-grad step and its halo exchanges reuse these work tensors in place; the previous
-        # state keeps its own.
-        fresh = {name: before[name].clone() for name in ("theta_m", "theta", "exner", "pressure_p", "rtheta_p", "u", "ru")}
+        fresh, tend_rtheta, tend_ru = glue(_radiation_physics_forcing)(
+            {name: before[name] for name in _DYCORE_WORK_FIELDS}, before["rho_zz"], atmosphere.theta_m,
+            result.state.u, result.edge_density, dt=config["config_dt"])
         after = {
             **before,
             **fresh,
             "scalars": atmosphere.scalars,
             "qv": atmosphere.scalars[..., 0],
             "t": fresh["theta_m"],
-            "tend_rtheta_physics": before["rho_zz"] * (atmosphere.theta_m - before["theta_m"]) / dt,
-            "tend_ru_physics": result.edge_density * (result.state.u - before["u"]) / dt,
+            "tend_rtheta_physics": tend_rtheta,
+            "tend_ru_physics": tend_ru,
         }
     else:
         after = {
@@ -252,6 +251,20 @@ def commit_mpas_state(
         dt=config["config_dt"],
     )
     return after, result
+
+
+# The dycore's no-grad step and its halo exchanges reuse these work tensors in place; the previous state keeps its own.
+_DYCORE_WORK_FIELDS = ("theta_m", "theta", "exner", "pressure_p", "rtheta_p", "u", "ru")
+
+
+def _radiation_physics_forcing(work, rho_zz, theta_m, u, edge_density, *, dt):
+    """The dycore's copies of its work fields and the RK-stage physics forcing of the phase-1 commit.
+
+    One region (``glue``): each copy forms in the kernel that also reads its field for the forcing.
+    """
+    fresh = {name: value.clone() for name, value in work.items()}
+    return (fresh, rho_zz * (theta_m - work["theta_m"]) / dt,
+            edge_density * (u - work["u"]) / dt)
 
 
 def commit_native(
@@ -311,6 +324,8 @@ def commit_native(
         raise ValueError("phase2 native commit must not mirror Sfcprop")
 
     observe = cycle_observers_enabled()
+    # Both phases convert the GFS heating to MPAS heat capacity on the physics entry mass (a physics change:
+    # reverse.commit_thermodynamics says what upstream does and why).
     cells = glue(commit_thermodynamics)(
         before.atmosphere,
         geometry.projection,
@@ -334,7 +349,7 @@ def commit_native(
                 water_species=water_species,
                 cumulative=before.cumulative,
             )
-    increments = prepare_cell_wind_increment(cells.atmosphere, stateout)
+    increments = glue(prepare_cell_wind_increment)(cells.atmosphere, stateout)
     if partitioned:
         exchanged = _exchanged(halo, "ufs_commit:wind_increment",
                                zonal=increments.zonal, meridional=increments.meridional)
@@ -347,7 +362,10 @@ def commit_native(
         ru=before.ru,
         exchanged_increment=increments,
     )
-    atmosphere = commit_surface_pressure(
+    # Every commit refreshes the output diagnostics (surface pressure, theta, reconstructed winds, rho and
+    # pressure), so its result is never stale. In phase 1 only observers read them (the dycore diagnoses its own);
+    # the refresh is a small share of a step, too little to keep a second, stale form.
+    atmosphere = glue(commit_surface_pressure)(
         winds.atmosphere,
         geometry.projection,
         native_qv_index=tracers.native_qv_index,

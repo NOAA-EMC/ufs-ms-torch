@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from .autodiff import static_tensor
 
 from .state import SaTkeEdmfState, require_float64
@@ -32,13 +33,13 @@ def diagnostic_slots(state: SaTkeEdmfState) -> torch.Tensor:
         if dtidx.ndim != 2 or min(rows) < 0 or max(rows) >= dtidx.shape[0] or not 0 <= process < dtidx.shape[1] or dtidx.shape[0] < 100 + ntrac:
             raise ValueError("invalid source PBL diagnostic indices")
         slots = torch.cat((dtidx[static_tensor(rows, dtype=torch.int64, device=dtidx.device), process], dtidx[100:100+ntrac, process])).to(torch.int64)
-    torch._assert_async((slots <= dtend.shape[2]).all(), "PBL diagnostic slot outside allocation")
+    torch_compat.assert_async((slots <= dtend.shape[2]).all(), "PBL diagnostic slot outside allocation")
     return slots
 
 
 def _slot_index(dtend: torch.Tensor, slot: torch.Tensor) -> torch.Tensor:
     # Nonpositive slots are off; they read and rewrite column 0 unchanged.
-    torch._assert_async(slot <= dtend.shape[2], "diagnostic slot outside allocation")
+    torch_compat.assert_async(slot <= dtend.shape[2], "diagnostic slot outside allocation")
     return (slot.clamp(min=1) - 1).to(torch.int64).reshape(1)
 
 

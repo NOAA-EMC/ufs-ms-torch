@@ -49,7 +49,6 @@ from mpas_pytorch.autodiff.soft_limiter import (
     fct_min,
     fct_neighbor_bounds,
     fct_quotient,
-    fct_sign_pm,
 )
 from mpas_pytorch.distributed.dynamics import current_dynamics_halo_exchange
 from mpas_pytorch.dynamics.dyn_tend import _make_flux_divisor, _validate_flux_divisor
@@ -70,7 +69,6 @@ from mpas_pytorch.dynamics.stencil_ops import (
     _gather_slot_batch,
     _replace_all_rows_cols,
     _replace_row_slice,
-    _replace_rows,
     _slot_batches,
     _slot_gather_batch,
     _static_connectivity_cache_allowed,
@@ -192,35 +190,6 @@ def _monotonic_scalar_transport_positive_scalar_all_cell_patch(
     return torch.cat(parts, dim=0)
 
 
-def _full_level_vertical_flux_delta(
-    interface_flux: torch.Tensor,
-    n_levels: int,
-) -> torch.Tensor:
-    """Match padded[:, 1:n+1, :] - padded[:, :n, :] with zero boundary fluxes."""
-    expected_interfaces = max(n_levels - 1, 0)
-    if interface_flux.shape[1] != expected_interfaces:
-        raise ValueError(
-            "interface_flux has wrong vertical width: "
-            f"got {interface_flux.shape[1]}, expected {expected_interfaces}"
-        )
-    if n_levels == 0:
-        return interface_flux.new_zeros(
-            (interface_flux.shape[0], 0, interface_flux.shape[2])
-        )
-    if expected_interfaces == 0:
-        return interface_flux.new_zeros(
-            (interface_flux.shape[0], n_levels, interface_flux.shape[2])
-        )
-    out = interface_flux.new_empty(
-        (interface_flux.shape[0], n_levels, interface_flux.shape[2])
-    )
-    out[:, 0, :] = interface_flux[:, 0, :]
-    if n_levels > 2:
-        out[:, 1:-1, :] = interface_flux[:, 1:, :] - interface_flux[:, :-1, :]
-    out[:, -1, :] = -interface_flux[:, -1, :]
-    return out
-
-
 def _monotonic_scalar_transport_apply_vertical_upwind_updates(
     *,
     scalar_old_rows: torch.Tensor,
@@ -228,29 +197,34 @@ def _monotonic_scalar_transport_apply_vertical_upwind_updates(
     flux_upwind_mid: torch.Tensor,
     rdnw: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply the two Fortran vertical upwind loops in their original order."""
+    """Apply the two Fortran vertical upwind loops in their original order.
+
+    Level k is ``(s*rho)_k - f_k*rdnw_k`` (k < n-1, the outgoing loop), then
+    ``+ f_(k-1)*rdnw_k`` (k > 0, the incoming loop), written level band by
+    level band into one result (no level concatenation of a materialized
+    first pass)."""
     n_levels = int(scalar_old_rows.shape[1])
-    scalar_new_rows = scalar_old_rows * rho_zz_old_rows.unsqueeze(2)
     if n_levels <= 1:
-        return scalar_new_rows
-    outgoing = scalar_new_rows[:, : n_levels - 1, :] - flux_upwind_mid * rdnw[
-        : n_levels - 1
-    ].view(1, n_levels - 1, 1)
-    scalar_new_rows = _replace_all_rows_cols(
-        scalar_new_rows,
-        0,
-        n_levels - 1,
-        outgoing,
+        return scalar_old_rows * rho_zz_old_rows.unsqueeze(2)
+    rho = rho_zz_old_rows.unsqueeze(2)
+    rd = rdnw[:n_levels].view(1, n_levels, 1)
+    out = scalar_old_rows.new_empty(scalar_old_rows.shape)
+    out[:, 0:1, :] = (
+        scalar_old_rows[:, 0:1, :] * rho[:, 0:1, :]
+        - flux_upwind_mid[:, 0:1, :] * rd[:, 0:1, :]
     )
-    incoming = scalar_new_rows[:, 1:n_levels, :] + flux_upwind_mid * rdnw[
-        1:n_levels
-    ].view(1, n_levels - 1, 1)
-    return _replace_all_rows_cols(
-        scalar_new_rows,
-        1,
-        n_levels,
-        incoming,
+    if n_levels > 2:
+        interior = slice(1, n_levels - 1)
+        out[:, interior, :] = (
+            scalar_old_rows[:, interior, :] * rho[:, interior, :]
+            - flux_upwind_mid[:, 1 : n_levels - 1, :] * rd[:, interior, :]
+        ) + flux_upwind_mid[:, 0 : n_levels - 2, :] * rd[:, interior, :]
+    last = slice(n_levels - 1, n_levels)
+    out[:, last, :] = (
+        scalar_old_rows[:, last, :] * rho[:, last, :]
+        + flux_upwind_mid[:, n_levels - 2 : n_levels - 1, :] * rd[:, last, :]
     )
+    return out
 
 
 def _monotonic_scalar_transport_scale_patches_from_mid_flux(
@@ -347,35 +321,6 @@ def _monotonic_scalar_transport_last_scalar_limited_rows(
     return wdtn_last
 
 
-def _sum_cell_edge_slots(
-    *,
-    field: torch.Tensor,
-    cell_edge_relation: StaticSlotRelation,
-    prefer_low_memory: bool = False,
-    reduction_slot_tile_width: int | None = None,
-) -> torch.Tensor:
-    """Accumulate cell-edge flux slots without materializing a 4D gather."""
-    cell_edges_0based = cell_edge_relation.indices
-    edge_sign = cell_edge_relation.sign
-    edge_valid = cell_edge_relation.valid
-    edge_valid_all_by_slot = cell_edge_relation.valid_all_by_slot
-    signed_inv_area_weight = cell_edge_relation.weights
-    if edge_sign is None or edge_valid is None or signed_inv_area_weight is None:
-        raise ValueError(
-            "monotonic-scalar-transport cell-edge reduction requires relation sign, valid mask, and weights"
-        )
-    return _sum_cell_edge_slots_from_static(
-        field=field,
-        cell_edges_0based=cell_edges_0based,
-        edge_sign=edge_sign,
-        edge_valid=edge_valid,
-        edge_valid_all_by_slot=edge_valid_all_by_slot,
-        signed_inv_area_weight=signed_inv_area_weight,
-        prefer_low_memory=prefer_low_memory,
-        reduction_slot_tile_width=reduction_slot_tile_width,
-    )
-
-
 def _monotonic_scalar_transport_apply_cell_edge_upwind_updates_from_static(
     *,
     scalar_new_rows: torch.Tensor,
@@ -431,164 +376,6 @@ def _monotonic_scalar_transport_apply_cell_edge_flux_updates_from_static(
         else:
             scalar_new_rows = scalar_new_rows - contribution
     return scalar_new_rows
-
-
-def _sum_cell_edge_slots_from_static(
-    *,
-    field: torch.Tensor,
-    cell_edges_0based: torch.Tensor,
-    edge_sign: torch.Tensor,
-    edge_valid: torch.Tensor,
-    edge_valid_all_by_slot: tuple[bool, ...] | None,
-    signed_inv_area_weight: torch.Tensor,
-    prefer_low_memory: bool = False,
-    reduction_slot_tile_width: int | None = None,
-) -> torch.Tensor:
-    """Ordered cell-edge reduction over prebound topology tensors."""
-    if _monotonic_scalar_transport_can_use_full_view_reduce(
-        field,
-        cell_edges_0based,
-        edge_sign,
-        edge_valid,
-        None,
-        signed_inv_area_weight,
-        prefer_low_memory=prefer_low_memory,
-        reduction_slot_tile_width=reduction_slot_tile_width,
-        slot_count=cell_edges_0based.shape[1],
-    ):
-        return _sum_cell_edge_slots_view_reduce(
-            field=field,
-            cell_edges_0based=cell_edges_0based,
-            edge_sign=edge_sign,
-            edge_valid=edge_valid,
-            inv_area_cell=None,
-            edge_valid_all_by_slot=edge_valid_all_by_slot,
-            signed_inv_area_weight=signed_inv_area_weight,
-        )
-    n_cells = cell_edges_0based.shape[0]
-    total: torch.Tensor | None = None
-    gather_batch = _monotonic_scalar_transport_reduction_gather_batch(
-        field,
-        cell_edges_0based.shape[1],
-        prefer_low_memory=prefer_low_memory,
-        reduction_slot_tile_width=reduction_slot_tile_width,
-        tensors=(cell_edges_0based, edge_sign, edge_valid, signed_inv_area_weight),
-    )
-    for batch_start, batch_stop in _slot_batches(
-        cell_edges_0based.shape[1],
-        gather_batch,
-    ):
-        field_batch = _gather_slot_batch(
-            field, cell_edges_0based, batch_start, batch_stop
-        )
-        weight_batch = signed_inv_area_weight[:, batch_start:batch_stop]
-        for local_slot in range(batch_stop - batch_start):
-            contrib = field_batch[:, local_slot, :, :] * weight_batch[
-                :, local_slot
-            ].view(n_cells, 1, 1)
-            total = _accumulate_ordered_slot(total, contrib)
-    if total is None:
-        return field.new_zeros((n_cells, *field.shape[1:]))
-    return total
-
-
-def _sum_cell_edge_limiter_slots(
-    *,
-    field: torch.Tensor,
-    cell_edge_relation: StaticSlotRelation,
-    tau: float = 0.01,
-    prefer_low_memory: bool = False,
-    reduction_slot_tile_width: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Accumulate positive and negative limiter flux slots in one ordered pass."""
-    cell_edges_0based = cell_edge_relation.indices
-    edge_sign = cell_edge_relation.sign
-    edge_valid = cell_edge_relation.valid
-    edge_valid_all_by_slot = cell_edge_relation.valid_all_by_slot
-    edge_valid_weight = cell_edge_relation.valid_weight
-    if edge_sign is None or edge_valid is None or edge_valid_weight is None:
-        raise ValueError(
-            "monotonic-scalar-transport limiter reduction requires relation sign, valid mask, and weights"
-        )
-    return _sum_cell_edge_limiter_slots_from_static(
-        field=field,
-        cell_edges_0based=cell_edges_0based,
-        edge_sign=edge_sign,
-        edge_valid=edge_valid,
-        edge_valid_all_by_slot=edge_valid_all_by_slot,
-        edge_valid_weight=edge_valid_weight,
-        tau=tau,
-        prefer_low_memory=prefer_low_memory,
-        reduction_slot_tile_width=reduction_slot_tile_width,
-    )
-
-
-def _sum_cell_edge_limiter_slots_from_static(
-    *,
-    field: torch.Tensor,
-    cell_edges_0based: torch.Tensor,
-    edge_sign: torch.Tensor,
-    edge_valid: torch.Tensor,
-    edge_valid_all_by_slot: tuple[bool, ...] | None,
-    edge_valid_weight: torch.Tensor,
-    tau: float = 0.01,
-    prefer_low_memory: bool = False,
-    reduction_slot_tile_width: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Ordered limiter reduction over prebound topology tensors."""
-    if _monotonic_scalar_transport_can_use_full_view_reduce(
-        field,
-        cell_edges_0based,
-        edge_sign,
-        edge_valid,
-        None,
-        edge_valid_weight,
-        prefer_low_memory=prefer_low_memory,
-        reduction_slot_tile_width=reduction_slot_tile_width,
-        slot_count=cell_edges_0based.shape[1],
-    ):
-        return _sum_cell_edge_limiter_slots_view_reduce(
-            field=field,
-            cell_edges_0based=cell_edges_0based,
-            edge_sign=edge_sign,
-            edge_valid=edge_valid,
-            inv_area_cell=None,
-            edge_valid_all_by_slot=edge_valid_all_by_slot,
-            edge_valid_weight=edge_valid_weight,
-            tau=tau,
-        )
-    n_cells = cell_edges_0based.shape[0]
-    positive: torch.Tensor | None = None
-    negative: torch.Tensor | None = None
-    gather_batch = _monotonic_scalar_transport_reduction_gather_batch(
-        field,
-        cell_edges_0based.shape[1],
-        prefer_low_memory=prefer_low_memory,
-        reduction_slot_tile_width=reduction_slot_tile_width,
-        tensors=(cell_edges_0based, edge_sign, edge_valid, edge_valid_weight),
-    )
-    for batch_start, batch_stop in _slot_batches(
-        cell_edges_0based.shape[1],
-        gather_batch,
-    ):
-        field_batch = _gather_slot_batch(
-            field, cell_edges_0based, batch_start, batch_stop
-        )
-        for local_slot in range(batch_stop - batch_start):
-            slot = batch_start + local_slot
-            signed = (
-                edge_sign[:, slot].view(n_cells, 1, 1)
-                * field_batch[:, local_slot, :, :]
-            )
-            weight = edge_valid_weight[:, slot].view(n_cells, 1, 1)
-            positive_contrib = fct_max_zero(signed, tau=tau) * weight
-            negative_contrib = (-fct_max_zero(-signed, tau=tau)) * weight
-            positive = _accumulate_ordered_slot(positive, positive_contrib)
-            negative = _accumulate_ordered_slot(negative, negative_contrib)
-    if positive is None or negative is None:
-        shape = (n_cells, *field.shape[1:])
-        return field.new_zeros(shape), field.new_zeros(shape)
-    return positive, negative
 
 
 def _sum_density_flux_slots(
@@ -691,6 +478,7 @@ def _monotonic_scalar_transport_vertical_neighbor_bounds_numeric(
     coef_3rd_order: float,
     prefer_low_memory: bool,
     reduction_slot_tile_width: int | None,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Local vertical bounds, neighbor bounds and the vertical scalar flux.
 
@@ -725,7 +513,9 @@ def _monotonic_scalar_transport_vertical_neighbor_bounds_numeric(
                 sn[:, 2 : n - 1, :],
                 sn[:, 3:n, :],
                 ww[:, 2 : n - 1].unsqueeze(2),
-                coef_3rd_order,
+                coef_3rd_order
+                if coef_3rd_scale is None
+                else coef_3rd_order * coef_3rd_scale,
                 flux_divisor,
             )
         )
@@ -790,30 +580,6 @@ def _neighbor_scalar_bounds_slots(
         neighbors_0based,
         neighbor_valid,
         slot_tile_width=slot_tile_width,
-    )
-
-
-def _gather_cell_pair_patch_or_zero(
-    patch: torch.Tensor,
-    row_idx: torch.Tensor,
-    *,
-    row_start: int,
-    row_end: int,
-) -> torch.Tensor:
-    """Gather cell rows from a contiguous patch; zero rows outside it."""
-    local_valid = (row_idx >= row_start) & (row_idx < row_end)
-    local_idx = (row_idx - row_start).clamp(min=0, max=max(row_end - row_start - 1, 0))
-    gathered = gather_rows(patch, local_idx)
-    if (
-        row_idx.device.type == "cpu"
-        and not _compile_active()
-        and bool(local_valid.all())
-    ):
-        return gathered
-    return torch.where(
-        local_valid.view(*row_idx.shape, *([1] * (patch.ndim - 1))),
-        gathered,
-        torch.zeros_like(gathered),
     )
 
 
@@ -903,102 +669,6 @@ def _monotonic_scalar_transport_effective_reduction_slot_tile_width(
     if requested <= 0:
         return 1 if prefer_low_memory else 0
     return max(1, min(requested, slots))
-
-
-def _monotonic_scalar_transport_reduction_gather_batch(
-    reference: torch.Tensor,
-    slot_count: int,
-    *,
-    prefer_low_memory: bool = False,
-    reduction_slot_tile_width: int | None = None,
-    tensors: tuple[torch.Tensor | None, ...] = (),
-) -> int:
-    """Choose slot gather width for monotonic-scalar-transport's memory/throughput policy."""
-    tile_width = _monotonic_scalar_transport_effective_reduction_slot_tile_width(
-        slot_count,
-        prefer_low_memory=prefer_low_memory,
-        reduction_slot_tile_width=reduction_slot_tile_width,
-    )
-    if tile_width > 0:
-        return tile_width
-    return _slot_gather_batch(reference, slot_count)
-
-
-def _sum_cell_edge_slots_view_reduce(
-    *,
-    field: torch.Tensor,
-    cell_edges_0based: torch.Tensor,
-    edge_sign: torch.Tensor,
-    edge_valid: torch.Tensor,
-    inv_area_cell: torch.Tensor | None,
-    edge_valid_all_by_slot: tuple[bool, ...] | None = None,
-    signed_inv_area_weight: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Row-owned monotonic-scalar-transport cell-edge reduction without slot-loop launches."""
-    n_cells = cell_edges_0based.shape[0]
-    n_slots = cell_edges_0based.shape[1]
-    if n_slots == 0:
-        return field.new_zeros((n_cells, *field.shape[1:]))
-    gathered = gather_rows(field, cell_edges_0based)
-    tail = (1,) * (field.ndim - 1)
-    if signed_inv_area_weight is not None:
-        weight = signed_inv_area_weight
-    else:
-        if inv_area_cell is None:
-            raise ValueError(
-                "monotonic-scalar-transport reduction requires inverse area or precomputed weights"
-            )
-        weight = edge_sign * inv_area_cell.unsqueeze(1)
-        valid_all = (
-            edge_valid_all_by_slot is not None
-            and len(edge_valid_all_by_slot) == n_slots
-            and all(edge_valid_all_by_slot)
-        )
-        if not valid_all:
-            weight = weight * edge_valid.to(dtype=field.dtype)
-    contrib = gathered * weight.view(n_cells, n_slots, *tail)
-    return sum_fortran_order(contrib, dim=1)
-
-
-def _sum_cell_edge_limiter_slots_view_reduce(
-    *,
-    field: torch.Tensor,
-    cell_edges_0based: torch.Tensor,
-    edge_sign: torch.Tensor,
-    edge_valid: torch.Tensor,
-    inv_area_cell: torch.Tensor | None,
-    edge_valid_all_by_slot: tuple[bool, ...] | None = None,
-    edge_valid_weight: torch.Tensor | None = None,
-    tau: float = 0.01,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Row-owned monotonic-scalar-transport limiter flux reduction without slot-loop launches."""
-    n_cells = cell_edges_0based.shape[0]
-    n_slots = cell_edges_0based.shape[1]
-    if n_slots == 0:
-        shape = (n_cells, *field.shape[1:])
-        return field.new_zeros(shape), field.new_zeros(shape)
-    gathered = gather_rows(field, cell_edges_0based)
-    tail = (1,) * (field.ndim - 1)
-    signed = edge_sign.view(n_cells, n_slots, *tail) * gathered
-    if edge_valid_weight is not None:
-        weight = edge_valid_weight
-    else:
-        if inv_area_cell is None:
-            raise ValueError(
-                "monotonic-scalar-transport limiter reduction requires inverse area or precomputed weights"
-            )
-        weight = inv_area_cell.unsqueeze(1)
-        valid_all = (
-            edge_valid_all_by_slot is not None
-            and len(edge_valid_all_by_slot) == n_slots
-            and all(edge_valid_all_by_slot)
-        )
-        if not valid_all:
-            weight = weight * edge_valid.to(dtype=field.dtype)
-    weight_view = weight.view(n_cells, n_slots, *tail)
-    positive = sum_fortran_order(fct_max_zero(signed, tau=tau) * weight_view, dim=1)
-    negative = sum_fortran_order((-fct_max_zero(-signed, tau=tau)) * weight_view, dim=1)
-    return positive, negative
 
 
 def _sum_density_flux_slots_view_reduce(
@@ -1121,6 +791,7 @@ def _monotonic_scalar_transport_pattern_c_flux_region(
     pattern_c_operator: PatternCOperator,
     edge_cell_relation: StaticPairRelation,
     edge_active_all: bool | None = None,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute monotonic-scalar-transport Pattern-C edge flux for one scalar chunk."""
     payload = pattern_c_operator.payload
@@ -1136,6 +807,7 @@ def _monotonic_scalar_transport_pattern_c_flux_region(
         adv_coef_3rd=payload["adv_coef_3rd"],
         slot_cells_matrix=payload["slot_cells_matrix"],
         slot_valid_matrix=payload["slot_valid_matrix"],
+        adv_coef_3rd_scale=coef_3rd_scale,
     )
     edge_active_mask = edge_cell_relation.active_3d
     if edge_active_mask is None:
@@ -1163,38 +835,49 @@ def _monotonic_scalar_transport_horizontal_source_flux(
     adv_coef_3rd: torch.Tensor,
     slot_cells_matrix: torch.Tensor,
     slot_valid_matrix: torch.Tensor,
+    adv_coef_3rd_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Preserve SELECT CASE(10) association with fixed-shape tensor masks."""
+    """Preserve SELECT CASE(10) association with fixed-shape tensor masks.
+
+    ``adv_coef_3rd_scale`` (0-d tensor or None; the config_coef_3rd_order scale) multiplies each third-order
+    coefficient; 1.0 is bitwise neutral.
+    """
     velocity = uh_avg[edge_start:edge_end, :]
+    # The same 1.0 as a constant, not a loaded input: compiled, each slot's [edge, level] factor then
+    # reads four tensors, and Inductor inlines it into the tracer product it is broadcast into
+    # instead of storing it (with a fifth read it stores all ten factor fields).
+    one = torch.ones((), dtype=one.dtype, device=one.device)
     ten_slots = (slot_valid_matrix.sum(dim=1) == 10).view(-1, 1)
     # copysign(one, velocity) as a select (same bits, signed zeros included; Metal codegen has no copysign).
     velocity_sign = torch.where(torch.signbit(velocity), -one, one)
-    total = torch.zeros(
-        velocity.shape[0],
-        scalar_field.shape[1],
-        scalar_field.shape[2],
-        dtype=scalar_field.dtype,
-        device=scalar_field.device,
-    )
+    total: torch.Tensor | None = None
     for slot in range(slot_count):
         a = adv_coef[:, slot].view(-1, 1)
         b = adv_coef_3rd[:, slot].view(-1, 1)
-        scalar = gather_rows(scalar_field, slot_cells_matrix[:, slot])
-        # Select completed contributions, not a broadcast weight field. This keeps the
-        # ordered products together instead of storing one [edge, level] weight per slot.
-        contribution = torch.where(
-            ten_slots.unsqueeze(2),
-            torch.where((velocity > 0.0).unsqueeze(2),
-                        (a + b).unsqueeze(2) * scalar, (a - b).unsqueeze(2) * scalar),
-            (velocity * (a + velocity_sign * b)).unsqueeze(2) * scalar,
+        if adv_coef_3rd_scale is not None:
+            b = b * adv_coef_3rd_scale
+        # The [edge, level] factor is selected before the tracer product: each element is the
+        # same single product as selecting completed [edge, level, tracer] products, without
+        # two full-size candidates per slot.
+        factor = torch.where(
+            ten_slots,
+            torch.where(velocity > 0.0, a + b, a - b),
+            velocity * (a + velocity_sign * b),
         )
+        scalar = gather_rows(scalar_field, slot_cells_matrix[:, slot])
         contribution = torch.where(
             slot_valid_matrix[:, slot].view(-1, 1, 1),
-            contribution,
-            torch.zeros_like(contribution),
+            factor.unsqueeze(2) * scalar,
+            0.0,
         )
-        added = total + contribution
-        total = torch.where(ten_slots.unsqueeze(2), contribution, added) if slot == 0 else added
+        del scalar, factor
+        if total is None:
+            # Ten-slot edges start from their first contribution; the others from 0 + it, as
+            # the source's zero-initialized sum (0 + -0 is +0).
+            total = torch.where(ten_slots.unsqueeze(2), contribution, contribution + 0.0)
+        else:
+            total = _accumulate_ordered_slot(total, contribution)
+        del contribution
     return torch.where(ten_slots.unsqueeze(2), velocity.unsqueeze(2) * total, total)
 
 
@@ -1634,6 +1317,7 @@ def _monotonic_scalar_transport_streaming_scale_prepare_numeric(
     scalar_new_all_patch: torch.Tensor,
     scalars_new_base_patch: torch.Tensor,
     rdnw: torch.Tensor,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1663,6 +1347,7 @@ def _monotonic_scalar_transport_streaming_scale_prepare_numeric(
         adv_coef_3rd=pattern_adv_coef_3rd,
         slot_cells_matrix=pattern_slot_cells,
         slot_valid_matrix=pattern_slot_valid,
+        adv_coef_3rd_scale=coef_3rd_scale,
     )
     flux_edge_patch = _monotonic_scalar_transport_masked_value_or_zero(
         flux_candidate,
@@ -1854,6 +1539,7 @@ def _monotonic_scalar_transport_streaming_limited_update_numeric(
     scalar_new_all_patch: torch.Tensor,
     scalars_new_base_patch: torch.Tensor,
     rdnw: torch.Tensor,
+    coef_3rd_scale: torch.Tensor | None = None,  # read by the prepare phase only
     prepared: tuple[torch.Tensor, ...],
     scale_row_end: int | None = None,
 ) -> tuple[
@@ -2068,6 +1754,7 @@ def _monotonic_scalar_transport_streaming_scalar_transport_tile_numeric(
     scalar_new_all_patch: torch.Tensor,
     scalars_new_base_patch: torch.Tensor,
     rdnw: torch.Tensor,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -2138,6 +1825,7 @@ def _monotonic_scalar_transport_streaming_scalar_transport_tile_numeric(
         "scalar_new_all_patch": scalar_new_all_patch,
         "scalars_new_base_patch": scalars_new_base_patch,
         "rdnw": rdnw,
+        "coef_3rd_scale": coef_3rd_scale,
     }
     prepared = _monotonic_scalar_transport_streaming_scale_prepare_numeric(
         *static_args, **dynamic_tensors
@@ -2154,21 +1842,49 @@ def _monotonic_scalar_transport_streaming_scalar_transport_store_numeric(
     scalars_new_base: torch.Tensor,
     store_start: int,
     store_end: int,
+    bounds_arguments: Mapping[str, Any] | None = None,
     **dynamic_tensors: torch.Tensor,
 ) -> tuple[torch.Tensor, ...]:
     """The single-tile streaming transport followed by the scalars_new row store.
 
-    Returns the tile outputs with the new-scalar patch replaced by
-    ``scalars_new_base`` with rows ``store_start:store_end`` set to that patch,
-    written once inside the region instead of a patch copied into the base
-    afterwards. The base is only read.
+    Returns ``scalars_new_base`` with rows ``store_start:store_end`` set to the
+    tile's new-scalar patch, written once inside the region instead of a patch
+    copied into the base afterwards, then the tile's scratch outputs. The base
+    is only read. The tile's limited scalar (``scalar_stage2``, read only by the
+    scratch pack, which this region never serves) is not returned, so the
+    region need not store it beside the packed rows.
+
+    With ``bounds_arguments`` (the remaining arguments of
+    ``_monotonic_scalar_transport_vertical_neighbor_bounds_numeric``) the
+    region first forms the tile's s_max, s_min and wdtn patches from its own
+    scalar_old_all, scalar_field (the new scalars), ww_avg_rows and
+    coef_3rd_scale, the same call the separate bounds region makes, so those
+    patches need not be stored between two regions.
+
+    Compiled inference keeps this second form of the store because it saves the stored bounds
+    and the patch copy; its values are those of the separate bounds region and row copy.
     """
+    if bounds_arguments is not None:
+        s_max_patch, s_min_patch, wdtn_patch = (
+            _monotonic_scalar_transport_vertical_neighbor_bounds_numeric(
+                scalar_old_all=dynamic_tensors["scalar_old_all"],
+                scalar_new_all=dynamic_tensors["scalar_field"],
+                ww=dynamic_tensors["ww_avg_rows"],
+                coef_3rd_scale=dynamic_tensors.get("coef_3rd_scale"),
+                **bounds_arguments,
+            )
+        )
+        dynamic_tensors = {
+            **dynamic_tensors,
+            "s_max_patch": s_max_patch,
+            "s_min_patch": s_min_patch,
+            "wdtn_patch": wdtn_patch,
+        }
     outputs = _monotonic_scalar_transport_streaming_scalar_transport_tile_numeric(
         *static_args,  # type: ignore[arg-type]
         **dynamic_tensors,
     )
     return (
-        outputs[0],
         _replace_row_slice(scalars_new_base, store_start, store_end, outputs[1]),
         *outputs[2:],
     )
@@ -2425,6 +2141,7 @@ def _monotonic_scalar_transport_streaming_scalar_transport_tile_region(
     scalar_new_all_patch: torch.Tensor,
     scalars_new_base_patch: torch.Tensor,
     rdnw: torch.Tensor,
+    coef_3rd_scale: torch.Tensor | None = None,
     edge_cell_relation: StaticPairRelation,
     cell_edge_relation: StaticSlotRelation,
     bdy_mask: torch.Tensor,
@@ -2479,6 +2196,7 @@ def _monotonic_scalar_transport_streaming_scalar_transport_tile_region(
         scalar_new_all_patch=scalar_new_all_patch,
         scalars_new_base_patch=scalars_new_base_patch,
         rdnw=rdnw,
+        coef_3rd_scale=coef_3rd_scale,
     )
 
 
@@ -2501,6 +2219,7 @@ def _monotonic_scalar_transport_streaming_scalar_transport_region(
     scalar_new_all_patch: torch.Tensor,
     scalars_new_base_patch: torch.Tensor,
     rdnw: torch.Tensor,
+    coef_3rd_scale: torch.Tensor | None = None,
     edge_cell_relation: StaticPairRelation,
     cell_edge_relation: StaticSlotRelation,
     bdy_mask: torch.Tensor,
@@ -2603,6 +2322,7 @@ def _monotonic_scalar_transport_streaming_scalar_transport_region(
                 scalar_new_all_patch=scalar_new_all_patch,
                 scalars_new_base_patch=scalars_new_base_patch,
                 rdnw=rdnw,
+                coef_3rd_scale=coef_3rd_scale,
             ),
         )
 
@@ -2654,6 +2374,7 @@ def _monotonic_scalar_transport_streaming_scalar_transport_region(
             scalar_new_all_patch=scalar_new_all_patch[..., scalar_start:scalar_end],
             scalars_new_base_patch=scalars_new_base_patch[..., scalar_start:scalar_end],
             rdnw=rdnw,
+            coef_3rd_scale=coef_3rd_scale,
         )
         if assemble_functionally:
             scalar_stage2_chunks.append(scalar_stage2_tile)
@@ -2774,7 +2495,9 @@ def _monotonic_scalar_transport_source_tendency_numeric(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply the source tendency to the solve rows, then zero the tendency.
 
-    Same expression and order as the former inline block.
+    Same expression and order as the former inline block. The tendency is only
+    read: its zeroed rows go into a new field (it may be a broadcast zero, see
+    stencil_ops._read_only_zeros).
     """
     rows = slice(read_start, read_stop)
     scalars_old_patch = scalars_old[rows, :, :] + dt * scalar_tend[
@@ -2789,6 +2512,7 @@ def _monotonic_scalar_transport_source_tendency_numeric(
             _monotonic_scalar_transport_zero_row_patch_like(
                 scalar_tend, write_start, write_end
             ),
+            preserve_base=True,
         ),
     )
 
@@ -3389,8 +3113,12 @@ def atm_advance_scalars_mono_work(
     _numeric_plan: MonotonicScalarTransportNumericPlan | None = None,
     _chunk_checkpoint: Callable[[Callable[[], dict]], dict] | None = None,
     _emit_scratch_outputs: bool = True,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> dict:
     """Public monotonic-scalar-transport entrypoint with runner-owned scalar chunk orchestration.
+
+    ``coef_3rd_scale`` (0-d tensor or None; ``config["parameter_scales"]["config_coef_3rd_order"]``) multiplies
+    coef_3rd_order and adv_coefs_3rd at their uses; 1.0 is bitwise neutral.
 
     ``_emit_scratch_outputs=False`` (a runner whose caller drops the Fortran
     scratch fields after the step) runs every chunk through the no-scratch
@@ -3481,6 +3209,7 @@ def atm_advance_scalars_mono_work(
             num_scalars=num_scalars,
             dt=dt,
             coef_3rd_order=coef_3rd_order,
+            coef_3rd_scale=coef_3rd_scale,
             nCellsSolve=nCellsSolve,
             cellStart=cellStart,
             cellEnd=cellEnd,
@@ -3675,6 +3404,8 @@ def atm_advance_scalars_mono_work(
         scalars_old_chunks: list[torch.Tensor] = []
         scalar_tend_chunks: list[torch.Tensor] = []
     else:
+        if 0 in scalar_tend.stride():  # a broadcast zero: the chunks write their slices into it
+            scalar_tend = scalar_tend.contiguous()
         scalars_new_result = scalars_new
         scalars_old_result = scalars_old
         scalar_tend_result = scalar_tend
@@ -3702,6 +3433,7 @@ def atm_advance_scalars_mono_work(
             num_scalars=scalar_end - scalar_start,
             dt=dt,
             coef_3rd_order=coef_3rd_order,
+            coef_3rd_scale=coef_3rd_scale,
             nCellsSolve=nCellsSolve,
             cellStart=cellStart,
             cellEnd=cellEnd,
@@ -3886,6 +3618,7 @@ def _atm_advance_scalars_mono_work_no_chunk(
     _reduction_slot_tile_width: int | None = None,
     _streaming_scalar_tile_width: int | None = None,
     _numeric_plan: MonotonicScalarTransportNumericPlan | None = None,
+    coef_3rd_scale: torch.Tensor | None = None,
 ) -> dict:
     """
     Advance scalar fields using flux-corrected transport (FCT) for monotonicity.
@@ -4200,6 +3933,22 @@ def _atm_advance_scalars_mono_work_no_chunk(
                 rho_zz_new[solve_cell_slice, :],
             )
 
+    # Compiled single-tile forward of the unchunked transport
+    # (_store_scalars_new_in_region, set by atm_advance_scalars_mono_work
+    # outside autograd): the region also stores the new-scalar rows into a new
+    # full field (scalars_new_out is only read), replacing the patch copy
+    # below, and forms the bounds of step 3b itself. scalars_new_out is step-owned (see the caller's holder check in
+    # time_integration). Scalar chunks keep their in-place slice writes.
+    store_in_region = (
+        _store_scalars_new_in_region
+        and "monotonic_scalar_transport_streaming_scalar_transport_region"
+        in compile_region_names
+        and exchanger is None
+        and not _pack_scratch_outputs
+        and not _return_compact_scalars_new_patch
+        and streaming_scalar_tile_width >= num_scalars
+    )
+
     # =========================================================================
     # PART 3: Vectorized over scalar dimension
     # =========================================================================
@@ -4218,25 +3967,32 @@ def _atm_advance_scalars_mono_work_no_chunk(
         # Step 3b: vertical/local and neighbor bounds plus the vertical flux,
         # one pure numeric region (compiled when selected).
         cell_slice = solve_cell_slice
-        bounds_region = _maybe_compile_monotonic_scalar_transport_region(
-            "monotonic_scalar_transport_vertical_neighbor_bounds_region",
-            _monotonic_scalar_transport_vertical_neighbor_bounds_numeric,
-        )
-        s_max_patch, s_min_patch, wdtn_patch = bounds_region(
-            scalar_old_all=scalar_old_all,
-            scalar_new_all=scalar_new_all,
-            ww=wwAvg[solve_cell_slice, :],
-            fnm=fnm,
-            fnp=fnp,
-            neighbor_relation=neighbor_cell_relation,
-            flux_divisor=_monotonic_scalar_transport_flux_divisor(scalar_old_all),
-            cell_start=int(solve_cell_slice.start),
-            cell_stop=int(solve_cell_slice.stop),
-            n_vert_levels=int(nVertLevels),
-            coef_3rd_order=float(coef_3rd_order),
-            prefer_low_memory=prefer_low_memory_reductions,
-            reduction_slot_tile_width=reduction_slot_tile_width,
-        )
+        bounds_arguments = {
+            "fnm": fnm,
+            "fnp": fnp,
+            "neighbor_relation": neighbor_cell_relation,
+            "flux_divisor": _monotonic_scalar_transport_flux_divisor(scalar_old_all),
+            "cell_start": int(solve_cell_slice.start),
+            "cell_stop": int(solve_cell_slice.stop),
+            "n_vert_levels": int(nVertLevels),
+            "coef_3rd_order": float(coef_3rd_order),
+            "prefer_low_memory": prefer_low_memory_reductions,
+            "reduction_slot_tile_width": reduction_slot_tile_width,
+        }
+        if store_in_region:
+            s_max_patch = s_min_patch = wdtn_patch = None
+        else:
+            bounds_region = _maybe_compile_monotonic_scalar_transport_region(
+                "monotonic_scalar_transport_vertical_neighbor_bounds_region",
+                _monotonic_scalar_transport_vertical_neighbor_bounds_numeric,
+            )
+            s_max_patch, s_min_patch, wdtn_patch = bounds_region(
+                scalar_old_all=scalar_old_all,
+                scalar_new_all=scalar_new_all,
+                ww=wwAvg[solve_cell_slice, :],
+                coef_3rd_scale=coef_3rd_scale,
+                **bounds_arguments,
+            )
 
     edge_dv_patch = edge_dv if isinstance(edge_dv, torch.Tensor) else dvEdge[edge_slice]
     solve_rel_start = py_cellSolveStart - py_cellStart
@@ -4363,21 +4119,6 @@ def _atm_advance_scalars_mono_work_no_chunk(
             return_scratch,
         )
 
-    # Compiled single-tile forward of the unchunked transport
-    # (_store_scalars_new_in_region, set by atm_advance_scalars_mono_work
-    # outside autograd): the region also stores the new-scalar rows into a new
-    # full field (scalars_new_out is only read), replacing the patch copy
-    # below. scalars_new_out is step-owned (see the caller's holder check in
-    # time_integration). Scalar chunks keep their in-place slice writes.
-    store_in_region = (
-        _store_scalars_new_in_region
-        and "monotonic_scalar_transport_streaming_scalar_transport_region"
-        in compile_region_names
-        and exchanger is None
-        and not _pack_scratch_outputs
-        and not _return_compact_scalars_new_patch
-        and streaming_scalar_tile_width >= num_scalars
-    )
     streaming_transport_tile_region = (
         _monotonic_scalar_transport_streaming_scalar_transport_tile_region
     )
@@ -4402,23 +4143,21 @@ def _atm_advance_scalars_mono_work_no_chunk(
             "ww_avg_rows": wwAvg[cell_slice, :],
             "uh_avg_edges": uhAvg[edge_slice, :],
             "dv_edge_patch": edge_dv_patch,
-            "wdtn_patch": wdtn_patch,
-            "s_max_patch": s_max_patch,
-            "s_min_patch": s_min_patch,
             "rho_zz_int_rows": rho_zz_int_out[cell_slice, :],
             "scalar_new_all_patch": scalar_new_all[all_cell_slice, :, :],
             "scalars_new_base_patch": scalars_new_out[all_cell_slice, :, :],
             "rdnw": rdnw,
+            "coef_3rd_scale": coef_3rd_scale,
         }
         with _monotonic_scalar_transport_profile(
             "mpas.monotonic_scalar_transport.streaming_scalar_transport"
         ):
             (
-                scalar_stage2,
                 scalars_new_out,
                 *streaming_scratch,
             ) = _streaming_transport_tile_variant(False, store=True)(
                 **store_tile_tensors,
+                bounds_arguments=bounds_arguments,
                 scalars_new_base=scalars_new_out,
                 store_start=py_cellStart,
                 store_end=py_cellEnd,
@@ -4453,6 +4192,7 @@ def _atm_advance_scalars_mono_work_no_chunk(
                 scalar_new_all_patch=scalar_new_all[all_cell_slice, :, :],
                 scalars_new_base_patch=scalars_new_out[all_cell_slice, :, :],
                 rdnw=rdnw,
+                coef_3rd_scale=coef_3rd_scale,
                 edge_cell_relation=edge_cell_relation,
                 cell_edge_relation=cell_edge_reduce_relation,
                 bdy_mask=conn["bdy_mask"],

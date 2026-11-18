@@ -5,12 +5,12 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
-import math
 
 import numpy as np
 
@@ -51,18 +51,11 @@ class TempoFrozenTables:
     file_records: tuple[TableFileRecord, ...]
     mmap_enabled: bool
 
-    @property
-    def resident_payload_bytes(self) -> int:
-        if self.mmap_enabled:
-            return 0
-        return int(sum(array.nbytes for array in self.arrays.values()))
-
-    @property
-    def logical_payload_bytes(self) -> int:
-        return int(sum(array.nbytes for array in self.arrays.values()))
 
     def native_array(self, name: str) -> np.ndarray:
-        return np.asarray(self.arrays[name], dtype=self.arrays[name].dtype.newbyteorder("="))
+        return np.asarray(
+            self.arrays[name], dtype=self.arrays[name].dtype.newbyteorder("=")
+        )
 
 
 F64 = np.dtype(">f8")
@@ -146,7 +139,9 @@ def load_tables(
                 filename=filename,
                 expected_bytes=expected,
                 observed_bytes=observed,
-                access="sequential_record" if filename == "ccn_activate.bin" else "stream",
+                access="sequential_record"
+                if filename == "ccn_activate.bin"
+                else "stream",
                 status=status,
             )
         )
@@ -187,8 +182,12 @@ def read_table_array(
         )
     with path.open("rb") as handle:
         handle.seek(offset)
-        data = np.frombuffer(handle.read(spec.byte_count), dtype=spec.dtype, count=spec.entries)
-    return np.array(data.reshape(spec.shape, order="F"), dtype=spec.dtype.newbyteorder("="))
+        data = np.frombuffer(
+            handle.read(spec.byte_count), dtype=spec.dtype, count=spec.entries
+        )
+    return np.array(
+        data.reshape(spec.shape, order="F"), dtype=spec.dtype.newbyteorder("=")
+    )
 
 
 def validate_ccn_record_markers(path: Path, payload_bytes: int) -> None:
@@ -202,7 +201,20 @@ def validate_ccn_record_markers(path: Path, payload_bytes: int) -> None:
         )
 
 
-CHECKPOINT_FIELDS = ("t", "p", "w", "dz", "qv", "qc", "qr", "qi", "qs", "qg", "ni", "nr")
+CHECKPOINT_FIELDS = (
+    "t",
+    "p",
+    "w",
+    "dz",
+    "qv",
+    "qc",
+    "qr",
+    "qi",
+    "qs",
+    "qg",
+    "ni",
+    "nr",
+)
 
 
 MIN_QV = np.float64(1.0e-10)
@@ -310,10 +322,31 @@ TENDENCY_FIELDS = (
 )
 
 
-SNOW_MOMENT_FIELDS = ("smo0", "smo1", "smo2", "smob", "smoc", "smoe", "smof", "smog", "smoz", "ns")
+SNOW_MOMENT_FIELDS = (
+    "smo0",
+    "smo1",
+    "smo2",
+    "smob",
+    "smoc",
+    "smoe",
+    "smof",
+    "smog",
+    "smoz",
+    "ns",
+)
 
 
-FALLSPEED_FIELDS = ("vtrr", "vtnr", "vtrs", "vtri", "vtni", "vtrc", "vtnc", "vtrg", "vtng")
+FALLSPEED_FIELDS = (
+    "vtrr",
+    "vtnr",
+    "vtrs",
+    "vtri",
+    "vtni",
+    "vtrc",
+    "vtnc",
+    "vtrg",
+    "vtng",
+)
 
 
 PRECIP_DIAG_FIELDS = (
@@ -449,13 +482,35 @@ LAM1 = np.float64(3.29)
 
 
 SA = np.array(
-    [5.065339, -0.062659, -3.032362, 0.029469, -0.000285, 0.31255, 0.000204, 0.003199, 0.0, -0.015952],
+    [
+        5.065339,
+        -0.062659,
+        -3.032362,
+        0.029469,
+        -0.000285,
+        0.31255,
+        0.000204,
+        0.003199,
+        0.0,
+        -0.015952,
+    ],
     dtype=np.float64,
 )
 
 
 SB = np.array(
-    [0.476221, -0.015896, 0.165977, 0.007468, -0.000141, 0.060366, 0.000079, 0.000594, 0.0, -0.003577],
+    [
+        0.476221,
+        -0.015896,
+        0.165977,
+        0.007468,
+        -0.000141,
+        0.060366,
+        0.000079,
+        0.000594,
+        0.0,
+        -0.003577,
+    ],
     dtype=np.float64,
 )
 
@@ -572,7 +627,9 @@ CCE = np.array(
 )
 
 
-CCG = np.array([[math.gamma(float(value)) for value in row] for row in CCE], dtype=np.float64)
+CCG = np.array(
+    [[math.gamma(float(value)) for value in row] for row in CCE], dtype=np.float64
+)
 
 
 OCG1 = np.float64(1.0) / CCG[0]
@@ -612,11 +669,23 @@ NRHG = 9
 IDX_BG1 = 6
 
 
-RHO_G = np.array([50.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0], dtype=np.float64)
+RHO_G = np.array(
+    [50.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0], dtype=np.float64
+)
 
 
 AV_G = np.array(
-    [45.9173813, 67.0867386, 98.0158463, 122.353378, 143.204224, 161.794724, 178.762115, 194.488785, 209.225876],
+    [
+        45.9173813,
+        67.0867386,
+        98.0158463,
+        122.353378,
+        143.204224,
+        161.794724,
+        178.762115,
+        194.488785,
+        209.225876,
+    ],
     dtype=np.float64,
 )
 
@@ -681,7 +750,9 @@ for _m in range(NRHG):
     CGE[10, _m] = 0.5 * (BV_G[_m] + 5.0 + 2.0 * MU_G)
 
 
-CGG = np.array([[math.gamma(float(value)) for value in row] for row in CGE], dtype=np.float64)
+CGG = np.array(
+    [[math.gamma(float(value)) for value in row] for row in CGE], dtype=np.float64
+)
 
 
 OGE1 = np.float64(1.0) / CGE[0, 0]
@@ -803,16 +874,40 @@ def _warm_rain_efficiency() -> np.ndarray:
                 elif dr[i] < 125.0e-6:
                     ef_rw = -0.00066842 * x * x + 0.061542 * x - 0.37089
                 elif dr[i] < 175.0e-6:
-                    ef_rw = 4.091e-06 * x * x * x * x - 0.00030908 * x * x * x + 0.0066237 * x * x - 0.0013687 * x - 0.073022
+                    ef_rw = (
+                        4.091e-06 * x * x * x * x
+                        - 0.00030908 * x * x * x
+                        + 0.0066237 * x * x
+                        - 0.0013687 * x
+                        - 0.073022
+                    )
                 elif dr[i] < 250.0e-6:
-                    ef_rw = 9.6719e-5 * x * x * x - 0.0068901 * x * x + 0.17305 * x - 0.65988
+                    ef_rw = (
+                        9.6719e-5 * x * x * x
+                        - 0.0068901 * x * x
+                        + 0.17305 * x
+                        - 0.65988
+                    )
                 elif dr[i] < 350.0e-6:
-                    ef_rw = 9.0488e-5 * x * x * x - 0.006585 * x * x + 0.16606 * x - 0.56125
+                    ef_rw = (
+                        9.0488e-5 * x * x * x - 0.006585 * x * x + 0.16606 * x - 0.56125
+                    )
                 else:
-                    ef_rw = 0.00010721 * x * x * x - 0.0072962 * x * x + 0.1704 * x - 0.46929
+                    ef_rw = (
+                        0.00010721 * x * x * x
+                        - 0.0072962 * x * x
+                        + 0.1704 * x
+                        - 0.46929
+                    )
             else:
                 # Preserve the original coefficient-first products before cancellation.
-                vtr = -0.1021 + 4.932e3 * dr[i] - 0.9551e6 * dr[i] * dr[i] + 0.07934e9 * dr[i] * dr[i] * dr[i] - 0.002362e12 * dr[i] * dr[i] * dr[i] * dr[i]
+                vtr = (
+                    -0.1021
+                    + 4.932e3 * dr[i]
+                    - 0.9551e6 * dr[i] * dr[i]
+                    + 0.07934e9 * dr[i] * dr[i] * dr[i]
+                    - 0.002362e12 * dr[i] * dr[i] * dr[i] * dr[i]
+                )
                 stokes = dc[j] * dc[j] * vtr * INIT_RHO_W / (9.0 * 1.718e-5 * dr[i])
                 reynolds = 9.0 * stokes / (p * p * INIT_RHO_W)
                 f = math.log(reynolds)
@@ -832,7 +927,10 @@ def _create_bins(numbins: int, lowbin: float, highbin: float) -> np.ndarray:
     xdx[0] = lowbin
     xdx[numbins] = highbin
     for n in range(1, numbins):
-        xdx[n] = math.exp(float(n) / float(numbins) * math.log(xdx[numbins] / xdx[0]) + math.log(xdx[0]))
+        xdx[n] = math.exp(
+            float(n) / float(numbins) * math.log(xdx[numbins] / xdx[0])
+            + math.log(xdx[0])
+        )
     bins = np.empty(numbins, dtype=np.float64)
     for n in range(numbins):
         bins[n] = math.sqrt(xdx[n] * xdx[n + 1])
@@ -881,7 +979,9 @@ R_UNI = _HOST.r_uni
 RHO_NOT0 = np.float64(101325.0) / (RDRY * T0)
 
 
-AR_VOLUME = np.float64(4.0) / np.float64(3.0) * PI * np.float64(2.5e-6) ** np.float64(3.0)
+AR_VOLUME = (
+    np.float64(4.0) / np.float64(3.0) * PI * np.float64(2.5e-6) ** np.float64(3.0)
+)
 
 
 R_C = np.array(R_R, dtype=np.float64, copy=True)
@@ -1056,7 +1156,10 @@ def _bin_widths(numbins: int, lowbin: float, highbin: float) -> np.ndarray:
     xdx[0] = lowbin
     xdx[numbins] = highbin
     for n in range(1, numbins):
-        xdx[n] = math.exp(float(n) / float(numbins) * math.log(xdx[numbins] / xdx[0]) + math.log(xdx[0]))
+        xdx[n] = math.exp(
+            float(n) / float(numbins) * math.log(xdx[numbins] / xdx[0])
+            + math.log(xdx[0])
+        )
     widths = np.empty(numbins, dtype=np.float64)
     for n in range(numbins):
         widths[n] = xdx[n + 1] - xdx[n]
@@ -1131,24 +1234,11 @@ T1_QS_ME = PI * np.float64(4.0) * C_SQRD * OLFUS * np.float64(0.86)
 
 
 T2_QS_ME = (
-    PI
-    * np.float64(4.0)
-    * C_SQRD
-    * OLFUS
-    * np.float64(0.28)
-    * SC3
-    * np.sqrt(AV_S)
+    PI * np.float64(4.0) * C_SQRD * OLFUS * np.float64(0.28) * SC3 * np.sqrt(AV_S)
 )
 
 
-T1_QG_ME = (
-    PI
-    * np.float64(4.0)
-    * C_CUBE
-    * OLFUS
-    * np.float64(0.86)
-    * CGG[9, 0]
-)
+T1_QG_ME = PI * np.float64(4.0) * C_CUBE * OLFUS * np.float64(0.86) * CGG[9, 0]
 
 
 TIMESTEP_CONVERSION_RIME_TO_RAIN = np.float64(120.0)
@@ -1172,10 +1262,14 @@ LFUS = LSUB - LVAP0
 TA_NA = np.array([10.0, 31.6, 100.0, 316.0, 1000.0, 3160.0, 10000.0], dtype=np.float64)
 
 
-TA_WW = np.array([0.01, 0.0316, 0.1, 0.316, 1.0, 3.16, 10.0, 31.6, 100.0], dtype=np.float64)
+TA_WW = np.array(
+    [0.01, 0.0316, 0.1, 0.316, 1.0, 3.16, 10.0, 31.6, 100.0], dtype=np.float64
+)
 
 
-TA_TK = np.array([243.15, 253.15, 263.15, 273.15, 283.15, 293.15, 303.15], dtype=np.float64)
+TA_TK = np.array(
+    [243.15, 253.15, 263.15, 273.15, 283.15, 293.15, 303.15], dtype=np.float64
+)
 
 
 T1_QR_EV = np.float64(0.78) * CRG[9]
@@ -1192,7 +1286,6 @@ def _drop_evap_number_table() -> np.ndarray:
     cloud_widths[1:] = cloud_diameters[1:] - cloud_diameters[:-1]
     cloud_number_bins = _cloud_number_bins()
     values = np.zeros((NBC, NTB_C, NBC), dtype=np.float64)
-    massc = INIT_AM_R * cloud_diameters**BM_R
     for k in range(NBC):
         nu_c = get_nuc(float(cloud_number_bins[k]))
         for j in range(NTB_C):
@@ -1204,7 +1297,12 @@ def _drop_evap_number_table() -> np.ndarray:
                 / R_C[j]
             ) ** OBMR
             n0_c = cloud_number_bins[k] * OCG1[nu_c - 1] * lamc ** CCE[0, nu_c - 1]
-            n_c = n0_c * cloud_diameters**nu_c * np.exp(-lamc * cloud_diameters) * cloud_widths
+            n_c = (
+                n0_c
+                * cloud_diameters**nu_c
+                * np.exp(-lamc * cloud_diameters)
+                * cloud_widths
+            )
             cumulative = np.cumsum(n_c)
             for i in range(NBC):
                 values[i, j, k] = cumulative[i]
@@ -1253,7 +1351,9 @@ def _hail_bins() -> tuple[np.ndarray, np.ndarray]:
     edges[0] = 500.0e-6
     edges[-1] = 0.075
     for index in range(1, NHBINS):
-        edges[index] = np.exp((index / NHBINS) * np.log(edges[-1] / edges[0]) + np.log(edges[0]))
+        edges[index] = np.exp(
+            (index / NHBINS) * np.log(edges[-1] / edges[0]) + np.log(edges[0])
+        )
     bins = np.sqrt(edges[:-1] * edges[1:])
     widths = edges[1:] - edges[:-1]
     return bins, widths
@@ -1291,13 +1391,21 @@ def complex_water_ray(lambda_radar: float, temperature_celsius: float) -> np.com
     ratio = lambdas / wavelength
     nenner = 1.0 + 2.0 * ratio ** (1.0 - alpha) * np.sin(alpha * PI * 0.5)
     nenner = nenner + ratio ** (2.0 - 2.0 * alpha)
-    epsr = epsinf + ((epss - epsinf) * (ratio ** (1.0 - alpha) * np.sin(alpha * PI * 0.5) + 1.0)) / nenner
-    epsi = ((epss - epsinf) * (ratio ** (1.0 - alpha) * np.cos(alpha * PI * 0.5))) / nenner
+    epsr = (
+        epsinf
+        + ((epss - epsinf) * (ratio ** (1.0 - alpha) * np.sin(alpha * PI * 0.5) + 1.0))
+        / nenner
+    )
+    epsi = (
+        (epss - epsinf) * (ratio ** (1.0 - alpha) * np.cos(alpha * PI * 0.5))
+    ) / nenner
     epsi = epsi + wavelength * 1.25664 / 1.88496
     return np.complex128(np.sqrt(np.complex128(complex(epsr, -epsi))))
 
 
-def complex_ice_maetzler(lambda_radar: float, temperature_celsius: float) -> np.complex128:
+def complex_ice_maetzler(
+    lambda_radar: float, temperature_celsius: float
+) -> np.complex128:
     """Complex refractive index of ice from Maetzler (1998)."""
 
     wavelength = np.float64(lambda_radar)
@@ -1314,16 +1422,22 @@ def complex_ice_maetzler(lambda_radar: float, temperature_celsius: float) -> np.
     beta = betam + deltabeta
     theta = 300.0 / tk - 1.0
     alfa = (0.00504 + 0.0062 * theta) * np.exp(-22.1 * theta)
-    refractive_index = complex(3.1884 + 9.1e-4 * (tk - 273.16), alfa / frequency + beta * frequency)
+    refractive_index = complex(
+        3.1884 + 9.1e-4 * (tk - 273.16), alfa / frequency + beta * frequency
+    )
     return np.complex128(np.sqrt(np.conj(np.complex128(refractive_index))))
 
 
-def _create_bins_with_widths(numbins: int, lowbin: float, highbin: float) -> tuple[np.ndarray, np.ndarray]:
+def _create_bins_with_widths(
+    numbins: int, lowbin: float, highbin: float
+) -> tuple[np.ndarray, np.ndarray]:
     xdx = np.empty(numbins + 1, dtype=np.float64)
     xdx[0] = lowbin
     xdx[numbins] = highbin
     for n in range(1, numbins):
-        xdx[n] = np.exp(float(n) / float(numbins) * np.log(xdx[numbins] / xdx[0]) + np.log(xdx[0]))
+        xdx[n] = np.exp(
+            float(n) / float(numbins) * np.log(xdx[numbins] / xdx[0]) + np.log(xdx[0])
+        )
     bins = np.sqrt(xdx[:-1] * xdx[1:])
     widths = xdx[1:] - xdx[:-1]
     return bins, widths

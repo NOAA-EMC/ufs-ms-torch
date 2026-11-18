@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 from mpas_pytorch.constants import UFS_CONSTANTS, ConstantsProfile
 from mpas_pytorch.diagnostics import physics_interface_surface_pressure
 
@@ -66,7 +67,7 @@ def _wind_extents(native: NativeAtmosphere, stateout: Stateout) -> tuple[int, in
         _working_on_device(name, value, device, dtype)
         if value.ndim != 2 or value.shape[0] < n or value.shape[1] != levels:
             raise ValueError(f"invalid Stateout wind extent: {name}")
-        torch._assert_async(
+        torch_compat.assert_async(
             (torch.isfinite(value[:n]) & (torch.abs(value[:n]) <= 10000.0)).all(),
             "invalid CCPP wind",
         )
@@ -162,7 +163,7 @@ def commit_momentum(
             raise ValueError(
                 "exchanged wind increment extent does not match native buffer"
             )
-    torch._assert_async(
+    torch_compat.assert_async(
         (
             (
                 exchanged_increment.zonal[:n]
@@ -177,7 +178,7 @@ def commit_momentum(
     )
     pairs = pairs[:ne]
     valid = (pairs >= 1) & (pairs <= nc)
-    torch._assert_async(
+    torch_compat.assert_async(
         valid.any(dim=1).all(), "native solve edge has no valid CCPP wind donor"
     )
     # Safe gather indices do not turn an invalid donor into a physical donor.
@@ -224,7 +225,7 @@ def commit_momentum(
     updated_u = u[:ne] + increment
     updated_ru = updated_u * density_sum / torch.clamp_min(donor_count, 1.0)
     for value in (increment, updated_u, updated_ru):
-        torch._assert_async(
+        torch_compat.assert_async(
             torch.isfinite(value).all(), "nonfinite committed edge momentum"
         )
     atmosphere = replace(
@@ -294,7 +295,7 @@ def commit_surface_pressure(
         zgrid=mesh.zgrid[:n],
         gravity=constants.G,
     )
-    torch._assert_async(
+    torch_compat.assert_async(
         torch.isfinite(result).all(), "nonfinite committed surface pressure"
     )
     return replace(

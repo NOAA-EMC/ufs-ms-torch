@@ -8,7 +8,7 @@ from __future__ import annotations
 import torch
 
 from sa_sas_deep_convection_torch.compile import run_compile_island
-from sa_sas_deep_convection_torch.constants import KM, NDTEND, NN, NTR
+from sa_sas_deep_convection_torch.constants import NDTEND
 from sa_sas_deep_convection_torch.samf_interstitials import (
     IMP_PHYSICS_CODES,
     ConvectionTracerLayout,
@@ -18,39 +18,9 @@ from sa_sas_deep_convection_torch.samf_interstitials import (
 )
 from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real, tracer_layout
 
-CHECKPOINT_FIELDS = (
-    "gt0",
-    "gu0",
-    "gv0",
-    "gq0",
-    "dtdt",
-    "dudt",
-    "dvdt",
-    "dqdt",
-    "dtend",
-    "upd_mf",
-    "dwn_mf",
-    "det_mf",
-    "cnvw_phy_f3d",
-    "cnvc_phy_f3d",
-    "rainc",
-    "cldwrk",
-    "ten_q",
-    "cnvw",
-    "cnvc",
-    "clw",
-    "errflg",
-)
 
 # CCPP GFS_typedefs.F90 microphysics codes (shared with the shallow port).
 IMP_PHYSICS_GFDL = IMP_PHYSICS_CODES["gfdl"]
-IMP_PHYSICS_THOMPSON = IMP_PHYSICS_CODES["thompson"]
-# GFS_DCNV_generic_post refreshes clw ice/water for these codes only; any other
-# code falls through and leaves clw ice/water untouched. TEMPO is included per the
-# GFS v17 TEMPO+RRTMGP reference patch, which adds it to the Thompson branch.
-CLW_ICE_WATER_CODES = frozenset(
-    IMP_PHYSICS_CODES[name] for name in ("thompson", "tempo", "nssl", "wsm6", "mg", "fer_hires")
-)
 
 
 def imp_physics_code(value: object) -> int | None:
@@ -258,6 +228,10 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
         frain,
         area,
         prsi,
+        state.require("q"),
+        state.require("phase_entry_temperature"),
+        state.require("rd"),
+        state.require("rv"),
         layout,
         is_gfdl,
         imp_physics,
@@ -342,6 +316,10 @@ def _generic_post_block(
     frain: torch.Tensor,
     area: torch.Tensor,
     prsi: torch.Tensor,
+    entry_qv: torch.Tensor,
+    entry_temperature: torch.Tensor,
+    rd: torch.Tensor,
+    rv: torch.Tensor,
     layout: ConvectionTracerLayout,
     is_gfdl: bool,
     imp_physics: int | None,
@@ -384,7 +362,8 @@ def _generic_post_block(
 
     if reconcile:
         gq0, gt0, reconcile_errflg = samf_water_reconciliation(
-            gq0, gt0, save_q, rn, area, prsi, frain, grav, cp, hvap, layout, delt=delt
+            gq0, gt0, save_q, rn, area, prsi, frain, grav, cp, hvap, layout, delt=delt, entry_qv=entry_qv,
+            entry_temperature=entry_temperature, con_rd=rd, con_rv=rv,
         )
         errflg = torch.maximum(errflg, reconcile_errflg)
 
@@ -444,5 +423,3 @@ def _generic_post_block(
     )
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

@@ -9,6 +9,7 @@ from dataclasses import dataclass, fields
 from typing import Mapping
 
 import torch
+from mpas_pytorch import _torch_compat as torch_compat
 
 R4_SURFACE_TAIL_SHAPES = {
     "vegtype_frac": (20,),
@@ -113,7 +114,7 @@ class NativeSurface:
             if values[name].dtype not in (torch.int32, torch.int64):
                 raise ValueError(f"native surface category is not an integer: {name}")
             limits = torch.iinfo(torch.int32)
-            torch._assert_async(
+            torch_compat.assert_async(
                 ((values[name] >= limits.min) & (values[name] <= limits.max)).all(),
                 f"native surface category exceeds source int32: {name}",
             )

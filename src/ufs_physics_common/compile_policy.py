@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """Exact-numerics policy for ``torch.compile`` over whole physics schemes.
 
-Measured on torch 2.8.0 with captured coupled inputs:
+Measured on torch 2.8.0 with captured coupled inputs (2026-10-15):
 
 * Inductor lowers ``x / c`` for a Python constant ``c`` to ``x * (1 / c)``, and
   ``x ** n`` for scalar ``n`` to multiplication chains (|n| >= 4, n <= -2) or to
@@ -41,21 +41,21 @@ Measured on torch 2.8.0 with captured coupled inputs:
   TEMPO's sedimentation snow moment differed at 2128 values. Keep that rounding.
 * Triton contracts ``a * b + c`` into FMA unless ``TRITON_DEFAULT_FP_FUSION=0``;
   eager CUDA runs the two operations as separate kernels.
+* The policy leaves Inductor's coordinate-descent tuning of Triton launch shapes at its default (off): it
+  changes only GPU launch configurations, not CPU code, and it lengthens the first compile. Set
+  ``TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1`` before the first compile to turn it on.
 * Inductor's in-place buffer reuse (``inplace_buffers``) gave wrong gradients for the RRTMGP SW
-  two-stream solver (``sw_solver_2stream_v17``): its compiled backward overwrote a saved
+  two-stream solver (``radiation_group._sw_solve``): its compiled backward overwrote a saved
   activation that other saved views (``unbind`` of one buffer) still read. Compiled VJPs were off
   by up to 7 % on random inputs and by 1e7 relative in the coupled radiation entry, while the
   forward, the FX graphs run eagerly and each compiled graph on cloned inputs were exact
-  (torch 2.8.0, CPU). Off in this policy; it changes where results are stored, not
+  (2026-10-18, torch 2.8.0, CPU). Off in this policy; it changes where results are stored, not
   their values.
 * Inductor decomposes ``aten._assert_async`` to nothing (torch 2.8 ``_inductor/decomposition.py``),
   and AOT tracing drops the one-argument form as dead code, so every finiteness, error-flag and
-  bound check inside a compiled region is off: a NaN raises in eager, not compiled.
-  ``set_compiled_asserts(True)`` keeps both forms as side-effecting ATen fallback calls
-  (``_keep_device_asserts``). That cost 9.7 % and 25 % of the compiled x1.10242 cycle (3.10 ->
-  3.40 s and 3.31 -> 4.14 s, CPU, 4 threads, two back-to-back pairs; 353 assert calls per plain
-  step), so it is off by default; the coupled interval driver checks the cycle state's finiteness
-  outside compiled code instead (``cycle.run_coupled_interval``).
+  bound check inside a compiled region is off: a NaN raises in eager, not compiled (2026-10-21).
+  The coupled interval driver checks the cycle state's finiteness outside compiled code instead
+  (``cycle.run_coupled_interval``).
 
 CPU backward reductions use ATen's tensor sum so parameter gradients keep eager's
 accumulation order and operand layout. Full backward reductions use it on CUDA too. Functional VJP regions
@@ -73,14 +73,22 @@ differences surviving in subnormal ice-number tracers. In FP64 Inductor's scalar
 ``torch.sum`` over a dimension in index order, while eager ATen adds the vector lanes first (four
 float64 values on arm64: ``(x0 + x2) + (x1 + x3)``); a recompiled variant can switch to the scalar
 code. The SA-TKE negative-energy borrowing sum then gave 1 ulp of TKE in one x1.10242 column at
-cycle 15 and a different 25-cycle state; Noah-MP soilwater ``rsat`` gave 1 ulp of
-``runoff`` in one x1.163842 column.
+cycle 15 and a different 25-cycle state (2026-10-27); Noah-MP soilwater ``rsat`` gave 1 ulp of
+``runoff`` in one x1.163842 column (2026-10-21).
+CPU floating minimum/maximum also keep ATen and its operand layouts. On arm64 their vector bodies
+and scalar tails choose different signed-zero operands. Scalar Inductor code otherwise changes
+one carried Noah-MP canopy-evaporation zero at +354 h, despite matching every published field.
+CPU FP32 clamp also keeps ATen: its vector body and scalar tail use different zero-tie rules.
 
 With this policy the compiled PBL, NSST, sea-ice and surface-layer calls are
 bitwise equal to eager on CPU. Install it before the first compilation. The
 policy id and a hash of this file enter Inductor's FX-graph cache key, so graphs compiled under
 different lowerings never share a cache entry, and a cache kept between runs never serves a graph
 lowered by an earlier version of this file.
+
+The policy and its state (the installed lowerings and patches, the compiled-region registry) are
+process-wide module globals, and no lock guards them. Install the policy from one thread, before the first
+compile of the process.
 """
 
 from __future__ import annotations
@@ -98,12 +106,12 @@ from pathlib import Path
 from typing import TypeVar
 
 import torch
-import torch.autograd.forward_ad as forward_ad
+from mpas_pytorch import _torch_compat as torch_compat
 from torch._inductor.custom_graph_pass import CustomGraphPass
 
 from ufs_physics_common import cost_meter
 
-POLICY_ID = "ufs-exact-numerics-v34"
+POLICY_ID = "ufs-exact-numerics-v36"
 # Every lowering and patch of the policy is in this file; its bytes key the compile cache.
 POLICY_KEY = POLICY_ID + "+src." + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 Result = TypeVar("Result")
@@ -111,7 +119,6 @@ _log = logging.getLogger(__name__)
 
 _installed = False
 _pointwise_factory_installed = False
-_compiled_asserts = False
 # Graphs one compiled region may hold, scoped to its calls (the process-wide limit stays 8). The
 # compaction capacity ladders give a region a static variant per rung: TEMPO's sedimentation tiers up
 # to 24 per shape (48 with column chunks), convection 5 or 10, the shortwave daylit buffer up to 6.
@@ -140,6 +147,59 @@ def eager_regions_active() -> bool:
     return _eager.get()
 
 
+# True while an orchestration region (``compiled(..., orchestration=True)``) runs or traces, outside its islands.
+# A module global, not a context variable: Dynamo reads it while tracing and guards on it (G257).
+_orchestrating = False
+
+
+def dispatcher(fn: Callable[..., Result]) -> Callable[..., Result]:
+    """Mark an island dispatcher: Dynamo inlines it into a region it traces, but never compiles it as a frame.
+
+    Inside an orchestration region Dynamo compiles every frame it enters; a dispatcher frame would compile
+    one variant per island it dispatches (167 for SA-SAS at x1.10242) until the recompile limit.
+    """
+    torch._dynamo.eval_frame.skip_code(fn.__code__)
+    return fn
+
+
+@torch.compiler.disable
+def _outside(call, args, kwargs):
+    """``call(*args, **kwargs)`` outside the orchestration region (a graph break while it traces)."""
+    global _orchestrating
+    previous, _orchestrating = _orchestrating, False
+    try:
+        return call(*args, **kwargs)
+    finally:
+        _orchestrating = previous
+
+
+@torch.compiler.disable
+def _outside_island(fn, normalize_layouts, /, *args, **kwargs):
+    # The island's region call leaves the orchestration itself (``_outside``).
+    return compiled(fn, normalize_layouts=normalize_layouts)(*args, **kwargs)
+
+
+@dispatcher
+def island(fn: Callable[..., Result], args: tuple, kwargs: dict | None = None, *,
+           normalize_layouts: bool) -> Result:
+    """A scheme's compiled tensor island called from its orchestration code: ``compiled(fn)``.
+
+    While a region traces, ``fn`` is inlined into it (``compiled``). Inside an orchestration region (tracing or
+    running) the island runs outside it, through its own region: a graph break while the orchestration traces, so
+    each island stays one region that its repeated calls reuse (G127) and only the code between islands joins the
+    orchestration graphs.
+    """
+    kwargs = {} if kwargs is None else kwargs
+    if _orchestrating:
+        return _outside_island(fn, normalize_layouts, *args, **kwargs)
+    return compiled(fn, normalize_layouts=normalize_layouts)(*args, **kwargs)
+
+
+def orchestrating() -> bool:
+    """True inside an orchestration region, outside its islands (``island`` then runs each island outside it)."""
+    return _orchestrating
+
+
 class _PolicyKey(CustomGraphPass):
     """No-op post-grad pass whose uuid separates cache entries by policy."""
 
@@ -147,7 +207,7 @@ class _PolicyKey(CustomGraphPass):
         return None
 
     def uuid(self) -> str:
-        return POLICY_KEY + ("+asserts" if _compiled_asserts else "")
+        return POLICY_KEY
 
 
 def _exact_div_prim(a, b):
@@ -365,8 +425,6 @@ def _preserve_scheduling_dependencies() -> None:
     from torch._inductor.dependencies import StarDep, WeakDep
     from torch.utils._ordered_set import OrderedSet
 
-    if torch.__version__.split("+")[0] != "2.8.0":
-        return
     original = scheduler.SchedulerNode.recompute_size_and_body
 
     @functools.wraps(original)
@@ -397,8 +455,7 @@ def _cached_fusion_scores() -> None:
     from torch._inductor.virtualized import V
     from torch.utils._ordered_set import OrderedSet
 
-    if torch.__version__.split("+")[0] != "2.8.0":
-        return  # the replacements mirror the 2.8.0 bodies
+    # The replacements mirror the 2.8.0 bodies (install_exact_numerics refuses any other release).
     _FUSION_ORIGINALS.update(score_fusion_memory=scheduler.Scheduler.score_fusion_memory,
                              can_fusion_increase_peak_memory=scheduler.Scheduler.can_fusion_increase_peak_memory)
 
@@ -467,6 +524,30 @@ def _make_mps_bounded_fusion(original):
     return can_fuse
 
 
+def _make_cuda_reduction_fusion(original):
+    """On CUDA, keep pointwise work over a reduction's whole (rows x reduced) range out of the reduction's kernel.
+
+    Inductor fuses such nodes into the reduction loop when the sizes match, so a long pointwise computation that
+    only shares the iteration space runs inside a per-row reduction kernel: TEMPO's microphysics rates beside the
+    column ``any`` of their supersaturation ran at 77-94 GB/s, 25 ms per 60 km step on an RTX PRO 6000 (round 8),
+    where the same rates as pointwise kernels run at 0.7-1.5 TB/s. The reduction reads the buffers it needs. Values
+    do not change: Triton contracts no multiply-adds under this policy (``TRITON_DEFAULT_FP_FUSION=0``).
+    """
+    @functools.wraps(original)
+    def can_fuse(self, node1, node2):
+        device = node1.get_device()
+        if device is not None and device.type == "cuda" and node1.is_reduction() != node2.is_reduction():
+            reduction, pointwise = (node1, node2) if node1.is_reduction() else (node2, node1)
+            groups = getattr(reduction, "group", None), getattr(pointwise, "group", None)
+            if all(isinstance(group, tuple) and len(group) == 2 for group in groups):
+                (numel, rnumel), (pnumel, prnumel) = groups[0][1], groups[1][1]
+                if rnumel != 1 and prnumel == 1 and pnumel == numel * rnumel:
+                    return False
+        return original(self, node1, node2)
+
+    return can_fuse
+
+
 def _make_mps_bounded_add(original):
     """Keep ordered lazy addition chains within one Metal argument table."""
     @functools.wraps(original)
@@ -487,26 +568,32 @@ def _make_mps_bounded_add(original):
 def _bound_mps_fusion() -> None:
     from torch._inductor import lowering, scheduler
 
-    if torch.__version__.split("+")[0] == "2.8.0":
-        scheduler.Scheduler.can_fuse = _make_mps_bounded_fusion(scheduler.Scheduler.can_fuse)
-        lowering.add = _make_mps_bounded_add(lowering.add)
-        for op in (torch.ops.aten.add.Tensor, torch.ops.aten.add.Scalar):
-            lowering.lowerings[op] = _make_mps_bounded_add(lowering.lowerings[op])
+    scheduler.Scheduler.can_fuse = _make_cuda_reduction_fusion(
+        _make_mps_bounded_fusion(scheduler.Scheduler.can_fuse))
+    lowering.add = _make_mps_bounded_add(lowering.add)
+    for op in (torch.ops.aten.add.Tensor, torch.ops.aten.add.Scalar):
+        lowering.lowerings[op] = _make_mps_bounded_add(lowering.lowerings[op])
 
 
-def _make_cpu_clamp(original, bound_wins):
-    """CPU clamp as eager: the argument wins a tie, so clamp_min(-0.0, 0.0) stays -0.0.
+def _make_cpu_clamp(original, bound_wins, aten_op):
+    """CPU FP64 clamp keeps its argument on ties; FP32 preserves native vector/tail rules.
 
     Inductor lowers clamp_min/clamp_max to maximum/minimum, where the bound wins
     the tie (+0.0). NaN arguments pass through both forms. CUDA keeps Inductor's
     lowering until its own eager tie rule is measured.
     """
     from torch._inductor import lowering
+    from torch._inductor.virtualized import V
+
+    native = lowering.fallback_handler(aten_op, add_to_fallback_set=False)
 
     def clamp(a, bound):
         if (not isinstance(bound, (int, float)) or isinstance(bound, bool)
                 or a.get_device().type != "cpu" or not lowering.is_float_dtype(a.get_dtype())):
             return original(a, bound)
+        if a.get_dtype() == torch.float32:
+            a = lowering.constrain_to_fake_tensor(a, V.graph.current_node.args[0].meta["val"])
+            return native(a, bound)
         def fn(x):
             limit = lowering.ops.constant(bound, a.get_dtype())
             beyond = bound_wins(x, limit)
@@ -514,6 +601,23 @@ def _make_cpu_clamp(original, bound_wins):
         return lowering.make_pointwise(fn)(a)
 
     return clamp
+
+
+def _make_cpu_minmax(original, aten_op):
+    """Preserve native floating signed-zero ties, including vector/scalar layout boundaries."""
+    from torch._inductor import lowering
+    from torch._inductor.virtualized import V
+
+    native = lowering.fallback_handler(aten_op, add_to_fallback_set=False)
+
+    def exact(a, b):
+        if a.get_device().type == "cpu" and a.get_dtype() in (torch.float32, torch.float64):
+            a = lowering.constrain_to_fake_tensor(a, V.graph.current_node.args[0].meta["val"])
+            b = lowering.constrain_to_fake_tensor(b, V.graph.current_node.args[1].meta["val"])
+            return native(a, b)
+        return original(a, b)
+
+    return exact
 
 
 _NUMERIC_INDEX = re.compile(r"^[0-9\s+\-*/()]+$")
@@ -566,7 +670,7 @@ def _normalize_tiling_solutions() -> None:
     Normalize before solving too: FloorDiv/ModularIndexing validation substitutes
     the solution back into the index expression. Keep all coalescing heuristics.
     A zero solution is no tile: the analyzer would divide the variable's range by it
-    (ZeroDivisionError compiling the UGWP v1 ``ngw_solv2`` training graph on CUDA).
+    (ZeroDivisionError compiling the UGWP v1 ``ngw_solv2`` training graph on CUDA, 2026-10-28).
     """
     from torch._inductor import tiling_utils
     from torch.utils._sympy.functions import Identity
@@ -679,48 +783,12 @@ def _route_backward_persistent_reductions() -> None:
     triton.TritonScheduling.define_kernel = define_kernel
 
 
-_ASSERT_OPS = (torch.ops.aten._assert_async.msg, torch.ops.aten._functional_assert_async.msg)
-# Eager's message for a failed one-argument torch._assert_async (aten/src/ATen/native/TensorCompare.cpp).
-_ASSERT_DEFAULT_MESSAGE = "Expected Tensor with single nonzero value, but got zero"
-
-
-def _keep_device_asserts() -> None:
-    """Lower ``aten._assert_async.msg`` to a side-effecting ATen fallback call (kept in the wrapper code).
-
-    The policy's decomposition table (``_policy_decompositions``) leaves the op in the graph; Inductor has
-    no lowering of its own, and a fallback kernel without outputs counts as dead unless it reports a side
-    effect. CPU raises in the call as eager does; CUDA runs the device assert kernel eager runs.
-    """
-    from torch._inductor import ir, lowering
-
-    lowering.make_fallback(torch.ops.aten._assert_async.msg, override_decomp=True)
-    original = ir.FallbackKernel.has_side_effects
-
-    def has_side_effects(self):
-        return getattr(self, "op_overload", None) is torch.ops.aten._assert_async.msg or original(self)
-
-    ir.FallbackKernel.has_side_effects = has_side_effects
-
-
-def set_compiled_asserts(enabled: bool) -> bool:
-    """Keep ``torch._assert_async`` checks inside compiled regions (default off); return the previous value.
-
-    Set it before the first compilation: regions compiled earlier keep their graphs. The setting enters
-    the policy's cache key, so graphs with and without the checks never share a cache entry.
-    """
-    global _compiled_asserts
-    if type(enabled) is not bool:
-        raise TypeError("compiled asserts switch requires a bool")
-    previous, _compiled_asserts = _compiled_asserts, enabled
-    return previous
-
-
 def _policy_decompositions(example_inputs=()) -> dict:
-    """Inductor's decomposition table; with ``set_compiled_asserts`` without the asserts' no-op decompositions."""
+    """Inductor's decomposition table, without ATen's tanh backward on CPU floating inputs."""
     from torch._inductor.decomposition import select_decomp_table
 
     table = select_decomp_table()
-    excluded = set(_ASSERT_OPS) if _compiled_asserts else set()
+    excluded = set()
     if any(isinstance(x, torch.Tensor) and x.device.type == "cpu" and x.dtype in (torch.float32, torch.float64)
            for x in example_inputs):
         # ATen's FP32 tail rounds differently from its decomposed (1 - y*y), and the GCC-built
@@ -729,31 +797,31 @@ def _policy_decompositions(example_inputs=()) -> dict:
     return {op: fn for op, fn in table.items() if op not in excluded} if excluded else table
 
 
-def _assert_messages(gm: torch.fx.GraphModule) -> int:
-    """Give each one-argument ``torch._assert_async`` eager's message: AOT tracing keeps only ``.msg``."""
-    if not _compiled_asserts:
-        return 0
-    count = 0
-    for node in gm.graph.nodes:
-        if node.op == "call_function" and node.target is torch._assert_async and len(node.args) == 1:
-            node.args = (*node.args, _ASSERT_DEFAULT_MESSAGE)
-            count += 1
-    if count:
-        gm.recompile()
-    return count
+_DRIVER_OOM_MESSAGES = ("Triton Error [CUDA]: out of memory", "CUDA driver error: out of memory")
 
 
 def _reclaim_driver_autotune_oom(original):
-    """Release unused Torch cache when CUDA needs memory outside its allocator."""
+    """Release unused Torch cache when CUDA needs memory outside its allocator, then retry once
+    (autotune benchmarks and kernel launches).
+
+    A spilling kernel's locals live in driver local memory, sized at its first launch for every
+    resident thread (13.6 KB per thread measured at 60 km, about 3 GB on an A100). The caching
+    allocator does not count it: after a radiation step it may hold most of the device as unused
+    cache, and the launch (or an autotune benchmark) then fails with a driver out-of-memory error.
+    A failed launch has not run, so one retry after the cache is released repeats nothing. Both launchers
+    report the error: Triton's Python launcher ("Triton Error [CUDA]: out of memory") and Inductor's C++
+    wrapper ("CUDA driver error: out of memory"). During a CUDA graph capture the error is raised as it is:
+    releasing cache and launching again would act inside the capture.
+    """
     @functools.wraps(original)
     def bench(self, *args, **kwargs):
         try:
             return original(self, *args, **kwargs)
         except RuntimeError as error:
             if (self.device_props.type != "cuda"
-                    or "CUDA driver error: out of memory" not in str(error)):
+                    or not any(message in str(error) for message in _DRIVER_OOM_MESSAGES)
+                    or torch.cuda.is_current_stream_capturing()):
                 raise
-            # Spilled kernel locals use driver memory, not the Torch allocator's retry path.
             with torch.cuda.device(self.device_props.index):
                 allocated = torch.cuda.memory_allocated()
                 reserved = torch.cuda.memory_reserved()
@@ -762,9 +830,9 @@ def _reclaim_driver_autotune_oom(original):
                 free_before, _ = torch.cuda.mem_get_info()
                 torch.cuda.empty_cache()
                 free_after, _ = torch.cuda.mem_get_info()
-                _log.warning("CUDA autotune driver OOM for %s: allocated=%d reserved=%d; "
+                _log.warning("CUDA driver OOM in %s of %s: allocated=%d reserved=%d; "
                              "released unused cache, driver free=%d -> %d; retry once",
-                             self.inductor_meta.get("kernel_name", "unknown"),
+                             original.__name__, self.inductor_meta.get("kernel_name", "unknown"),
                              allocated, reserved, free_before, free_after)
                 return original(self, *args, **kwargs)
 
@@ -858,7 +926,10 @@ def _policy_worker_compile_triton(load_kernel, extra_env, extra_config):
 
 
 def install_exact_numerics() -> None:
-    """Make Inductor keep eager's arithmetic for the measured cases; idempotent."""
+    """Make Inductor keep eager's arithmetic for the measured cases; idempotent.
+
+    The patches replace torch 2.8.0's own Inductor bodies, so any other release raises ``RuntimeError``."""
+    torch_compat.require_supported_torch()
     global _installed
     if _installed:
         return
@@ -896,10 +967,14 @@ def install_exact_numerics() -> None:
         _make_backward_sum(lowering.sum_))
     for op in (aten.any.default, aten.any.dim, aten.any.dims):
         lowering.register_lowering([op])(_make_mps_any(lowering.lowerings[op], op))
+    for name in ("minimum", "maximum"):
+        aten_op = getattr(aten, name).default
+        for op in (aten_op, getattr(torch.ops.prims, name).default):
+            lowering.register_lowering([op])(_make_cpu_minmax(lowering.lowerings[op], aten_op))
     lowering.register_lowering([aten.clamp_min.default])(
-        _make_cpu_clamp(lowering.maximum, lambda x, m: lowering.ops.lt(x, m)))
+        _make_cpu_clamp(lowering.maximum, lambda x, m: lowering.ops.lt(x, m), aten.clamp_min.default))
     lowering.register_lowering([aten.clamp_max.default])(
-        _make_cpu_clamp(lowering.minimum, lambda x, m: lowering.ops.gt(x, m)))
+        _make_cpu_clamp(lowering.minimum, lambda x, m: lowering.ops.gt(x, m), aten.clamp_max.default))
     config.cpp.simdlen = 1
     config.inplace_buffers = False  # in-place reuse overwrote aliased saved views (module docstring)
     _tensor_constant_triton_index()
@@ -914,13 +989,13 @@ def install_exact_numerics() -> None:
     _keep_mps_mask_types()
     _no_cpu_outer_loop_fusion()
     _functional_accumulate()
-    _keep_device_asserts()
     from torch._inductor import async_compile
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
     _install_pointwise_factory()
     async_compile._worker_compile_triton = _policy_worker_compile_triton
     CachingAutotuner.bench = _reclaim_driver_autotune_oom(CachingAutotuner.bench)
+    CachingAutotuner.run = _reclaim_driver_autotune_oom(CachingAutotuner.run)
     CachingAutotuner.benchmark_all_configs = _benchmark_spilling_pointwise(
         CachingAutotuner.benchmark_all_configs)
     config.post_grad_custom_pre_pass = _PolicyKey()
@@ -990,7 +1065,6 @@ def _inductor_backend(gm, example_inputs):
     from torch._inductor.compile_fx import compile_fx
 
     _global_tables_as_device_constants(gm, example_inputs)
-    _assert_messages(gm)
     return compile_fx(gm, example_inputs, inner_compile=_policy_inner_compile,
                       decompositions=_policy_decompositions(example_inputs))
 
@@ -1000,7 +1074,6 @@ def _inductor_vjp_backend(gm, example_inputs):
     from torch._inductor.compile_fx import compile_fx
 
     _global_tables_as_device_constants(gm, example_inputs)
-    _assert_messages(gm)
     return compile_fx(gm, example_inputs,
                       inner_compile=functools.partial(_policy_inner_compile, functional_vjp=True),
                       decompositions=_policy_decompositions(example_inputs))
@@ -1054,7 +1127,8 @@ def _canonical_layout(value, seen: set[int]):
     return value
 
 
-def compiled(fn: Callable[..., Result], *, normalize_layouts: bool = True) -> Callable[..., Result]:
+def compiled(fn: Callable[..., Result], *, normalize_layouts: bool = True,
+             orchestration: bool = False) -> Callable[..., Result]:
     """Whole-call ``torch.compile`` of ``fn`` under the exact policy, built once per function.
 
     The first call runs ``fn`` eagerly: schemes fill their table caches there (file
@@ -1063,14 +1137,26 @@ def compiled(fn: Callable[..., Result], *, normalize_layouts: bool = True) -> Ca
     each call outside a traced region is a timed region named ``fn.__name__``.
     ``normalize_layouts=False`` is for qualified read-only tensor islands/assembly only. Their
     producer layouts stay explicit in guards; all carried-state regions keep normalization.
+
+    ``orchestration=True`` is for a scheme's container orchestration around its islands, forward only (with
+    gradients enabled ``fn`` runs as it is): ``fullgraph=False`` and no layout normalization, each island call
+    (``island``, or another region of this function) a graph break, so the code between islands compiles
+    into graphs while every island keeps its own reusable region. Its first call runs ``fn`` itself (its
+    islands warm and compile as usual); inside another orchestration region it is inlined. Dynamo (torch 2.8)
+    runs a frame eagerly when a graph break falls inside one of its loops; the functions such a loop calls
+    still compile as frames of their own.
     """
-    cache_key = fn if normalize_layouts else (fn, "borrowed_layouts")
+    # Do not guard an enclosing graph on unrelated registry growth. Orchestration
+    # still dispatches an island outside tracing, where its wrapper lookup belongs.
+    if torch.compiler.is_compiling():
+        if _orchestrating and not orchestration:
+            return functools.partial(_outside_island, fn, normalize_layouts)
+        return fn
+    cache_key = (fn, "orchestration") if orchestration else fn if normalize_layouts else (fn, "borrowed_layouts")
     found = _compiled.get(cache_key)
     if found is None:
         install_exact_numerics()
-        region = torch.compile(fn, backend=_inductor_backend, fullgraph=True, dynamic=False)
-        # Config.patch creates a context class per call; prepare its critical-path helper once.
-        patch_limit = torch._dynamo.config._make_closure_patcher(recompile_limit=REGION_RECOMPILE_LIMIT)
+        region = torch.compile(fn, backend=_inductor_backend, fullgraph=not orchestration, dynamic=False)
         warmed: set[tuple] = set()
 
         def signature(kwargs):
@@ -1086,13 +1172,17 @@ def compiled(fn: Callable[..., Result], *, normalize_layouts: bool = True) -> Ca
                 return fn(*args, **kwargs)
 
         def call(*args, **kwargs):
-            # Called while an enclosing region is traced: inline, so that region holds one graph.
+            global _orchestrating
+            # Called while an enclosing region is traced: inline, so that region holds one graph. An
+            # orchestration region instead breaks its graph here and calls this region at run time.
+            if _orchestrating and not orchestration:
+                return _outside(call, args, kwargs)
             if torch.compiler.is_compiling():
                 return fn(*args, **kwargs)
             # torch 2.8's compiled regions drop forward-mode tangents without an error (their
             # outputs come back as plain tensors). Under an active dual level run the eager
             # function, which equals the region bit for bit under this policy.
-            if forward_ad._current_level >= 0:
+            if torch_compat.forward_ad_active() or (orchestration and torch.is_grad_enabled()):
                 return fn(*args, **kwargs)
             meter = cost_meter.METER  # None (off): no timing, nothing else changes
             timed = meter is not None and meter.enter(fn.__name__)
@@ -1100,15 +1190,18 @@ def compiled(fn: Callable[..., Result], *, normalize_layouts: bool = True) -> Ca
                 key = signature(kwargs)
                 if key not in warmed or _eager.get():
                     warmed.add(key)
-                    return eager_call(*args, **kwargs)
+                    return fn(*args, **kwargs) if orchestration else eager_call(*args, **kwargs)
                 seen: set[int] = set()
-                restore_limit = patch_limit()
+                limit = torch._dynamo.config.patch(recompile_limit=REGION_RECOMPILE_LIMIT)
+                limit.__enter__()
+                previous, _orchestrating = _orchestrating, orchestration
                 try:
-                    if normalize_layouts:
+                    if normalize_layouts and not orchestration:
                         return region(*_canonical_layout(args, seen), **_canonical_layout(kwargs, seen))
                     return region(*args, **kwargs)
                 finally:
-                    restore_limit()
+                    _orchestrating = previous
+                    limit.__exit__(None, None, None)
             finally:
                 if timed:
                     meter.exit()

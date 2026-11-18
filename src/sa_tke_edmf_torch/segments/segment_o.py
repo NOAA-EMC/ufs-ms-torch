@@ -6,14 +6,13 @@
 from __future__ import annotations
 
 import torch
+from ufs_physics_common.ordered_sum import level_sum
 from ufs_physics_common.quotient import quotient
 
 from sa_tke_edmf_torch.compile import run_compile_island
-from sa_tke_edmf_torch.constants import GRAV, IM, KM, NDTEND, NTKE, NTRAC
+from sa_tke_edmf_torch.constants import GRAV
 from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
 from sa_tke_edmf_torch.diagnostics import diagnostic_slots, add_diagnostic_
-
-CHECKPOINT_FIELDS = ("tkeh", "te", "tke", "ten_t")
 
 
 def _tridit_tke(
@@ -72,8 +71,8 @@ def _borrow_negative_energy(
         in_range = in_range & (levels[None, :] <= upper_bound[:, None])
 
     weighted = head * delp_head * gravi
-    tsumn = torch.where(in_range & (head < 0.0), weighted, torch.zeros_like(weighted)).cumsum(dim=1)[:, -1].clone()  # source order
-    tsump = torch.where(in_range & (head > 0.0), weighted, torch.zeros_like(weighted)).cumsum(dim=1)[:, -1].clone()
+    tsumn = level_sum(torch.where(in_range & (head < 0.0), weighted, torch.zeros_like(weighted)), 1)  # source order
+    tsump = level_sum(torch.where(in_range & (head > 0.0), weighted, torch.zeros_like(weighted)), 1)
 
     rtnp = torch.ones((IM,), dtype=dtype, device=device)
     has_both = (tsump > 0.0) & (tsumn < 0.0)
@@ -187,8 +186,8 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     e_half = state.require("e_half")
     xmf = state.require("xmf")
     xmfd = state.require("xmfd")
-    qcko = state.require("qcko")
-    qcdo = state.require("qcdo")
+    qcko_tke = state.require("qcko_tke")
+    qcdo_tke = state.require("qcdo_tke")
     delt = state.require("delt")
     kpbl = state.require("kpbl").to(torch.int64)
     krad = state.require("krad").to(torch.int64)
@@ -210,14 +209,12 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     require_float64("e_half", e_half, (IM, KM - 1))
     require_float64("xmf", xmf, (IM, KM))
     require_float64("xmfd", xmfd, (IM, KM))
-    require_float64("qcko", qcko, (IM, KM, NTRAC))
-    require_float64("qcdo", qcdo, (IM, KM, NTRAC))
+    require_float64("qcko_tke", qcko_tke, (IM, KM))
+    require_float64("qcdo_tke", qcdo_tke, (IM, KM))
 
-    dtype = te.dtype
     device = te.device
     dt2 = delt[0]
     rdt = 1.0 / dt2
-    km1 = KM - 1
 
     lower, diagonal, upper, rhs = run_compile_island(
         "tridiagonal",
@@ -231,8 +228,8 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
         e_half,
         xmf,
         xmfd,
-        qcko[:, :, NTKE - 1],
-        qcdo[:, :, NTKE - 1],
+        qcko_tke,
+        qcdo_tke,
         kpbl,
         mrad,
         krad,
@@ -286,5 +283,3 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     )
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

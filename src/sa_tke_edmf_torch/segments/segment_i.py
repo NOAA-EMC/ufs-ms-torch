@@ -14,8 +14,6 @@ from sa_tke_edmf_torch.state import SaTkeEdmfState, require_float64
 from sa_tke_edmf_torch.thermo import fpvs_from_table, fpvs_table_like
 from sa_tke_edmf_torch.tracers import satmedmf_hydrometeor_indices
 
-CHECKPOINT_FIELDS = ("xmfd", "xlamde", "tcdo", "qcdo", "buod", "krad", "mrad")
-
 
 def _safe(value, mask, fallback=1.0):
     return torch.where(mask, value, fallback)
@@ -106,6 +104,49 @@ def _descending_blocks(count):
     # Bound live FP64 outputs; full-depth recurrence fusion exhausted H100 driver memory (G158).
     for stop in range(count, 0, -4):
         yield max(0, stop - 4), stop
+
+
+# The three sweeps over level blocks are frames of their own: an island call inside a loop makes Dynamo run the
+# rest of its frame eagerly (compile_policy.compiled), so ``run`` keeps no loop around an island and compiles
+# between them. The joins of their pieces stay in ``run``.
+def _buoyancy_sweep(half, previous, profiles, entrainment_rows, base, masks, table, es_scale, qmin):
+    pieces = []
+    for first, stop in _descending_blocks(half):
+        piece = run_compile_island(
+            "i_downdraft", "buoyancy_levels", _buoyancy_levels,
+            previous, profiles[first:stop + 1], entrainment_rows[first:stop],
+            base[first:stop], masks[first:stop], table, es_scale, qmin)
+        pieces.append(piece)
+        previous = piece[0]
+    return tuple(pieces[::-1])
+
+
+def _velocity_sweep(half, zm_rows, xlam_rows, buoy_rows, wush_rows, masks, seeds, initial_wd, previous):
+    pieces = []
+    for first, stop in _descending_blocks(half):
+        piece = run_compile_island(
+            "i_downdraft", "velocity_levels", _velocity_levels,
+            previous, zm_rows[first:stop + 1], xlam_rows[first:stop + 1],
+            buoy_rows[first:stop + 1], wush_rows[first:stop + 1],
+            masks[first:stop], seeds[first:stop], initial_wd)
+        pieces.append(piece)
+        previous = piece[0]
+    return tuple(pieces[::-1])
+
+
+def _transport_sweep(half, previous, previous_water, profiles, entrainment_rows, base, water_rows,
+                     environment_water, masks, table, tracer, transported, es_scale, qmin, pgcon, cloud):
+    pieces, waters = [], []
+    for first, stop in _descending_blocks(half):
+        piece, water = run_compile_island(
+            "i_downdraft", "transport_levels", _transport_levels,
+            previous, previous_water, profiles[first:stop + 1], entrainment_rows[first:stop],
+            base[first:stop], water_rows[first:stop], environment_water[first:stop + 1],
+            masks[first:stop], table, tracer, transported, es_scale, qmin, pgcon, cloud)
+        pieces.append(piece)
+        waters.append(water)
+        previous, previous_water = piece[0], water[0]
+    return tuple(pieces[::-1]), tuple(waters[::-1])
 
 
 def _find_bottom(mrad, cnv, r, extends):
@@ -203,15 +244,8 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     level_rows = torch.arange(half, device=q1.device)[:, None]
     masks = cnv[None, :] & (level_rows < r[None, :])
     table, es_scale = fpvs_table_like(q1), literal(0.01)
-    previous, pieces = base[half], []
-    for first, stop in _descending_blocks(half):
-        piece = run_compile_island(
-            "i_downdraft", "buoyancy_levels", _buoyancy_levels,
-            previous, profiles[first:stop + 1], entrainment_rows[first:stop],
-            base[first:stop], masks[first:stop], table, es_scale, qmin)
-        pieces.append(piece)
-        previous = piece[0]
-    parcel_rows = torch.cat(pieces[::-1], dim=0)
+    parcel_rows = torch.cat(_buoyancy_sweep(half, base[half], profiles, entrainment_rows, base, masks, table,
+                                            es_scale, qmin), dim=0)
     th = list(parcel_rows[:, 0].unbind(0))
     initial_k = (r - 1).clamp(0, km - 2)
     xlam = torch.slice_scatter(xlamde, entrainment_lower, dim=1, start=0, end=km // 2)
@@ -223,16 +257,8 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
         x[:, :half + 1].t().contiguous() for x in (zm, xlam, buod, state.require("wush")))
     masks = cnv[None, :] & (level_rows < r[None, :] - 1)
     seeds = cnv[None, :] & (level_rows == initial_k[None, :])
-    previous, pieces = torch.zeros_like(krad), []
-    for first, stop in _descending_blocks(half):
-        piece = run_compile_island(
-            "i_downdraft", "velocity_levels", _velocity_levels,
-            previous, zm_rows[first:stop + 1], xlam_rows[first:stop + 1],
-            buoy_rows[first:stop + 1], wush_rows[first:stop + 1],
-            masks[first:stop], seeds[first:stop], initial_wd)
-        pieces.append(piece)
-        previous = piece[0]
-    wd_rows = torch.cat(pieces[::-1], dim=0)
+    wd_rows = torch.cat(_velocity_sweep(half, zm_rows, xlam_rows, buoy_rows, wush_rows, masks, seeds, initial_wd,
+                                        torch.zeros_like(krad)), dim=0)
     wd = list(wd_rows.unbind(0))
     mrad = torch.where(cnv, krad.to(torch.int64), mrad)
     mrad = run_compile_island("i_downdraft", "find_bottom", _find_bottom,
@@ -272,18 +298,11 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     transported = (tracer != 0) & (tracer != cloud) & (tracer < ntrac - 1)
     masks = cnv[None, :] & (level_rows + 1 >= mrad[None, :]) & (level_rows < r[None, :])
     entrainment_rows = entrainment_lower.t().contiguous()
-    previous, previous_water, pieces, waters = base[half], water_rows[half], [], []
-    for first, stop in _descending_blocks(half):
-        piece, water = run_compile_island(
-            "i_downdraft", "transport_levels", _transport_levels,
-            previous, previous_water, profiles[first:stop + 1], entrainment_rows[first:stop],
-            base[first:stop], water_rows[first:stop], environment_water[first:stop + 1],
-            masks[first:stop], table, tracer, transported, es_scale, qmin, pgcon, cloud)
-        pieces.append(piece)
-        waters.append(water)
-        previous, previous_water = piece[0], water[0]
-    transport_rows = torch.cat(pieces[::-1], dim=0)
-    water = torch.cat(waters[::-1], dim=0)
+    pieces, waters = _transport_sweep(half, base[half], water_rows[half], profiles, entrainment_rows, base,
+                                      water_rows, environment_water, masks, table, tracer, transported,
+                                      es_scale, qmin, pgcon, cloud)
+    transport_rows = torch.cat(pieces, dim=0)
+    water = torch.cat(waters, dim=0)
     return state.with_updates(
         {
             "xmfd": torch.slice_scatter(xmfd, mass_lower, dim=1, start=0, end=half),
@@ -302,5 +321,3 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     )
 
 
-def checkpoint_fields(state: SaTkeEdmfState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

@@ -9,13 +9,10 @@ import torch
 
 from sa_sas_deep_convection_torch import recurrence_chunks as chunks
 from sa_sas_deep_convection_torch.compile import (
-    masked_sum_chunk_size, run_compile_island, run_recurrence_chunk,
+    recurrence_chunk_size, run_compile_island, run_recurrence_chunk,
     ordered_chunks_enabled,
 )
-from sa_sas_deep_convection_torch.constants import KM, NTK
-from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real
-
-CHECKPOINT_FIELDS = ("tkemean", "xlamue", "xlamud", "xlamd", "xlamdd", "cnvflg", "ca_deep")
+from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConvectionState, require_real, tracer_layout
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
@@ -39,7 +36,7 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
     require_real("tkeh", tkeh, (ncol, KM))
 
     hwrf_samfdeep = bool(state.config.get("hwrf_samfdeep", False))
-    ntk = int(state.config.get("ntk", NTK))
+    ntk = tracer_layout(state).ntk
     (
         sumx,
         tkemean,
@@ -128,7 +125,7 @@ def _entrainment_rates_block(
     tkemean = torch.zeros_like(cnvflg)
     sumx = torch.zeros_like(cnvflg)
     if (not hwrf_samfdeep) and ntk > 0:
-        size = masked_sum_chunk_size()
+        size = recurrence_chunk_size()
         levels = torch.arange(1, KM, dtype=kb.dtype, device=kb.device)
         profile_rows = chunks.pack_profiles(zo, tkeh)
         for start in range(0, KM - 1, size):
@@ -213,5 +210,3 @@ def _entrainment_rates_from_mean(
     return sumx, tkemean, clamt, xlamdet, xlamddt, cxlamet, cxlamdt, xlamue, xlamud
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

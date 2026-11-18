@@ -11,8 +11,6 @@ from sa_sas_deep_convection_torch.compile import run_compile_island
 from sa_sas_deep_convection_torch.segments.segment_d import _gather_column
 from sa_sas_deep_convection_torch.state import SaSasDeepConvectionState, require_real
 
-CHECKPOINT_FIELDS = ("xmb", "xmbmax", "sigmagfm", "scaldfunc", "cnvflg", "return_stage")
-
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
     """Run lines 3020-3112 of ``samfdeepcnv_run`` for the approved active case."""
@@ -173,5 +171,3 @@ def _mass_flux_scale_block(
     return fld, xk, xmb, sigmagfm, scaldfunc, cnvflg, asqecflg
 
 
-def checkpoint_fields(state: SaSasDeepConvectionState) -> dict[str, torch.Tensor]:
-    return {name: state.require(name) for name in CHECKPOINT_FIELDS}

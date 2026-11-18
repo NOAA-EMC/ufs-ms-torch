@@ -9,7 +9,7 @@ so no saved view can be invalidated by a later level update.
 from __future__ import annotations
 
 import torch
-from ufs_physics_common.ordered_sum import masked_sum, parallel_masked_sums
+from sa_sas_deep_convection_torch.samf_interstitials import evaporate_convective_rain
 
 
 def _divide(mask, numerator, denominator, other):
@@ -27,7 +27,17 @@ def _levels(first, width):
 
 
 def pack_profiles(*values):
-    """One contiguous [level, profile, column, ...] packet per ordered pass."""
+    """One contiguous [level, profile, column, ...] packet per ordered pass.
+
+    A compiled island (one tiled transpose kernel): eager, the stack of level-leading views was a strided
+    batched copy (G4a, CatArrayBatchedCopy). Values are copies, unchanged.
+    """
+    from sa_sas_shallow_convection_torch.compile import run_compile_island
+
+    return run_compile_island("recurrence_chunks", "pack_profiles", _pack_profiles, values)
+
+
+def _pack_profiles(values):
     return torch.stack(tuple(value.movedim(1, 0) for value in values), dim=1)
 
 
@@ -40,8 +50,6 @@ def _stack(values):
 
 def ordered_pair_sums(mask, terms, first_sum, second_sum, *, masked_add):
     """Two ordered sums over contiguous level rows; only column carries remain live."""
-    if parallel_masked_sums():
-        return masked_sum(first_sum, mask, terms[:, 0]), masked_sum(second_sum, mask, terms[:, 1])
     for offset in range(mask.shape[0]):
         active = mask[offset]
         if masked_add:
@@ -271,12 +279,12 @@ def velocity(cnv, kbcon1, ktcon, first, profiles, carry, *, bb1, bb2):
 
 
 def evaporation(cnv, kb, ktcon, kmax, first, profiles, xmb, carry, rntot,
-                *, shevf, evef, delt, el2orc, elocp, grav):
+                *, shevf, evef, delt, el2orc, cp, rd, rv, grav):
     rn, qcond, qevap, delqev, delq2, delqbar, deltbar, flg = carry
     width = profiles.shape[0]
     level = _levels(first, width)
     cond_rn = cnv & (level < ktcon) & (level > kb)
-    pwo, dp, qeso, tk, qk = (profiles[:, i] for i in range(5))
+    pwo, dp, qeso, tk, qk, entry_q, entry_t = (profiles[:, i] for i in range(7))
     rain = (pwo * xmb * 0.001 * delt).masked_fill(~cond_rn, 0.0)
     window = (level < ktcon) & (level <= kmax)
     tk2 = tk * tk
@@ -303,9 +311,9 @@ def evaporation(cnv, kb, ktcon, kmax, first, profiles, xmb, carry, rntot,
         too_much = apply_evap & (tem1 > rn)
         qevap = torch.where(too_much, torch.where(too_much, rn / torch.where(too_much, tem[offset], 1.0), 0.0), qevap)
         rn = torch.where(too_much, 0.0, torch.where(apply_evap, rn - tem1, rn))
-        q_cells[offset] = torch.where(apply_evap, qk[offset] + qevap, qk[offset])
-        t_cells[offset] = torch.where(apply_evap, tk[offset] - elocp * qevap, tk[offset])
-        deltv = torch.where(apply_evap, -elocp * qevap / delt, 0.0)
+        q_cells[offset], t_cells[offset], cooling = evaporate_convective_rain(qk[offset], tk[offset],
+            qevap, entry_q[offset], entry_t[offset], apply_evap, cp, rd, rv)
+        deltv = torch.where(apply_evap, -cooling / delt, 0.0)
         delq = torch.where(apply_evap, qevap / delt, 0.0)
         delqev = torch.where(apply_evap, delqev + tem[offset] * qevap, delqev)
         delqbar = delqbar + (delq * factor[offset]).masked_fill(~cond, 0.0)
