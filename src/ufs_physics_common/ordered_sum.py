@@ -5,7 +5,7 @@
 
 A column total accumulated over selected levels, ``where(mask[k], total + term[k], total)``,
 is one masked sum. The source schemes add the levels in sequence, and the default keeps that
-order: this is the form the Fortran oracle gates compare bit for bit. Each unrolled level adds
+order: this is the form that matches the Fortran reference bit for bit. Each unrolled level adds
 code to one thread per column, which the kernel then has to execute level by level.
 """
 

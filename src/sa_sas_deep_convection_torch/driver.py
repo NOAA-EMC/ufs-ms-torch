@@ -1,7 +1,7 @@
 # Copyright (c) 2026 IC Weather LLC. Licensed under LICENSE and PERMISSIONS.md.
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""Integrated SA-SAS deep-convection PyTorch driver for cumulative port gates."""
+"""SA-SAS deep-convection PyTorch driver: the segments of ``samfdeepcnv_run`` in order."""
 
 from __future__ import annotations
 
@@ -28,11 +28,11 @@ def _runs_through(through: str, segment_id: str) -> bool:
 
 
 def unsupported_config_reasons(config: dict[str, Any], *, through: str = "V") -> tuple[str, ...]:
-    """Return uncheckpointed target-side branch claims for the requested prefix."""
+    """Return the reasons ``config`` is not supported by segments A through ``through``."""
 
     reasons: list[str] = []
-    # Tracer-index branches sealed by goldens: the legacy harness table (TKE slot 8,
-    # chemistry 6:8) and the G3.2 oracle MPAS table (TKE slot 3, itc=0, ntc=nscav=7).
+    # Supported tracer-index branches: the legacy table (TKE slot 8, chemistry 6:8)
+    # and the MPAS TEMPO table (TKE slot 3, itc=0, ntc=nscav=7).
     sealed = {"legacy": (NTK, ITC, NTC), "mpas_tempo": (3, 0, 7)}
     layout_name = "mpas_tempo" if config.get("tracer_layout") is not None else "legacy"
     sealed_ntk, sealed_itc, sealed_ntc = sealed[layout_name]
@@ -106,9 +106,8 @@ def run_sa_sas_deep_convection(
 
 # Gathered columns that three or more compiled cloud-model kernels read: each is stored once
 # instead of being gathered again inside every consumer. The others (one or two consumers, or
-# constant workspace) stay fused into their consumers. Measured on the compiled deep
-# apply_convection at x1.10242 (consumer kernels per stored column); the set changes
-# only performance, not values.
+# constant workspace) stay fused into their consumers. The set follows the consumer kernels per
+# column of the compiled deep apply_convection; it changes only performance, not values.
 _STORED_COLUMNS = frozenset({
     "buo", "c0t", "cnvflg", "cnvwt", "ctr", "ctro", "dbyo", "del", "dellal", "ecdo", "eta", "etad",
     "gdx", "hcdo", "hcko", "heo", "heso", "kb", "kbcon", "kbcon1", "kd94", "kmax", "ktcon", "ktop", "new_qtr",

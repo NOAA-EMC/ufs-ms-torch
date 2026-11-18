@@ -141,7 +141,7 @@ def prepare_r4_diagnostic_indices(physics_namelist: Mapping[str, Any], *,
 
     The source leaves chemistry indices unset when ntchm=0, but consumes them
     during allocation. Require its frozen positive rows explicitly; these are
-    not portable chemistry defaults. No captured dtidx supplies the other rows.
+    not portable chemistry defaults.
     """
     def value(name, default):
         return _static_namelist_value(physics_namelist, name, default)
@@ -212,7 +212,7 @@ def prepare_r4_diagnostic_indices(physics_namelist: Mapping[str, Any], *,
 
 def prepare_r4_physics_controls(physics_namelist: Mapping[str, Any], *,
     dt_physics: float, dt_dycore: float, device: torch.device | str) -> PhysicsSchemeControls:
-    """Defined R4 surface/prefix/PBL setup, without captured host containers.
+    """Defined R4 surface/prefix/PBL setup, without host containers.
 
     GFS_typedefs supplies defaults, indices and source-ordered area scaling.
     The selected TEMPO allocation has one phy_f2d field and no SHOC fields.
@@ -282,14 +282,14 @@ class ConvectionSchemeControls:
 def prepare_r4_convection_controls(physics_namelist: Mapping[str, Any], *,
     dt_physics: float, dt_dycore: float, ncol: int, device: torch.device | str,
     frozen_unassigned_indices: Mapping[str, int], step_index: int = 1) -> ConvectionSchemeControls:
-    """Selected nonrestart SAMF core/post setup without captured containers.
+    """Selected nonrestart SAMF core/post setup without host containers.
 
     Reuse the frozen R4 tracer contract and source packing rule. Coefficients live on the numerical
     device; step flags use the static scheduler index checked by the device clock.
     Five cap indices are unassigned on the source MPAS/TEMPO path.
     Require the frozen-build zeros explicitly, not as portable source defaults.
     Source setup also reads unset ntccn/ntccna; the frozen packing contract
-    qualifies its resulting transport flags, not those members' initialization.
+    fixes its resulting transport flags, not those members' initialization.
     This does not prepare dtidx, ozone forcing, cloud or TEMPO-tail controls.
     """
     for timestep in (dt_physics,dt_dycore):
@@ -385,7 +385,7 @@ def prepare_r4_microphysics_controls(physics_namelist: Mapping[str, Any], *,
 
     The caller must complete TEMPO preparation before setting tempo_initialized.
     The frozen dtidx remains a separate input. Source-declared rows and chemistry
-    process flags do not need captured buffers or host reads from device tensors.
+    process flags do not need host buffers or host reads from device tensors.
     """
     unset = ("ntclamt","nthv","ntrz","ntgz","nthz","ntccn")
     if not isinstance(frozen_unassigned_indices, Mapping) or set(frozen_unassigned_indices) != set(unset):
@@ -497,7 +497,7 @@ def prepare_r4_radiation_config(physics_namelist: Mapping[str, Any], *,
 
     GFS_typedefs leaves doGP_smearclds unassigned on the implicit-cloud path.
     Require its frozen-build value explicitly; never invent a portable default.
-    This does not prepare gas/cloud tables or select a different source oracle.
+    This does not prepare gas/cloud tables or select a different source configuration.
 
     The GFS v17 options read data files in ``input_dir`` (the run folder, the names the Fortran
     opens) during this host preparation: ``isol = 2`` (``solarconstant_noaa_an.txt``),
@@ -638,7 +638,7 @@ def prepare_r4_gwd_controls(physics_namelist: Mapping[str, Any],
     """Selected UGWP-v0/PSL (R4) or UGWP-v1/GSL (GFS v17) controls from source namelists.
 
     Resolution stays the device integer from native reference geometry.
-    The current nonstationary runtime implements the declared R4 launch/spectrum.
+    The nonstationary runtime implements the declared R4 launch/spectrum.
     Reject other initialization knobs rather than silently use those constants.
     UGWP v1 (do_ugwp_v1 without do_ugwp_v0) reads ugwp_limb_tau.nc from ``input_dir``.
     """

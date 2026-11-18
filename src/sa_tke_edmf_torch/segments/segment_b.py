@@ -19,7 +19,7 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     q1 = state.require("q1")
     IM = q1.shape[0]
     require_float64("rtg", state.require("rtg"), (IM, KM, NTRAC))
-    # satmedmfvdifq_run zeroes rtg on entry (oracle satmedmfvdifq.F:420); an incoming seed is discarded.
+    # satmedmfvdifq_run zeroes rtg on entry (satmedmfvdifq.F:420); an incoming seed is discarded.
     # One stride-0 zero (no [ncol, KM, ntrac] fill): segment O writes the whole of rtg as a new tensor from it.
     rtg = q1.new_zeros(()).expand(IM, KM, NTRAC)
     require_float64("q1", q1, (IM, KM, NTRAC))

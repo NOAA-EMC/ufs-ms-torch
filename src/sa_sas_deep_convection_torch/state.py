@@ -58,9 +58,9 @@ def require_same_device(fields: Mapping[str, torch.Tensor]) -> torch.device:
 def runtime_dimensions(state: SaSasDeepConvectionState) -> tuple[int, int, int, int, int]:
     """Validate immutable extents from current tensors, without host tensor reads.
 
-    Without ``config['tracer_layout']`` the frozen legacy harness table applies
-    (``nn = ntr + 2``, TKE slot 8, chemistry slots 6:8). With a layout (G3.2, e.g. the
-    oracle MPAS table) ``nn``, ``ntr``, ``ntk``, ``itc`` and ``ntc`` must equal the
+    Without ``config['tracer_layout']`` the legacy tracer table applies
+    (``nn = ntr + 2``, TKE slot 8, chemistry slots 6:8). With a layout (e.g. the
+    MPAS TEMPO table) ``nn``, ``ntr``, ``ntk``, ``itc`` and ``ntc`` must equal the
     layout's CCPP values; ``ntr`` (``nsamftrac``) is then independent of ``nn``.
     """
     from sa_sas_deep_convection_torch.samf_interstitials import layout_from_config
@@ -102,7 +102,7 @@ def runtime_dimensions(state: SaSasDeepConvectionState) -> tuple[int, int, int, 
 
 
 def tracer_layout(state: SaSasDeepConvectionState):
-    """The resolved convective tracer layout (legacy harness table when undeclared)."""
+    """The resolved convective tracer layout (legacy table when undeclared)."""
     from sa_sas_deep_convection_torch.samf_interstitials import layout_from_config, legacy_layout
 
     layout = layout_from_config(state.config.get("tracer_layout"))

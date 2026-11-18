@@ -19,7 +19,7 @@ pass through unchanged.
 
 A replay records no autograd graph and no forward-mode tangents. Under a derivative request (grad
 mode or an active dual level) the driver therefore advances with ordinary steps
-(``run_coupled_interval``), the qualified differentiable path.
+(``run_coupled_interval``), the differentiable path.
 
 Replays accumulate the compaction overflow flag; the driver reads it every
 ``runtime_policy.overflow_check_steps()`` replays (one host sync per window). On overflow it restores
@@ -64,7 +64,7 @@ from .distributed import all_ranks, consensus_regions
 from .runtime_policy import overflow_check_steps, raise_compaction, step_graphs_enabled
 
 _PLAIN = (type(None), bool, int, float, str, bytes)
-# Steps run as ordinary steps, graphs recorded and replays, over the process (evidence of use).
+# Steps run as ordinary steps, graphs recorded and replays, over the process.
 COUNTS = {"ordinary": 0, "recorded": 0, "replayed": 0}
 
 

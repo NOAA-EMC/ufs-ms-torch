@@ -241,8 +241,8 @@ def allocate_physics_prefix_scratch(
     scratch["del_gz"] = zeros(ncol, nlev + 1)
     for name in ("dudt", "dvdt", "dtdt"):
         scratch[name] = zeros(ncol, nlev)
-    # The [ncol, nlev, ntrac] zero scratch is one stride-0 zero each (no 360 MB fill at 60 km; their readers
-    # write new tensors, round 8). Distinct tensor objects, as before.
+    # The [ncol, nlev, ntrac] zero scratch is one stride-0 zero each (no fill; their readers write new
+    # tensors). Distinct tensor objects.
     scratch["dqdt"] = _zero_like(statein.qgrs)
     layout = mpas_tempo_layout()
     if statein.qgrs.shape != (ncol, nlev, layout.ntrac):
@@ -406,7 +406,7 @@ def _interstitial_2(
             # Area-weighted over land, ice and open water (flag_cice is false: uncoupled).
             frland = scratch["frland"]
             ice_fraction = (1.0 - frland) * surface.fice
-            # A1: a huge placeholder (no open water) has zero weight; it enters as the ice value so
+            # A huge placeholder (no open water) has zero weight; it enters as the ice value so
             # that the derivative with respect to fice stays finite. The forward value is unchanged.
             water = scratch["adjsfculw_water"]
             water = torch.where(water == control.composites.huge, scratch["adjsfculw_ice"], water)

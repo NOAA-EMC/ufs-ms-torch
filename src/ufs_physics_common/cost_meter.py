@@ -42,7 +42,7 @@ Compile clocks come from torch 2.8's own instrumentation, attributed per compile
   ``Benchmarker.benchmark_gpu``, but not the compiles of the configs it tries), so the meter times
   ``CachingAutotuner.coordinate_descent_tuning`` itself while it is on. It runs at a kernel's first launch.
 
-``phase_split`` turns ``dynamo_timed`` sums into exclusive phases. Nesting in torch 2.8.0 (checked by probes):
+``phase_split`` turns ``dynamo_timed`` sums into exclusive phases. Nesting in torch 2.8.0:
 ``_compile.compile_inner`` holds ``bytecode_tracing`` (it stops before the graph is compiled),
 ``OutputGraph.call_user_compiler`` (the backend) and ``build_guards``; the backend holds
 ``create_aot_dispatcher_function``, which holds ``compile_fx_inner`` (Inductor, forward and backward); Inductor

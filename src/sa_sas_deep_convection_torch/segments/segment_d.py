@@ -19,7 +19,7 @@ def _gather_column(field: torch.Tensor, one_based_index: torch.Tensor) -> torch.
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
-    """Run lines 691-814 of ``samfdeepcnv_run`` for the approved active case."""
+    """Run lines 691-814 of ``samfdeepcnv_run``."""
     _, KM, NN, NTR, NTC = runtime_dimensions(state)
 
     zo = state.require("zo")

@@ -80,9 +80,8 @@ compile_policy._compiled[_sw_daylit_columns] = _sw_column_regions
 
 
 # The McICA layer steps read their layer's words as slices of the tempered twist block, in place. The LW and SW
-# sweep blocks and the SW band layer chunks read layer slices and band rows of whole-column or whole-spectrum arrays:
-# normalization copied 9,155 of them per 60 km radiation step (85 ms of RTX PRO 6000 kernels, round 8; the same
-# cost round 6 removed for the former lazy sweeps). The LW band transport reads each band's g-point rows of the
+# sweep blocks and the SW band layer chunks read layer slices and band rows of whole-column or whole-spectrum arrays,
+# which layout normalization would copy at every call. The LW band transport reads each band's g-point rows of the
 # level-major inference gas optics (strided views, which normalization would copy).
 _BORROWED_INPUTS = (_longwave_absorption_v17, _longwave_sources_tensor, _sw_daylit_optics, _mcica_layer_maxrand,
                     _mcica_layer_dcorr, _lw_down_levels, _lw_up_levels, _lw_scatter_up_levels, _lw_scatter_down_levels,
@@ -92,8 +91,8 @@ _BORROWED_INPUTS = (_longwave_absorption_v17, _longwave_sources_tensor, _sw_dayl
 
 def _radiation_tensor_region(fn):
     # Avoid repeated forward copies of call-local preparation: the interpolation plan and band Planck tables
-    # are views into buffers their compiled producer shares, and layout normalization copied them at every
-    # call while the originals stayed live (6.2 GiB at the 60 km LW absorption peak, round-4 G4a). These
+    # are views into buffers their compiled producer shares, and layout normalization would copy them at every
+    # call while the originals stay live. These
     # islands only read their inputs. AD keeps the canonical layouts: strided reductions need a separate
     # adjoint envelope.
     borrowed = not torch.is_grad_enabled() and fn in _BORROWED_INPUTS
@@ -529,12 +528,11 @@ def radiation_group_inputs(
     )
     # Radiation works level-major ([nlev, ncol], columns contiguous). The views its computation reads are copied
     # once into that layout: every array radiation derives from them (interpolation plans, the g-point arrays)
-    # then shares one layout, and no fused kernel mixes column-strided and column-contiguous operands (plan
-    # FORWARD_PERF_ROUND2, M2). Inputs already in that layout (state in Fortran order) are not copied. Fields
+    # then shares one layout, and no fused kernel mixes column-strided and column-contiguous operands.
+    # Inputs already in that layout (state in Fortran order) are not copied. Fields
     # radiation only passes on (winds, the previous heating rates, fluxr, phy_f3d) stay views. Values unchanged.
     # With the radiation compiled and no gradient, the copies are one compiled region: Inductor tiles each transpose
-    # (an eager transposing copy reads with a column stride; gq0's took 6 ms per 60 km radiation step on the RTX PRO
-    # 6000, round 8).
+    # (an eager transposing copy reads with a column stride).
     copies = (compiled(_level_major_copies)
               if scheme_compile_selected("run_native_radiation") and not torch.is_grad_enabled()
               else _level_major_copies)
@@ -603,9 +601,9 @@ def _aligned_columns(call, columns, **options):
     in place. With a column count that is not a multiple of four, most slices start off a 16-byte boundary, which
     a GPU kernel reads at a fraction of its aligned bandwidth. Each column is computed from its own values, so the
     real columns are unchanged. The padding runs on every device, so CPU and GPU run one form and the CPU checks
-    cover the code the GPU runs. Calls with gradients keep their columns: their whole-column forms read no slices in place. The padding is 1 to
-    4 columns (4 for a count already a multiple of four), so every count takes the same gathers and copies and the
-    work per column does not depend on the count (checks/test_efficiency.py).
+    cover the code the GPU runs. Calls with gradients keep their columns: their whole-column forms read no slices
+    in place. The padding is 1 to 4 columns (4 for a count already a multiple of four), so every count takes the
+    same gathers and copies and the work per column does not depend on the count.
     """
     ncol = columns["p_lay"].shape[-1]
     pad = COLUMN_ALIGNMENT - ncol % COLUMN_ALIGNMENT
@@ -624,7 +622,7 @@ def _radiation_group(inputs, config, tables, scales=None):
     chunks do not reduce the daylit compaction. Under grad each chunk is a checkpoint; with the
     radiation entry selected for compile, column work uses the same tensor regions with or without
     column chunks. The whole-mesh parts before and after the mains (setup to cloud diagnostics;
-    post and fluxr) compile only without gradients (their compiled reverse is not qualified).
+    post and fluxr) compile only without gradients (their compiled reverse mode is not validated).
     ``scales``: the radiation parameter scales by group name (``radiation_parameter_scales``; None: no op).
     """
     chunk = scheme_column_chunk("run_native_radiation")
@@ -719,7 +717,7 @@ def run_native_radiation(
         (clock.lsswr == config.lsswr) & (clock.lslwr == config.lslwr),
         "static radiation selection disagrees with the device clock",
     )
-    # atmos_model seeds Stateout before the gate, but calls no cap on skipped steps.
+    # atmos_model seeds Stateout before the radiation-step test, but calls no cap on skipped steps.
     if not (config.lsswr or config.lslwr):
         return NativeRadiationResult(Stateout.from_statein(statein), sfcprop, carry, {})
     config.require_supported()

@@ -9,7 +9,7 @@
 * ``build_clw``: the ``clw`` construction of ``GFS_suite_interstitial_3_run`` (and the
   identical refresh in ``GFS_DCNV_generic_post_run``): transported tracers in
   ``otsptflag`` order from slot 3, ice/water in slots 1/2 by microphysics code.
-* ``samf_water_reconciliation``: the MPAS SAMF water reconciliation of the oracle
+* ``samf_water_reconciliation``: the MPAS SAMF water reconciliation of the MPAS-coupled
   ``GFS_DCNV_generic_post_run`` / ``GFS_SCNV_generic_post_run`` (active when
   ``MPAS_UFS_SAMF_WATER_RECONCILIATION=1``). Column sums run level by level in the
   Fortran order; there is no host synchronisation and its fail-closed guards are
@@ -42,7 +42,7 @@ from sa_sas_deep_convection_torch.constants import HFUS, HVAP
 def detrain_cloud_condensate(ice, liquid, temperature, vapor, entry_vapor, amount, active, cp):
     """Add detrained condensate to the ice and liquid tracers, and heat the cell by the fusion heat of the ice part.
 
-    Deliberate change from GFS v17 (samfdeepcnv.F, samfshalcnv.F; Fortran patch samf_detrain_fusion_heat_20261116):
+    Deliberate change from GFS v17 (samfdeepcnv.F, samfshalcnv.F):
     upstream adds the condensate without heating, so the newly frozen part gives no fusion heat. Here it warms the
     cell by ``HFUS/cp`` per unit of ice on the physics-group entry gas mass, which conserves MPAS internal energy;
     it warms cells where detrained condensate freezes.
@@ -62,7 +62,7 @@ def detrain_cloud_condensate(ice, liquid, temperature, vapor, entry_vapor, amoun
 def evaporate_convective_rain(vapor, temperature, amount, entry_vapor, entry_temperature, active, cp, rd, rv):
     """Evaporate ``amount`` of convective rain into the cell's vapour and cool the cell by its latent heat.
 
-    Deliberate change from GFS v17 (samfdeepcnv.F, samfshalcnv.F; Fortran patch samf_rain_phase_transfer_20261116):
+    Deliberate change from GFS v17 (samfdeepcnv.F, samfshalcnv.F):
     upstream adds ``amount`` to the specific humidity and cools by ``hvap/cp`` at any temperature. Here the vapour
     increment adds exactly ``amount`` of water on the physics-group entry dry-air mass, the other tracers keep their
     dry ratios (``rescale_convective_tracers``), and the cooling uses the latent heat at the entry temperature, so
@@ -128,7 +128,7 @@ OTSPT_EXCLUDED = (
     "ntcw", "ntiw", "ntclamt", "ntrw", "ntsw", "ntrnc", "ntlnc", "ntinc", "ntsnc", "ntgl", "ntgnc",
     "nthl", "nthnc", "ntgv", "nthv", "ntccn", "ntccna", "ntrz", "ntgz", "nthz", "ntsigma", "ntomega",
 )
-# Oracle MPAS lane tracer table (qv qc qr qi qs qg ni nr sgs_tke o3mr).
+# MPAS tracer table of the GFS v17 TEMPO configuration (qv qc qr qi qs qg ni nr sgs_tke o3mr).
 MPAS_TEMPO_TRACERS = ("qv", "qc", "qr", "qi", "qs", "qg", "ni", "nr", "sgs_tke", "o3mr")
 MPAS_TEMPO_INDICES = {
     "ntqv": 1, "ntcw": 2, "ntrw": 3, "ntiw": 4, "ntsw": 5, "ntgl": 6,
@@ -210,14 +210,14 @@ def ccpp_convective_tracers(
 def mpas_tempo_layout(*, ntc: int | None = None) -> ConvectionTracerLayout:
     """MPAS/TEMPO transport layout; pass the actual cap's ntchm as ntc.
 
-    Omission preserves the historical G3.2 nscav-sized chemistry fixture.
+    Without ``ntc``, the chemistry extent is ``nscav``.
     """
 
     rule = ccpp_convective_tracers(
         len(MPAS_TEMPO_TRACERS), MPAS_TEMPO_INDICES, satmedmf=True, trans_trac=True, ncnd=MPAS_NWAT - 1
     )
-    # nscav sizes a different host work array. The real SAMF cap passes ntchm,
-    # which is zero in R4; the G3.2 chemistry fixture passes nscav instead.
+    # nscav sizes a different host work array. The SAMF cap passes ntchm,
+    # which is zero without chemistry.
     if ntc is not None and (type(ntc) is not int or ntc < 0):
         raise ValueError("MPAS convection chemistry extent must be a static nonnegative integer")
     return ConvectionTracerLayout(
@@ -235,7 +235,7 @@ def mpas_tempo_layout(*, ntc: int | None = None) -> ConvectionTracerLayout:
 
 
 def legacy_layout(ntrac: int, *, indices: Mapping[str, int], ntk: int, itc: int, ntc: int) -> ConvectionTracerLayout:
-    """The frozen legacy harness table: nn=ntrac+2, all tracers but qv transported."""
+    """The legacy tracer table: nn=ntrac+2, all tracers but qv transported."""
 
     return ConvectionTracerLayout(
         name="legacy",
@@ -342,7 +342,7 @@ def tendencies_from_dclw(
 
 
 def interface_pressure(psp: torch.Tensor, delp: torch.Tensor) -> torch.Tensor:
-    """prsi(:,1)=ps, prsi(:,k+1)=prsi(:,k)-delp(:,k), level by level as in the harness."""
+    """prsi(:,1)=ps, prsi(:,k+1)=prsi(:,k)-delp(:,k), level by level."""
 
     levels = [psp]
     for k in range(delp.shape[1]):
@@ -396,12 +396,12 @@ def samf_water_reconciliation(
 
     The convective rain that leaves a column must equal the water the column lost. The reconciliation (an MPAS
     coupling step in the GFS_DCNV/SCNV generic post, not in upstream GFS v17) moves the column's residual into its
-    vapour, as a fraction of the column vapour limited per step. Deliberate changes from its first form (Fortran
-    patches samf_native_mass_20261115 and samf_reconciliation_heat_20261116): the residual is measured and applied
-    as water mass on the physics-group entry dry-air mass, the other tracers keep their dry ratios, and the vapour
-    change exchanges the latent heat at the entry temperature (``phase_latent_heat``) in place of ``hvap/cp`` at
-    any temperature. This conserves the transfer's water and MPAS internal energy (not potential or kinetic energy,
-    nor convection's own budget); it changes the reconciled columns' humidity and temperature slightly.
+    vapour, as a fraction of the column vapour limited per step. Deliberate changes from its first form: the
+    residual is measured and applied as water mass on the physics-group entry dry-air mass, the other tracers keep
+    their dry ratios, and the vapour change exchanges the latent heat at the entry temperature
+    (``phase_latent_heat``) in place of ``hvap/cp`` at any temperature. This conserves the transfer's water and
+    MPAS internal energy (not potential or kinetic energy, nor convection's own budget); it changes the reconciled
+    columns' humidity and temperature slightly.
     The Fortran error returns become ``errflg = 1`` without a host read.
     """
 
@@ -496,7 +496,7 @@ def samf_water_reconciliation(
     thermal_total = thermal.sum()
     latent_total = latent.sum()
     # The totals are sums of cancelling column values, so their rounding follows the size of those values and not of
-    # the totals: a chunk total near zero in FP32 failed by rounding alone (column residuals at most 0.22%).
+    # the totals: otherwise a chunk total near zero in FP32 can fail by rounding alone.
     water_scale = torch.abs(column_delta).sum() + torch.abs(applied).sum()
     energy_scale = torch.abs(thermal).sum() + torch.abs(latent).sum()
     water_tol = torch.clamp_min(relative * water_scale, 1.0)

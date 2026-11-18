@@ -4,12 +4,11 @@
 """Working precision of the coupled model: the dtype of the state, not a module constant.
 
 The coupled model runs in the floating dtype of its case. Float64 is the default and the parity
-dtype (cases are prepared in float64 and stay bitwise to the Fortran-derived references); float32
-is separately qualified. Runtime code takes its working dtype from a state tensor it already
-holds (``x.dtype``). FP32 uses FP64 evaluation at selected powers, then rounds once, on CPU and
-CUDA alike; PyTorch 2.8 scalar/SIMD power differences otherwise change results with spatial ownership.
-``ufs_physics_common.precision.working_power`` defines this
-on-device, differentiable precision policy. It does not change FP64 arithmetic.
+dtype (cases are prepared in float64 and stay bitwise to the Fortran-derived references). Runtime
+code takes its working dtype from a state tensor it already holds (``x.dtype``). FP32 uses FP64
+evaluation at selected powers, then rounds once, on CPU and CUDA alike; PyTorch 2.8 scalar/SIMD power
+differences otherwise change results with spatial ownership. ``ufs_physics_common.precision.working_power``
+defines this on-device, differentiable precision policy. It does not change FP64 arithmetic.
 
 ``prepare_case`` makes a case of another precision from a prepared case in memory: every floating
 tensor of the whole case, including configuration tensors, is rounded to ``dtype``
@@ -23,26 +22,26 @@ interpolation). McICA uses the same integer Mersenne-Twister words in both preci
 FP64 uniforms divide by ``2**32 - 1``, while FP32 uses exact integer threshold predicates.
 Host tables (fpvs, CO2) are built in float64 and held in the working dtype.
 
-Where float32 loses meaning (not tuned; revisit before float32 science runs):
+Where float32 loses meaning (these guards are not tuned for float32):
 - ``eps_scaled`` guards keep the float64 count of rounding steps: ``reverse.py`` mass check (1e-10 is
   4.5e5 ulp, 5.4e-2 relative in float32: the check no longer catches a vapour-basis error) and the
   SAMF water/energy reconciliation (``samf_interstitials.py`` 5e-13, 2.7e-4 in float32).
 - ``roundoff_floor``: the absolute tracer floors (``projection.py`` -1e-10, -1e-8 for ni/nr) are below
   float32 resolution; float32 uses 64 ulp of the field maximum (ni reached -0.03 kg-1 at the first commit after the physics group).
 - Divide guards of 1e-300 round to 0 in float32 (0/0 in masked lanes): TEMPO ``torch_native.py``
-  (42 sites, e.g. 4667, 6103, 14543), Noah-MP ``land_energy.py`` 1974; ``frac > 1e-300`` in RRTMGP
-  ``shortwave.py`` 568 and ``longwave_main.py`` 488 becomes ``frac > 0``.
-- Additive guards below float32 epsilon are no-ops: ``surface_mirror.py`` 161 (``smc + 1e-12``),
-  surface layer ``driver.py`` 333/337 (``wind2 >= 1e-12`` fallback).
-- RRTMGP thresholds from float64 epsilon (``radiation_group.py`` 125-135: WP_EPS, LW_TAU_THRESH,
+  (42 sites), Noah-MP ``land_energy.py``; ``frac > 1e-300`` in RRTMGP ``shortwave.py`` and
+  ``longwave_main.py`` becomes ``frac > 0``.
+- Additive guards below float32 epsilon are no-ops: ``surface_mirror.py`` (``smc + 1e-12``),
+  surface layer ``driver.py`` (``wind2 >= 1e-12`` fallback).
+- RRTMGP thresholds from float64 epsilon (``radiation_group.py``: WP_EPS, LW_TAU_THRESH,
   SW_MIN_K, SW_MIN_MU0); a float32 Fortran build would take epsilon(1._sp).
 - The CCPP fill value ``huge`` (9.97e36) times a squared wind overflows float32 in unused surface
-  lanes (surface layer ``driver.py`` 332-334, masked afterwards).
+  lanes (surface layer ``driver.py``, masked afterwards).
 - Ordered column sums (``ledger._ordered_totals``: limiter ledgers, reference geometry) accumulate
-  ~n*eps relative error over 10,242 columns in float32.
+  ~n*eps relative error over n columns in float32.
 - TEMPO collection and freezing tables (``real(table_dp)`` in module_mp_tempo_params.F90) and its
   ``real(dp)`` diagnostics are float32 here.
-- The dycore's compiled normal-mode AD is qualified for float64 only (``compile_utils.py`` 3863);
+- The dycore's compiled normal-mode AD is validated for float64 only (``compile_utils.py``);
   float32 runs the no-grad and eager differentiable paths.
 """
 

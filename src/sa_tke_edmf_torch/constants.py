@@ -1,13 +1,13 @@
 # Copyright (c) 2026 IC Weather LLC. Licensed under LICENSE and PERMISSIONS.md.
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""Constants for the approved profile-based SA-TKE-EDMF gate path."""
+"""Constants of the SA-TKE-EDMF port."""
 
 import struct
 
 
 def source_real(value: float, config: dict) -> float:
-    """Bind default-real literals to the oracle build, without tensor host reads."""
+    """Bind default-real literals to the Fortran build's default real kind, without tensor host reads."""
     kind = config.get("source_default_real_bytes", 4)
     if kind == 8:
         return value

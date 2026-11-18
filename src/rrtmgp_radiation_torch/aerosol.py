@@ -37,7 +37,7 @@ WVNLW2 = np.asarray(
     dtype=np.float64,
 )
 
-# physcons.F90 values used by the active CCPP-SCM source chain.
+# physcons.F90 values.
 CON_T0C = 2.7315e2
 CON_C = 2.99792458e8
 CON_PLNK = 6.6260693e-34

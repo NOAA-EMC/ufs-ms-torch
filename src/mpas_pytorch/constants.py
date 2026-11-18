@@ -197,7 +197,7 @@ NCAR_CONSTANTS = ConstantsProfile(
     },
 )
 
-# R4 physconst_ufs_mpas_rrfs_compat.F90 and mpas_constants_compute_derived.
+# UFS physconst_ufs_mpas_rrfs_compat.F90 and mpas_constants_compute_derived.
 UFS_CONSTANTS = ConstantsProfile(
     name="ufs",
     PI=PI,

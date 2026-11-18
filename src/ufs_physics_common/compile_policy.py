@@ -3,19 +3,19 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """Exact-numerics policy for ``torch.compile`` over whole physics schemes.
 
-Measured on torch 2.8.0 with captured coupled inputs (2026-10-15):
+Behaviour of torch 2.8.0 that the policy corrects or avoids:
 
 * Inductor lowers ``x / c`` for a Python constant ``c`` to ``x * (1 / c)``, and
   ``x ** n`` for scalar ``n`` to multiplication chains (|n| >= 4, n <= -2) or to
-  ``pow`` (n = -0.5); both differ from eager in the last bit (shared reference G34).
-* Inductor's vectorized CPU C++ code returned a wrong water-vapour tendency for
-  the whole-scheme SATMEDMF graph (5184 of 140800 values, up to q/dt), while
-  ``eager``, ``aot_eager`` and scalar CPU code (``cpp.simdlen = 1``) matched eager.
-* Clang merged ``std::sin``/``std::cos`` of one argument into ``sincos`` and
+  ``pow`` (n = -0.5); both differ from eager in the last bit.
+* Inductor's vectorized CPU C++ code returns a wrong water-vapour tendency for
+  the whole-scheme SATMEDMF graph (errors up to q/dt), while
+  ``eager``, ``aot_eager`` and scalar CPU code (``cpp.simdlen = 1``) match eager.
+* Clang merges ``std::sin``/``std::cos`` of one argument into ``sincos`` and
   ``pow(10, x)`` into ``exp10`` in Inductor's CPU kernels, and Inductor lowers
   ``pow(2, x)`` to ``exp2``; each differs from eager by an ulp.
-* CPU FP32 transcendental functions differ between ATen's vector path and scalar libm. The
-  compiled 240km pressure projection differed at 1594 interface values. FP32
+* CPU FP32 transcendental functions differ between ATen's vector path and scalar libm, which
+  changes the compiled pressure projection. FP32
   CPU functions with measured mismatches retain ATen calls; FP64 and CUDA keep their existing lowering.
   This includes the three power overloads and the FP32 tanh backward tail. CPU FP64 tanh backward
   also keeps ATen's kernel, whose rounding depends on the wheel's build (FMA on linux-aarch64).
@@ -23,7 +23,7 @@ Measured on torch 2.8.0 with captured coupled inputs (2026-10-15):
   chains, including in reciprocal-square-root backward. Native ``rsqrt`` also differs
   from Inductor's Metal intrinsic. Native MPS sums retain eager's accumulation order.
   Native MPS ``log1p`` preserves its dedicated evaluation; generic codegen evaluates
-  ``log(1 + x)``, changing cloud cover on the independent late-state packet.
+  ``log(1 + x)``, which changes the cloud cover.
 * Torch2.8's MPS ``any`` codegen can corrupt a fused strided producer by nesting independent
   reduction-index loops. A fused Boolean consumer can also receive a string dtype.
   Native ATen MPS ``any`` avoids both defects without changing the assertion or moving data to CPU.
@@ -33,27 +33,25 @@ Measured on torch 2.8.0 with captured coupled inputs (2026-10-15):
 * Metal permits 31 separately bound buffers. A four-node fusion of recurrence assembly can
   still require 76 buffers. Bound MPS fusion by external reads plus all produced buffers,
   not only node count; this conservative estimate includes stores that codegen may remove.
-  Static-shape regions can then retain useful fusion without a global four-node cap (G225).
+  Static-shape regions can then retain useful fusion without a global four-node cap.
   Scalar backward addition chains can already exceed this limit before scheduling. Realize
   their existing operands before combining more than 30 distinct reads; addition order stays fixed.
 * Torch 2.8's ``pointless_convert`` removes CPU FP64 -> FP32 -> FP64 chains,
-  losing the required intermediate rounding between mixed-precision powers.
-  TEMPO's sedimentation snow moment differed at 2128 values. Keep that rounding.
+  losing the required intermediate rounding between mixed-precision powers
+  (in TEMPO's sedimentation snow moment, for example). Keep that rounding.
 * Triton contracts ``a * b + c`` into FMA unless ``TRITON_DEFAULT_FP_FUSION=0``;
   eager CUDA runs the two operations as separate kernels.
 * The policy leaves Inductor's coordinate-descent tuning of Triton launch shapes at its default (off): it
   changes only GPU launch configurations, not CPU code, and it lengthens the first compile. Set
   ``TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1`` before the first compile to turn it on.
-* Inductor's in-place buffer reuse (``inplace_buffers``) gave wrong gradients for the RRTMGP SW
-  two-stream solver (``radiation_group._sw_solve``): its compiled backward overwrote a saved
-  activation that other saved views (``unbind`` of one buffer) still read. Compiled VJPs were off
-  by up to 7 % on random inputs and by 1e7 relative in the coupled radiation entry, while the
-  forward, the FX graphs run eagerly and each compiled graph on cloned inputs were exact
-  (2026-10-18, torch 2.8.0, CPU). Off in this policy; it changes where results are stored, not
-  their values.
+* Inductor's in-place buffer reuse (``inplace_buffers``) gives wrong gradients for the RRTMGP SW
+  two-stream solver (``radiation_group._sw_solve``) on CPU: its compiled backward overwrites a saved
+  activation that other saved views (``unbind`` of one buffer) still read, while the forward, the
+  FX graphs run eagerly and each compiled graph on cloned inputs are exact. Off in this policy; it
+  changes where results are stored, not their values.
 * Inductor decomposes ``aten._assert_async`` to nothing (torch 2.8 ``_inductor/decomposition.py``),
   and AOT tracing drops the one-argument form as dead code, so every finiteness, error-flag and
-  bound check inside a compiled region is off: a NaN raises in eager, not compiled (2026-10-21).
+  bound check inside a compiled region is off: a NaN raises in eager, not compiled.
   The coupled interval driver checks the cycle state's finiteness outside compiled code instead
   (``cycle.run_coupled_interval``).
 
@@ -65,19 +63,18 @@ and consumers depend on the completed accumulation rather than a mutable zero bu
 CPU loop reshaping preserves manually installed allocation and mutation-order dependencies.
 Torch 2.8 otherwise drops these edges and can schedule a backward write before allocation.
 Floating zero additions/subtractions remain in the graph: Inductor's identity
-removal otherwise changes +0 + -0 to -0 (four 60 km surface-w values).
+removal otherwise changes +0 + -0 to -0.
 
 CPU FP32 and FP64 forward sums also retain ATen's order and operand layout. In FP32 the PBL
-negative-tracer recovery otherwise differs at six captured values, with later
-differences surviving in subnormal ice-number tracers. In FP64 Inductor's scalar CPU code adds
+negative-tracer recovery otherwise differs from eager, and the differences persist in subnormal
+ice-number tracers. In FP64 Inductor's scalar CPU code adds
 ``torch.sum`` over a dimension in index order, while eager ATen adds the vector lanes first (four
 float64 values on arm64: ``(x0 + x2) + (x1 + x3)``); a recompiled variant can switch to the scalar
-code. The SA-TKE negative-energy borrowing sum then gave 1 ulp of TKE in one x1.10242 column at
-cycle 15 and a different 25-cycle state (2026-10-27); Noah-MP soilwater ``rsat`` gave 1 ulp of
-``runoff`` in one x1.163842 column (2026-10-21).
+code. The SA-TKE negative-energy borrowing sum (and with it the later state) and Noah-MP soilwater
+``rsat`` (and with it ``runoff``) then differ from eager by an ulp.
 CPU floating minimum/maximum also keep ATen and its operand layouts. On arm64 their vector bodies
 and scalar tails choose different signed-zero operands. Scalar Inductor code otherwise changes
-one carried Noah-MP canopy-evaporation zero at +354 h, despite matching every published field.
+the sign of carried zeros (in Noah-MP canopy evaporation, for example).
 CPU FP32 clamp also keeps ATen: its vector body and scalar tail use different zero-tie rules.
 
 With this policy the compiled PBL, NSST, sea-ice and surface-layer calls are
@@ -148,7 +145,7 @@ def eager_regions_active() -> bool:
 
 
 # True while an orchestration region (``compiled(..., orchestration=True)``) runs or traces, outside its islands.
-# A module global, not a context variable: Dynamo reads it while tracing and guards on it (G257).
+# A module global, not a context variable: Dynamo reads it while tracing and guards on it.
 _orchestrating = False
 
 
@@ -156,7 +153,7 @@ def dispatcher(fn: Callable[..., Result]) -> Callable[..., Result]:
     """Mark an island dispatcher: Dynamo inlines it into a region it traces, but never compiles it as a frame.
 
     Inside an orchestration region Dynamo compiles every frame it enters; a dispatcher frame would compile
-    one variant per island it dispatches (167 for SA-SAS at x1.10242) until the recompile limit.
+    one variant per island it dispatches until the recompile limit.
     """
     torch._dynamo.eval_frame.skip_code(fn.__code__)
     return fn
@@ -186,7 +183,7 @@ def island(fn: Callable[..., Result], args: tuple, kwargs: dict | None = None, *
 
     While a region traces, ``fn`` is inlined into it (``compiled``). Inside an orchestration region (tracing or
     running) the island runs outside it, through its own region: a graph break while the orchestration traces, so
-    each island stays one region that its repeated calls reuse (G127) and only the code between islands joins the
+    each island stays one region that its repeated calls reuse and only the code between islands joins the
     orchestration graphs.
     """
     kwargs = {} if kwargs is None else kwargs
@@ -340,7 +337,7 @@ def _functional_accumulate() -> None:
 
     Generated CPU atomic adds change order between calls. IndexPutFallback also loses a
     read-after-write dependency in large graphs. Fusing consumers of scatter_add's mutable
-    reduction buffer changed the actual TEMPO substep VJP by 26.6%. A functional result
+    reduction buffer changes the TEMPO substep VJP. A functional result
     owns fresh storage, so consumers depend on the completed accumulation.
     ATen controls device determinism; this does not change the process-wide setting.
     """
@@ -382,9 +379,9 @@ def _keep_separate_libm_calls() -> None:
 
     With -fno-math-errno clang merges std::sin and std::cos of one argument into a
     sincos call that can differ from the separate calls eager makes by one ulp
-    (measured in GWD mountain blocking on macOS arm64), and rewrites pow(10, x)
-    into exp10(x) (Noah-MP czil). Inductor's -fno-signed-zeros turned -0.0 into
-    +0.0 in Noah-MP etran. Triton ignores these flags.
+    (GWD mountain blocking), and rewrites pow(10, x) into exp10(x) (Noah-MP czil).
+    Inductor's -fno-signed-zeros turns -0.0 into +0.0 (Noah-MP etran). Triton
+    ignores these flags.
     """
     from torch._inductor import cpp_builder
 
@@ -399,10 +396,10 @@ def _keep_separate_libm_calls() -> None:
 def _no_cpu_outer_loop_fusion() -> None:
     """Turn off Inductor's CPU outer-loop fusion (torch 2.8.0), whose local buffers can be undersized.
 
-    A compiled-reverse coupling test (x1.10242, column chunk 2561) aborted on heap corruption: the
-    generated backward kernel allocated ``make_unique<double []>(1)`` for an outer-loop local buffer and
-    wrote it at ``[x1]`` for x1 in 0..52 (the size is sliced from the global layout with a negative
-    offset). Without outer-loop fusion every node keeps its global buffer; the arithmetic is unchanged.
+    A generated backward kernel can allocate ``make_unique<double []>(1)`` for an outer-loop local buffer
+    and write it at ``[x1]`` past that size (the size is sliced from the global layout with a negative
+    offset), which corrupts the heap. Without outer-loop fusion every node keeps its global buffer; the
+    arithmetic is unchanged.
     Triton (CUDA) does not use this path.
     """
     from torch._inductor.codegen import cpp
@@ -417,8 +414,8 @@ def _preserve_scheduling_dependencies() -> None:
     """Keep Torch 2.8 CPU loop reshaping from discarding mutation-order edges.
 
     recompute_size_and_body rebuilds tensor reads from the loop body, unlike
-    refresh_dependencies, which retains StarDep/WeakDep. The actual deep-convection
-    backward lost 15 allocation edges and wrote an unallocated buffer. Retain those
+    refresh_dependencies, which retains StarDep/WeakDep. The deep-convection backward
+    otherwise loses allocation edges and writes an unallocated buffer. Retain those
     manual edges while allowing the reshaped tensor reads and writes to change.
     """
     from torch._inductor import scheduler
@@ -441,12 +438,11 @@ def _preserve_scheduling_dependencies() -> None:
 def _cached_fusion_scores() -> None:
     """Per-node caches for two of Inductor's fusion heuristics (torch 2.8.0); same results, less compile time.
 
-    For every candidate pair, ``score_fusion_memory`` rebuilt both nodes' read|write dependency sets and
-    ``can_fusion_increase_peak_memory`` rebuilt their single-user inputs and a sympy reuse key per buffer.
-    On the TEMPO and convection graphs (30-85k FX nodes) this was 26-40% of the whole compile (CPU,
-    2026-10-20). Here each node's dependency ids and reuse keys are formed once (buffer users do not change
-    while nodes fuse) and a pair compares them: the same integers and decisions, so the same generated code
-    (TEMPO 103/103 and convection 25/25 code files identical; fusion 219 -> 54 s and 157 -> 50 s).
+    For every candidate pair, ``score_fusion_memory`` rebuilds both nodes' read|write dependency sets and
+    ``can_fusion_increase_peak_memory`` rebuilds their single-user inputs and a sympy reuse key per buffer.
+    On graphs of tens of thousands of FX nodes (TEMPO, convection) this is a large part of the compile time.
+    Here each node's dependency ids and reuse keys are formed once (buffer users do not change while nodes
+    fuse) and a pair compares them: the same integers and decisions, so the same generated code.
     """
     import itertools
 
@@ -528,9 +524,9 @@ def _make_cuda_reduction_fusion(original):
     """On CUDA, keep pointwise work over a reduction's whole (rows x reduced) range out of the reduction's kernel.
 
     Inductor fuses such nodes into the reduction loop when the sizes match, so a long pointwise computation that
-    only shares the iteration space runs inside a per-row reduction kernel: TEMPO's microphysics rates beside the
-    column ``any`` of their supersaturation ran at 77-94 GB/s, 25 ms per 60 km step on an RTX PRO 6000 (round 8),
-    where the same rates as pointwise kernels run at 0.7-1.5 TB/s. The reduction reads the buffers it needs. Values
+    only shares the iteration space runs inside a per-row reduction kernel (TEMPO's microphysics rates beside the
+    column ``any`` of their supersaturation, for example), at a small fraction of the memory bandwidth the same
+    computation reaches as pointwise kernels. The reduction reads the buffers it needs. Values
     do not change: Triton contracts no multiply-adds under this policy (``TRITON_DEFAULT_FP_FUSION=0``).
     """
     @functools.wraps(original)
@@ -580,7 +576,7 @@ def _make_cpu_clamp(original, bound_wins, aten_op):
 
     Inductor lowers clamp_min/clamp_max to maximum/minimum, where the bound wins
     the tie (+0.0). NaN arguments pass through both forms. CUDA keeps Inductor's
-    lowering until its own eager tie rule is measured.
+    lowering.
     """
     from torch._inductor import lowering
     from torch._inductor.virtualized import V
@@ -628,7 +624,7 @@ def _tensor_constant_triton_index() -> None:
 
     Inductor 2.8 tests only ``sympy.Integer`` for constant indices. A gather whose
     indirect index folds to a literal prints as e.g. ``1800 + 18*(9)`` and is passed
-    to ``tl.broadcast_to``, which Triton rejects (whole-scheme SATMEDMF on an A100).
+    to ``tl.broadcast_to``, which Triton rejects (whole-scheme SATMEDMF on CUDA).
     Only purely numeric index strings change; arithmetic on data is untouched.
     """
     import dataclasses
@@ -670,7 +666,7 @@ def _normalize_tiling_solutions() -> None:
     Normalize before solving too: FloorDiv/ModularIndexing validation substitutes
     the solution back into the index expression. Keep all coalescing heuristics.
     A zero solution is no tile: the analyzer would divide the variable's range by it
-    (ZeroDivisionError compiling the UGWP v1 ``ngw_solv2`` training graph on CUDA, 2026-10-28).
+    (a ZeroDivisionError, as in the UGWP v1 ``ngw_solv2`` backward graph on CUDA).
     """
     from torch._inductor import tiling_utils
     from torch.utils._sympy.functions import Identity
@@ -734,8 +730,8 @@ def _widen_reduction_configs(configs, size_hints, max_warps=32):
 
     Triton 3.4 (sm_80) fails `TritonGPURemoveLayoutConversions` ("operand does not dominate
     this use") on large fused backward reductions whenever a block holds more than half an
-    element per thread (SATMEDMF r=9 and SA-SAS deep r=55 kernels, every XBLOCK/num_warps
-    pair checked); with at least two threads per element every checked layout compiled.
+    element per thread (SATMEDMF and SA-SAS deep backward kernels, for any XBLOCK/num_warps
+    pair); with at least two threads per element these layouts compile.
     """
     from torch._inductor.runtime.runtime_utils import next_power_of_2
     from torch._inductor.runtime.triton_heuristics import get_total_reduction_numel
@@ -805,7 +801,7 @@ def _reclaim_driver_autotune_oom(original):
     (autotune benchmarks and kernel launches).
 
     A spilling kernel's locals live in driver local memory, sized at its first launch for every
-    resident thread (13.6 KB per thread measured at 60 km, about 3 GB on an A100). The caching
+    resident thread, which can amount to gigabytes on a large device. The caching
     allocator does not count it: after a radiation step it may hold most of the device as unused
     cache, and the launch (or an autotune benchmark) then fails with a driver out-of-memory error.
     A failed launch has not run, so one retry after the cache is released repeats nothing. Both launchers
@@ -843,8 +839,8 @@ def _benchmark_spilling_pointwise(original):
     """Measure pointwise candidates when Torch would reject every candidate for spills.
 
     Torch 2.8 returns infinity above its spill threshold, then selects the first candidate
-    if every cost is infinite. TEMPO selected n_spills=1976 without measuring its
-    n_spills=134 alternative. This driver metric includes local stack bytes / 4.
+    if every cost is infinite, so a heavily spilling TEMPO kernel config can win without its
+    less spilling alternatives being measured. This driver metric includes local stack bytes / 4.
     Keep reduction configurations and their arithmetic unchanged.
     """
     from torch._inductor.runtime.hints import HeuristicType
@@ -876,8 +872,8 @@ def _overflow_pointwise(original):
     """Do not enlarge Y tiles for a limit already handled by the overflow grid.
 
     Torch 2.8's pointwise factory increases YBLOCK to keep grid Y <= 65535,
-    even for Grid2DWithYZOverflow. At 60 km this creates 64x1024 tiles and
-    multi-minute native builds. Only candidate sizing uses the capped hint;
+    even for Grid2DWithYZOverflow. On large meshes this creates 64x1024 tiles and
+    long native builds. Only candidate sizing uses the capped hint;
     the autotuner and generated grid retain the complete problem size.
     """
     from torch._inductor.runtime import triton_heuristics as heuristics
@@ -1085,14 +1081,13 @@ def _canonical_layout(value, seen: set[int]):
     A scheme region takes the whole carried state, and Dynamo guards every tensor it passes through on
     strides and on object identity between inputs. The carry alternates layouts (a contiguous cold-start
     field, a strided view of qgrs after Noah-MP, a fresh field after a radiation step; two names bound
-    to one object or not), so one region collected a variant per combination: apply_surface_layer
-    reached torch's recompile limit after the first radiation step (x1.10242, 13 cycles), a hard error
-    under fullgraph. Only views into a larger buffer are copied (their strides depend on the producer);
-    a tensor that owns its whole storage keeps its layout, so the column-major TEMPO tables (0.9 GiB) are
+    to one object or not), so one region would collect a variant per combination: apply_surface_layer
+    would reach torch's recompile limit after the first radiation step, a hard error under fullgraph.
+    Only views into a larger buffer are copied (their strides depend on the producer);
+    a tensor that owns its whole storage keeps its layout, so the large column-major TEMPO tables are
     never copied, and broadcast (stride-0) views stay as they are. Values are unchanged.
     A later occurrence of one tensor object is a distinct alias (``view_as``, no copy; a copied view is
-    copied again): Dynamo then sees distinct objects whatever the carry binds twice, and no bytes move
-    (a copy of each repeat cost 67 mesh tensors per microphysics-prefix call at 60 km).
+    copied again): Dynamo then sees distinct objects whatever the carry binds twice, and no bytes move.
     """
     if isinstance(value, torch.Tensor):
         copy = (not value.is_contiguous() and 0 not in value.stride()
@@ -1106,7 +1101,7 @@ def _canonical_layout(value, seen: set[int]):
         return out if any(out[k] is not v for k, v in value.items()) else value
     if isinstance(value, tuple) and not hasattr(value, "_fields"):
         # Lists stay opaque: in scheme inputs they hold per-column Python records (Noah-MP's case has
-        # 10,243 column dicts; walking them cost 1.1 s per call), not carried tensors.
+        # one dict per column, slow to walk on every call), not carried tensors.
         out = [_canonical_layout(v, seen) for v in value]
         return tuple(out) if any(a is not b for a, b in zip(out, value)) else value
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
@@ -1135,7 +1130,7 @@ def compiled(fn: Callable[..., Result], *, normalize_layouts: bool = True,
     parsing, coefficient reduction), which Dynamo must not trace. Later calls run the
     compiled region, which equals eager bit for bit under this policy. With ``cost_meter`` on,
     each call outside a traced region is a timed region named ``fn.__name__``.
-    ``normalize_layouts=False`` is for qualified read-only tensor islands/assembly only. Their
+    ``normalize_layouts=False`` is for read-only tensor islands/assembly only. Their
     producer layouts stay explicit in guards; all carried-state regions keep normalization.
 
     ``orchestration=True`` is for a scheme's container orchestration around its islands, forward only (with

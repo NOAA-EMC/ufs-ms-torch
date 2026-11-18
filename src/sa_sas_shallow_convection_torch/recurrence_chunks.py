@@ -30,7 +30,7 @@ def pack_profiles(*values):
     """One contiguous [level, profile, column, ...] packet per ordered pass.
 
     A compiled island (one tiled transpose kernel): eager, the stack of level-leading views was a strided
-    batched copy (G4a, CatArrayBatchedCopy). Values are copies, unchanged.
+    batched copy (CatArrayBatchedCopy). Values are copies, unchanged.
     """
     from sa_sas_shallow_convection_torch.compile import run_compile_island
 
@@ -43,8 +43,7 @@ def _pack_profiles(values):
 
 def _stack(values):
     # Levels before columns, then a column-leading view: with the caller's slice_scatter Inductor
-    # writes the chunk in one kernel (a dim-1 stack cost one more kernel and 34% more bytes in a
-    # 55-level mimic). Values are unchanged.
+    # writes the chunk in one kernel (a dim-1 stack costs one more kernel). Values are unchanged.
     return torch.stack(values, dim=0).movedim(0, 1)
 
 

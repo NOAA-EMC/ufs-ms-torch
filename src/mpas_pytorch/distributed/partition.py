@@ -402,7 +402,7 @@ def partition_initial_state(
 
     No initialization equations are duplicated. Call the ordinary loader on CPU
     once at setup, then release the global cold-start dictionaries after sharding.
-    This is not yet a distributed run_timestep entry point.
+    This is not a distributed run_timestep entry point.
     """
     target_device = torch.device(device)
     for kind, dimension in _DIMENSIONS.items():

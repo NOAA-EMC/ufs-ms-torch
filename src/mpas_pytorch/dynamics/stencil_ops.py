@@ -4,7 +4,7 @@
 """Reusable stencil operators for vectorized MPAS dynamics kernels.
 
 These helpers provide gather-reduce and CSR-SpMM implementations for common
-connectivity patterns used by diagnostic-solve and upcoming vectorized kernels.
+connectivity patterns used by diagnostic-solve and other vectorized kernels.
 """
 
 from __future__ import annotations
@@ -176,8 +176,8 @@ def _slot_batches(slot_count: int, batch_size: int = _STENCIL_SLOT_GATHER_BATCH)
 
 def _slot_gather_batch(field: torch.Tensor, slot_count: int) -> int:
     # One slot per gather on every device. Wider batches give the same bytes
-    # but make Inductor materialize [rows, width, levels] gathers on CUDA:
-    # A100 60 km split 482 -> 419 ms/step at width 1 (kernel-efficiency ke3).
+    # but make Inductor materialize [rows, width, levels] gathers on CUDA,
+    # which is slower than width 1.
     return 1
 
 
@@ -199,8 +199,8 @@ def _static_mask_all_true(
 ) -> bool | None:
     """Infer only shape-proven shortcuts; otherwise retain the tensor mask.
 
-    The compatibility argument no longer permits tensor-to-host inference.
-    Nonempty masks remain authoritative in the existing masked numerical path.
+    The compatibility argument does not permit tensor-to-host inference.
+    Nonempty masks remain authoritative in the masked numerical path.
     """
     del allow_cuda_sync
     if mask is None:
@@ -328,7 +328,7 @@ class _IndexCopyRows(torch.autograd.Function):
     """Memory-efficient row replacement for autograd.
 
     Standard ``torch.index_copy`` saves the full output tensor in the
-    backward graph (~5 MB per call on the coarse mesh). This custom Function saves
+    backward graph. This custom Function saves
     only ``row_idx`` (tiny) and propagates gradients sparsely: the backward
     for ``base`` scatters the output gradient at non-replaced rows, and
     the backward for ``values`` gathers from the replaced rows.
@@ -715,8 +715,8 @@ def _gather_rows_numeric(field: torch.Tensor, row_idx: torch.Tensor) -> torch.Te
     return gathered.reshape(*row_idx.shape, *field.shape[1:])
 
 
-# Least recently used last. One x1.40962 adjoint step uses about 180 plans of stable index sets; the
-# limit keeps them while index sets of one call age out.
+# Least recently used last. One adjoint step uses many plans of stable index sets; the limit keeps
+# them while index sets of one call age out.
 _ORDERED_SUM_PLANS: dict[tuple[object, ...], OrderedSumPlan] = {}
 _ORDERED_SUM_PLAN_LIMIT = 512
 
@@ -796,8 +796,8 @@ def _ordered_index_sum_numeric(
             return values.new_zeros((n_source_rows, *values.shape[1:]))
         if torch.compiler.is_compiling() or torch_compat.is_fake(values):
             # A traced region (Dynamo, or AOT tracing a backward) cannot plan on the host: one
-            # scatter-add, summed in the device's order (compiled derivatives are judged by the
-            # derivative checks, not bit for bit).
+            # scatter-add, summed in the device's order (compiled derivatives are therefore not
+            # bit for bit equal to eager ones).
             return torch.index_add(values.new_zeros((n_source_rows, *values.shape[1:])), 0, indices, values)
         plan = _ordered_sum_plan(indices, n_source_rows, plan_key)
         return _ordered_segment_sum_by_plan(plan, values, n_source_rows)

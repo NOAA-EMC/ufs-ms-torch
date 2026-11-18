@@ -25,8 +25,8 @@ recomputes. A selected scheme's compiled region is then the chunk; ``run_native_
 it gathered from the whole mesh.
 
 ``set_unchunked_schemes`` (default empty): selected column-local entries run
-as one batch without changing other entries' memory limits. This explicit experiment policy
-requires separate memory qualification; checkpoint recomputation retains the forward selection.
+as one batch without changing other entries' memory limits. This explicit policy needs its own
+memory check; checkpoint recomputation retains the forward selection.
 Forward steps are decided by ``set_column_chunk(None)`` alone: every entry then runs full batch.
 ``FULL_BATCH_SCHEMES`` names the entries that a differentiable caller keeps full batch under a column
 limit, and ``RADIATION_REVERSE_COLUMNS`` bounds radiation's chunk under grad (``plan_memory``).
@@ -77,7 +77,7 @@ Cycle checkpointing: a differentiable ``run_coupled_interval`` keeps operation i
 backward recomputes them through ``cycle._checkpointed_cycle``. Global multicycle intervals retain
 five-field post-dynamics atmospheric phases; initial compatibility inputs and terminal observations
 remain separate. Other boundary modes retain completed-cycle inputs. Forward/replay identity is
-bitwise; native/carried VJP accumulation can round differently and must pass the established AD gates.
+bitwise; native/carried VJP accumulation can round differently.
 Reverse-mode memory is about one operation's graph plus the carried states.
 Each recompute uses the compaction rungs its forward used and
 checks on the device that its output state equals the forward's bit for bit (on CUDA both run with
@@ -97,10 +97,10 @@ NumPy or DLPack views) are not seen. The observers' carry receipt always compare
 ``with_dycore_compile(config)`` is a configuration, not a switch: the dycore's
 compile settings enter its continuation identity, so a run selects them before
 cold initialization. The same config serves every kind of step (``dynamics.dycore_step_config``):
-steps without derivatives run the compiled regions; derivative steps run them only where
-qualified (reverse mode with ``reverse=True``) and otherwise eagerly, through a private per-step
-key outside the continuation identity. ``reverse=True`` selects the compiled regions under
-reverse-mode AD too (see its docstring for the qualification and the forward-mode limit).
+steps without derivatives run the compiled regions; derivative steps run them only in reverse
+mode with ``reverse=True`` and otherwise eagerly, through a private per-step key outside the
+continuation identity. ``reverse=True`` selects the compiled regions under reverse-mode AD too
+(see its docstring for the forward-mode limit).
 
 The switches are module globals: they hold for the whole process, and no lock guards them. Set them
 from one thread, before the run that reads them; two models with different settings need two processes.
@@ -128,8 +128,8 @@ _saved_tensor_offload = False
 _column_chunk: int | None = None
 # {kind: ((first substep, column fraction), ...)}. Rain and graupel sediment in one loop (kind
 # rain_graupel) that compacts from substep 0 (only columns holding either species sediment); snow
-# runs substeps 0-1 on every column. Each buffer holds at least 3x the column share that needed its
-# tier after 2 h of the x1.10242 coupled run (2026-10-17): rain any 13.4 %, > 2 substeps 7.0 %,
+# runs substeps 0-1 on every column. The fractions are fitted to measured coupled runs: each buffer holds
+# at least 3x the column share that needed its tier: rain any 13.4 %, > 2 substeps 7.0 %,
 # > 4 1.1 %; graupel any 4.0 %, > 2 0.23 % (so rain or graupel at most 17.4 %, 7.2 %, 1.1 %);
 # snow > 2 8.6 %, > 4 2.0 %, > 8 0.5 %. An undersized buffer sets its overflow bit and the
 # interval driver retries the affected group one ladder rung up (raise_compaction).
@@ -137,33 +137,26 @@ _column_chunk: int | None = None
 # (torch_native.sedimentation_substep_bound: int(dt*v/dz_min + 1) + 1 substeps, int(n/10) + 1 on
 # the semi-Lagrangian rain/graupel path, dz_min the grid's thinnest layer). 20 m/s is the
 # worst-case ceiling (DEFAULT_MAX_SEDIMENTATION_FALL_SPEED): 14 rain/graupel and 131 snow
-# substeps at dt 300 s, dz_min 46.4 m (x1.10242; the 60 km case, also dt 300 s, has the same 14
-# and 131), against at most 6 and 22 needed after 2 h of the x1.10242 run (effective fall speeds
-# <= 9.0 and <= 3.2 m/s). The defaults 12 and 5 m/s (1.3x and 1.5x those) give 8 and 34 substeps
-# there. A column that
-# needs more sets region tempo.bound.<kind>; the driver retries with the next ceiling of
-# TEMPO_FALL_SPEED_LADDER, up to the worst case.
+# substeps at dt 300 s and dz_min 46.4 m, against at most 6 and 22 needed in measured coupled runs
+# (effective fall speeds <= 9.0 and <= 3.2 m/s). The defaults 12 and 5 m/s (1.3x and 1.5x those)
+# give 8 and 34 substeps there. A column that needs more sets region tempo.bound.<kind>; the driver
+# retries with the next ceiling of TEMPO_FALL_SPEED_LADDER, up to the worst case.
 TEMPO_FALL_SPEED_LADDER = (5.0, 12.0, 20.0)
 # "window": the source cells one semi-Lagrangian destination may span (kt - kb + 1; the static loop of its
-# inner-cell sums). Over 5 cycles of the x1.10242 coupled run (2026-11-12, round-4 log entry 8) a destination
-# spans at most 3 (1 inner cell, 296 of 35 M destinations in cycle 5); 4 is one cell above. A wider
+# inner-cell sums). In measured coupled runs a destination spans at most 3 (1 inner cell, rarely); 4 is one
+# cell above. A wider
 # destination sets region tempo.window; the driver retries with the next TEMPO_WINDOW_LADDER rung and then
 # unbounded (None).
 TEMPO_WINDOW_LADDER = (4, 8, 16, 32, 64)
 # "lanes": ((group, fraction), ...), the buffers of TEMPO's masked FP64 lane groups (torch_native.set_lane_compaction)
-# as fractions of the [column, level] lanes. "snow": the snow moments, sedimentation snow moments and snow fall
-# speed (mask l_qs; rs > R1). On the x1.10242 FP32 coupled run of 2024-01-01 (cold start, 2026-11-15) the snow
-# share rises to 13.6 % at cycle 6, 21.2 % at 12, 24.0 % at 21 and 24.9 % at 33 (11 h), growing 0.06 % a cycle there
-# (fall speed: at most 18.8 %); 0.375 holds 1.5x the largest. 0.25 would overflow after about 10 h and pay a rerun
-# and a recompile for about 2 ms of a 60 km step. "cloud": the cloud slope of the cloud checks (mask l_qc); the
-# cloud share of the same run is 3.3 % at cycle 1, 10.2 % at 6 and 11.6 % at 10, rising 0.3 % a cycle: 0.25 holds
-# 2.2x the largest. "melt": the snow-melt number factor 10^(-0.25 tempc) (mask snow_melt, within warm l_qs lanes);
-# warm snow lanes are at most 2.4 % over 12 cycles of the same run: 0.0625 holds 2.6x. "rain": the rain slope of the
-# rain checks outside the semi-Lagrangian substeps (their active lanes); over 36 cycles (12 h) of the same run
-# (2026-11-16) the rain share rises to 4.3 % at cycle 6, 7.2 % at 12, 9.0 % at 24 and 9.6 % at 36, growing 0.03 % a
-# cycle there: 0.1875 holds 1.95x. "ice": the ice slope of the ice checks (their active lanes); 11.4 % at cycle 6,
-# 16.5 % at 12, 19.5 % at 24, 20.4 % at 36 (0.04 % a cycle): 0.375 holds 1.84x. The cloud share with the warm-rain
-# xdc lanes (cloud_auto) is at most 14.4 % at cycle 36: 0.25 holds 1.74x.
+# as fractions of the [column, level] lanes. Each fraction is fitted to the largest share of measured FP32
+# coupled runs of up to 12 h from a cold start; the shares grow slowly with forecast time.
+# "snow": the snow moments, sedimentation snow moments and snow fall speed (mask l_qs; rs > R1); at most 24.9 %
+# (fall speed: 18.8 %): 0.375 holds 1.5x. "cloud": the cloud slope of the cloud checks (mask l_qc) and the warm-rain
+# xdc lanes (cloud_auto); at most 14.4 %: 0.25 holds 1.74x. "melt": the snow-melt number factor 10^(-0.25 tempc)
+# (mask snow_melt, within warm l_qs lanes); at most 2.4 %: 0.0625 holds 2.6x. "rain": the rain slope of the rain
+# checks outside the semi-Lagrangian substeps (their active lanes); at most 9.6 %: 0.1875 holds 1.95x. "ice": the
+# ice slope of the ice checks (their active lanes); at most 20.4 %: 0.375 holds 1.84x.
 # A larger share sets region tempo.lanes.<group>; the driver retries one LADDER rung up (raise_compaction).
 TEMPO_SEDIMENTATION_COMPACTION = {
     "rain_graupel": ((0, 0.5), (2, 0.25), (4, 0.0625)),
@@ -174,17 +167,15 @@ TEMPO_SEDIMENTATION_COMPACTION = {
 }
 _tempo_sedimentation_compaction = TEMPO_SEDIMENTATION_COMPACTION
 _sw_daylit_fraction = 1.0
-# The lowest ladder rung at or above 3x the triggered deep share of the x1.10242 coupled run
-# (about 6 % over 24 cycles, 5.3 % at cycle 1; 2026-10-17/18).
+# The lowest ladder rung at or above 3x the triggered deep share of measured coupled runs (about 6 %).
 DEEP_CONVECTION_FRACTION = 0.25
 _deep_convection_fraction = DEEP_CONVECTION_FRACTION
-# The triggered shallow share of the x1.10242 coupled run rises from 24.4 % to 29.7 % over the first
-# 24 cycles (2026-10-20): 0.5 holds 1.7x the largest; the 3x rule of the deep buffer would leave the
-# scheme dense. A larger share overflows and the driver retries at 1.0.
+# The triggered shallow share of measured coupled runs is at most 29.7 %: 0.5 holds 1.7x; the 3x rule of
+# the deep buffer would leave the scheme dense. A larger share overflows and the driver retries at 1.0.
 SHALLOW_CONVECTION_FRACTION = 0.5
 _shallow_convection_fraction = SHALLOW_CONVECTION_FRACTION
-# UGWP v1 eddy-diffusion substeps: every column of the x1.10242 coupled run needs 1 over 25 cycles
-# (2026-10-21, claude/r4-e scratch/m240); 2 is the margin, 16 the ported maximum.
+# UGWP v1 eddy-diffusion substeps: every column of measured coupled runs needs 1; 2 is the margin, 16 the
+# ported maximum.
 UGWP_V1_NSTAB_CAP = 2
 UGWP_V1_NSTAB_MAX = 16
 _ugwp_v1_nstab_cap = UGWP_V1_NSTAB_CAP
@@ -277,7 +268,7 @@ def step_graphs_enabled() -> bool:
 def set_column_chunk(columns: int | None) -> int | None:
     """Columns per chunk of the column-local kernels (None: one call); return the previous value.
 
-    RRTMGP holds [g-point, layer, column] work arrays (about 1.7 MB per column) and the reverse
+    RRTMGP holds large [g-point, layer, column] work arrays and the reverse
     pass of TEMPO keeps most of a cycle's saved tensors, so large meshes need chunks.
     """
     global _column_chunk
@@ -421,11 +412,8 @@ def cycle_observers_enabled() -> bool:
     return _cycle_observers
 
 
-# Dycore regions compiled: mpas-port's qualified list (orchestration/scripts/fusion_cpu_gate.py
-# CANDIDATE_TARGETS: the 17 regions of the parallel-efficiency round 3 GPU campaign plus 14 from the
-# structural efficiency round). With all ten schemes compiled, 25 coupled CPU cycles (x1.10242, two
-# radiation steps) equal eager in all 652 state tensors (2026-10-20); the dycore's per-step bytes
-# outside compiled code fall to 4 GiB (inputs), its fused bytes are 26 GiB (Inductor estimate).
+# Dycore regions compiled. With these and all ten schemes compiled, coupled CPU cycles (including radiation
+# steps) equal eager in every state tensor.
 DYCORE_COMPILE_TARGETS = (
     "acoustic_step_acoustic_flux_solve_region",
     "dynamics_tendency_normal_velocity_tendency_normal_velocity_section",
@@ -468,18 +456,17 @@ def with_dycore_compile(config: dict, *, reverse: bool = False) -> dict:
     no GPU-validated region, and "safe" would leave every region eager on CUDA.
 
     ``reverse=True`` also runs the regions under reverse-mode AD, through the dycore's explicit
-    experiment switches. It selects only targets admitted by the dycore's reverse-AD registry;
-    forward-only targets keep the same eager PyTorch implementation. Qualified on CPU
-    in the coupled x1.10242 case, policy v12 (2026-10-18): forward bitwise to the eager
-    differentiable step, wind VJP within 4.1e-14 of eager, adjoint identity 0.0 against the
-    eager JVP. Forward-mode AD through compiled dycore regions is not qualified (the dycore
-    rejects dual tensors); forward-mode steps run the regions eagerly, as do reverse-mode steps
-    of the default (forward-only) config.
+    experiment switches. It selects only targets enabled in the dycore's reverse-AD registry;
+    forward-only targets keep the same eager PyTorch implementation. On CPU in a coupled case the
+    forward is bitwise equal to the eager differentiable step, the wind VJP is within 4.1e-14 of
+    eager and the adjoint identity against the eager JVP is 0.0. Forward-mode AD through compiled
+    dycore regions is not supported (the dycore rejects dual tensors); forward-mode steps run the
+    regions eagerly, as do reverse-mode steps of the default (forward-only) config.
     """
     # The dycore's Inductor regions keep eager arithmetic only under the exact policy (signed zeros of
-    # `x + 0`, no FMA contraction on CUDA). It is process-wide and must precede the first compile; before
-    # this call only a scheme region installed it, so a dycore-only compile gave -0.0 where eager gives
-    # +0.0 (w at the surface, the explicit transport tendency without physics).
+    # `x + 0`, no FMA contraction on CUDA). It is process-wide and must precede the first compile; without
+    # it a dycore-only compile gives -0.0 where eager gives +0.0 (w at the surface, the explicit transport
+    # tendency without physics).
     install_exact_numerics()
     selected = {**config, "config_use_torch_compile": True, "config_torch_compile_backend": "inductor",
                 "config_torch_compile_mode": "default", "config_torch_compile_scope": "all",
@@ -497,7 +484,7 @@ def with_dycore_compile(config: dict, *, reverse: bool = False) -> dict:
 
 
 def dycore_forward_only(config: dict) -> bool:
-    """True when the config's compiled dycore regions are qualified for steps without derivatives
+    """True when the config's compiled dycore regions are enabled for steps without derivatives
     only (not ``reverse=True``); derivative steps then run the regions eagerly."""
     return bool(config.get("config_use_torch_compile", False)) and not (
         config.get("config_torch_compile_differentiable_policy") == "experiment"
@@ -522,8 +509,8 @@ RADIATION_REVERSE_COLUMNS = 1024
 def set_unchunked_schemes(names: Iterable[str]) -> frozenset[str]:
     """Run these column-local entries as one batch; retain other memory limits.
 
-    This is an explicit memory policy, not an automatic fit claim. Qualify each
-    selected entry's peak before using it on a larger mesh or under derivatives.
+    This is an explicit memory policy, not an automatic fit. Check each selected
+    entry's peak before using it on a larger mesh or under derivatives.
     """
     global _unchunked_schemes
     if isinstance(names, str):
@@ -549,9 +536,8 @@ def scheme_column_chunk(name: str) -> int | None:
 
 def glue(fn: Callable[..., Result]) -> Callable[..., Result]:
     """``scheme(fn)`` for the coupling glue (projection, prefix preparation, forcing, commits, posts,
-    clock): compiled under the scheme switch when no gradient is recorded, else ``fn``. Compiled, the
-    glue's ops left outside compiled code fall from 5,214 to about 300 per plain step at x1.10242
-    (2026-10-20); its reverse mode is not qualified, so differentiable steps run it eagerly.
+    clock): compiled under the scheme switch when no gradient is recorded, else ``fn``. Its compiled
+    reverse mode is not validated, so differentiable steps run it eagerly.
     """
     return fn if torch.is_grad_enabled() else scheme(fn)
 
@@ -585,22 +571,18 @@ def scheme(fn: Callable[..., Result]) -> Callable[..., Result]:
     return chunked
 
 
-# Device memory of one coupled step, per column at 55 levels (scaled linearly in levels), measured
-# on CPU at x1.10242 in the performance configuration, 2026-10-18 (ccpp scratch/s60): census peak
-# live 5.32 GiB at column chunk 2561 and 14.37 GiB unchunked give the whole-mesh share (dycore
-# transients, glue intermediates) and the share per chunk column (largest scheme transient);
-# reverse-mode retained bytes after the dycore scalar-transport checkpoint: dycore 3.36 GiB,
-# physics and glue 1.35 GiB. Reverse mode adds a backward excess over the forward peak: process RSS
-# grew 31.9 GiB during the backward of one x1.163842 cycle (CPU, chunk 73728, 2026-10-19: forward
-# peak 203.0, total 234.9 GiB); the same measure at x1.10242 chunk 2561 gives 1.85 GiB against 2.0
-# predicted, and 0 unchunked (the forward peak dominates there), so the additive term is
-# conservative. A model for planning: it does not hold the allocator's caching or fixed tables;
-# check a plan against the device before a long run.
+# Device memory of one coupled step, per column at 55 levels (scaled linearly in levels), fitted to
+# FP64 CPU measurements of two meshes in the performance configuration; each divisor below is a measured
+# mesh's cell count plus the padding row. Census peaks give the whole-mesh share (dycore transients, glue
+# intermediates) and the share per chunk column (largest scheme transient). Reverse mode retains the
+# activations after the dycore scalar-transport checkpoint (dycore, and physics with glue) and adds a
+# backward excess over the forward peak; on the smaller mesh the fitted excess is slightly above the
+# measured one, so the additive term is conservative. A model for planning: it does not hold the
+# allocator's caching or fixed tables; check a plan against the device before a long run.
 _GIB = 2**30
-# Forward, from the census (tools/coupled/census2.py, one cold cycle, x1.163842 GFS v17 performance case,
-# dycore tracer tiles of 2, MVP2 M4, 2026-10-20; ccpp-s60 scratch/mvp2/m4_census60_*): peak live 57.26 GiB at
-# column chunk 32768 and 69.13 GiB at 43008 (radiation) give the line whole + chunk * columns; at 21504 the
-# peak is the dycore step, 45.61 GiB with tracer tiles of 2 and 56.07 GiB untiled: the whole-mesh floor.
+# Forward, from a census of one cold cycle (larger mesh, GFS v17 performance case, dycore tracer tiles of 2):
+# the peak live bytes at column chunks 32768 and 43008 (radiation) give the line whole + chunk * columns; at
+# 21504 the peak is the dycore step, with tracer tiles of 2 and untiled: the whole-mesh floor.
 _CHUNK_BYTES_PER_COLUMN = (69.13 - 57.26) * _GIB / (43008 - 32768)
 _WHOLE_BYTES_PER_COLUMN = (57.26 * _GIB - _CHUNK_BYTES_PER_COLUMN * 32768) / 163843
 _FLOOR_BYTES_PER_COLUMN = 45.61 * _GIB / 163843
@@ -609,15 +591,13 @@ SCALAR_TRANSPORT_TILE = 2  # tracers per dycore scalar-transport tile when the p
 _RETAINED_PHYSICS_BYTES_PER_COLUMN = 1.35 * _GIB / 10243
 _RETAINED_DYCORE_BYTES_PER_COLUMN = 3.36 * _GIB / 10243
 # Resident before the step: the cold-start coupled state (cold boundary under the stamps guard) with the
-# case's mesh and cycle arguments, the case's initial fields freed: 16.84 GiB at x1.163842 (107.8 KiB per
-# column; scratch/mvp2/resident_union.py). The census counts only tensors made during its cycle, so this term
-# is separate (Phase E: the 60 km forward ran out of an 80 GB A100 with the case and state held and no such
-# term). Callers that keep the case on the device pass resident_bytes.
+# case's mesh and cycle arguments, the case's initial fields freed (measured on the larger mesh). The census
+# counts only tensors made during its cycle, so this term is separate. Callers that keep the case on the device
+# pass resident_bytes.
 _RESIDENT_STATE_BYTES_PER_COLUMN = 16.84 * _GIB / 163843
-# Reverse: retained activations from the x1.10242 reverse measurements; the backward excess is fitted so
-# that the plan reproduces the x1.163842 reverse cycle at chunk 73728 (CPU, 16 threads, peak RSS 233.9
-# GiB, lean-boundary code before the M4 forward changes, 2026-10-20; tools/coupled/smoke.py reverse), so it is
-# conservative for the current code.
+# Reverse: retained activations from the smaller mesh's reverse measurements; the backward excess is fitted
+# so that the plan reproduces the measured peak RSS of a reverse cycle of the larger mesh at chunk 73728 (CPU).
+# That measurement predates later reductions of the forward memory, so the term is conservative.
 _BACKWARD_EXCESS_BYTES_PER_COLUMN = (233.9 * _GIB - 163842 * (
     _RESIDENT_STATE_BYTES_PER_COLUMN + _WHOLE_BYTES_PER_COLUMN + _RETAINED_PHYSICS_BYTES_PER_COLUMN
     + _RETAINED_DYCORE_BYTES_PER_COLUMN) - 73728 * _CHUNK_BYTES_PER_COLUMN) / 163842
@@ -707,10 +687,9 @@ def planned_config(config: dict, plan: MemoryPlan) -> dict:
 
 def use_expandable_segments(device) -> None:
     """Expandable segments for the CUDA caching allocator (no-op off CUDA); call before the run's first device
-    allocation. With fixed segments a large request fails while freed memory sits in partly used segments: the
-    60 km forward ran out at a 4.03 GiB request with 15 GiB cached (A100, MVP2 M8), reproduced by replaying the
-    step's allocation stream through the allocator's rules (scratch/mvp2/alloc_sim.py); expandable segments
-    unmap free pages and map them where the request fits. CUDA graph pools use them as well (PyTorch 2.8)."""
+    allocation. With fixed segments a large request can fail while freed memory sits in partly used segments;
+    expandable segments unmap free pages and map them where the request fits. CUDA graph pools use them as
+    well (PyTorch 2.8)."""
     import torch
 
     if torch.device(device).type == "cuda":

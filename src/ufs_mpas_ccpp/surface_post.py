@@ -193,13 +193,13 @@ def surface_composites_post(f, *, huge: float):
     out["tisfc"] = torch.where(ice, f["tisfc"], out["tsfc"])
     out["hice"] = torch.where(ice, f["hice"], 0.0)
     out["cice"] = torch.where(ice, f["cice"], 0.0)
-    # A1: huge inactive roughness is an omitted logarithm, not log(huge).
+    # A huge inactive roughness is an omitted logarithm, not log(huge).
     ln_ice = torch.log(torch.where(ice & (f["zorli"] != huge), f["zorli"], 1.0))
     ln_water = torch.log(torch.where(ice & (f["zorlo"] != huge), f["zorlo"], 1.0))
     txi, txo = f["cice"], 1.0 - f["cice"]
 
     def water(value, ice_value):
-        # A1: a huge placeholder (no open water) enters as the ice value; txo * huge would give a
+        # A huge placeholder (no open water) enters as the ice value; txo * huge would give a
         # ~huge derivative with respect to cice. The forward value is unchanged where txo == 0.
         return torch.where(value == huge, ice_value, value)
 
@@ -238,7 +238,7 @@ def surface_composites_post_fractional(f, *, huge: float, thsfc_loc: bool, lheat
     weights = {"lnd": txl, "ice": txi, "wat": txo}
 
     def term(kind, *values):
-        # A1: a surface with zero area contributes zero; its placeholder (huge) values do not
+        # A surface with zero area contributes zero; its placeholder (huge) values do not
         # enter, so no huge derivative reaches cice. Forward: 0 * finite = 0, as in the source.
         weight = weights[kind]
         result = weight

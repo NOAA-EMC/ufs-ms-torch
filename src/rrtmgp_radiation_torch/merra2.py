@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """MERRA-2 aerosol climatology for the RRTMGP group (``iaer = 1011``: ``iaermdl = 1``, ``iaerflg = 11``).
 
-Fortran sources (ccpp-physics of the v17 oracle tree):
+Fortran sources (ccpp-physics of GFS v17):
 
 * ``MP/Morrison_Gettelman/aerinterp.F90``: ``setindxaer`` (horizontal indices, at init),
   ``read_netfaer`` (monthly fields, float32 pressure sum) and ``aerinterpol`` (time and vertical

@@ -3,9 +3,9 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """Tracer-layout rules of GFS_PBL_generic_pre/post and the satmedmfvdifq index arguments.
 
-Without ``config["tracer_layout"]`` the legacy profile layout applies (species slots
+Without ``config["tracer_layout"]`` the legacy layout applies (species slots
 from ``constants``, TKE last, ``vdftra = qgrs``). With a layout mapping (1-based
-indices ``ntqv ntcw ntiw ntrw ntsw ntgl ntinc ntrnc ntke ntoz``) the oracle rules
+indices ``ntqv ntcw ntiw ntrw ntsw ntgl ntinc ntrnc ntke ntoz``) the CCPP rules
 apply: when ``nvdiff == ntrac``, ``ntkev = nvdiff /= ntke`` and ``imp_physics`` is
 Thompson or TEMPO, ``vdftra`` is packed in a fixed 9-species order plus TKE at
 ``ntkev`` and ``ten_q`` is unpacked back to the global slots.
@@ -23,7 +23,7 @@ from sa_tke_edmf_torch.constants import NTCW, NTIW, NTOZ, NTQV, NTRW
 IMP_PHYSICS_THOMPSON = 8
 IMP_PHYSICS_TEMPO = 88
 
-# MPAS tracer table of the GFS v17 TEMPO+RRTMGP oracle lane:
+# MPAS tracer table of the GFS v17 TEMPO+RRTMGP configuration:
 # qv qc qr qi qs qg ni nr sgs_tke o3mr.
 MPAS_TEMPO_TRACER_LAYOUT = {
     "ntqv": 1,
@@ -47,7 +47,7 @@ def _layout(config: Mapping[str, Any]) -> Mapping[str, Any] | None:
 
 
 def uses_thompson_tempo_pack(config: Mapping[str, Any], nvdiff: int) -> bool:
-    """True when the oracle pre/post take the packed Thompson-or-TEMPO branch.
+    """True when GFS_PBL_generic_pre/post take the packed Thompson-or-TEMPO branch.
 
     The port always has ``nvdiff == ntrac`` and ``satmedmf``; ``ntkev = nvdiff``.
     """

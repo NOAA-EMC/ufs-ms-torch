@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """R4 topographic binding and legacy mountain-blocking/orographic-wave solver.
 
-This module does not yet implement small-scale/nonstationary drag or UGWP post.
+This module does not implement small-scale/nonstationary drag or UGWP post.
 """
 
 from dataclasses import replace

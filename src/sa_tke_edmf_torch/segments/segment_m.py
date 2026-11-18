@@ -443,8 +443,8 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
         scuflg,
     )
     # The updated TKE plumes are their own fields; qcko and qcdo keep their other slots. Their only reader after
-    # this segment is segment O (P reads the slots below the TKE slot): writing them back into the TKE slot cost
-    # two full [ncol, KM, NTRAC] passes and O's two strided slot copies, 1.4 ms per 60 km step (round 8 wave 4).
+    # this segment is segment O (P reads the slots below the TKE slot): writing them back into the TKE slot costs
+    # two full [ncol, KM, NTRAC] passes and O's two strided slot copies.
     return state.with_updates(
         {
             "prod": prod,

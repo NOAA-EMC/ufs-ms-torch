@@ -19,7 +19,7 @@ def _masked_fill_field(base: torch.Tensor, values: torch.Tensor, mask: torch.Ten
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
-    """Run lines 516-690 of ``samfdeepcnv_run`` for the approved active case."""
+    """Run lines 516-690 of ``samfdeepcnv_run``."""
     _, KM, NN, NTR, NTC = runtime_dimensions(state)
 
     ps = state.require("ps")
@@ -111,8 +111,8 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
         u1,
         v1,
         # samf transports qtr(:,:,3:ntr+2); slots above ntr+2 (layout nn > ntr+2) pass through. The island reads
-        # its slots from the whole qtr: the slice qtr[:, :, :ntr+2] was a strided view that the region entry
-        # copied (0.29 ms per 60 km step on the RTX PRO 6000, round 8 wave 4).
+        # its slots from the whole qtr: the slice qtr[:, :, :ntr+2] is a strided view that the region entry
+        # would copy.
         qtr,
         cnvflg,
         sfcpbl,

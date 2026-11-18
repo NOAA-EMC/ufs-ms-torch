@@ -4,13 +4,12 @@
 """
 MPAS-Atmosphere PyTorch port.
 
-This package provides a PyTorch implementation of the tested MPAS-Atmosphere
-dynamics-core release surface.  Numerical claims are scoped to registered gates.
+This package provides a PyTorch implementation of the MPAS-Atmosphere
+dynamics core.
 
 Key modules:
     constants: Physical constants (gravity, gas constants, etc.)
     dynamics: Time integration and dynamical processes
-    boundary: Boundary condition handling
     utils: Checkpoint loading and validation utilities
 """
 

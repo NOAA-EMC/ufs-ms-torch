@@ -122,8 +122,8 @@ def execution_neutral_config(config: Mapping[str, Any] | None) -> dict[str, Any]
     """The configuration with execution-only keys at their defaults (dropped where none exists).
 
     A compiled run then shares the identity of its eager twin, and a configuration at the
-    defaults, as every validated eager one is, keeps the digest it had before compile keys
-    were neutralized: existing restarts and boundaries stay valid.
+    defaults, as every validated eager one is, keeps its digest: restarts and boundaries
+    written by eager runs stay valid.
     """
     from mpas_pytorch.config_defaults import FORTRAN_DEFAULTS
 

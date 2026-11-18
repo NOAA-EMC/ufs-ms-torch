@@ -53,7 +53,7 @@ def sea_ice_fluxes(fields, table, *, thsfc_loc: bool):
     active = (
         (fields["islmsk"] == 2) & fields["flag_iter"] & (fields["use_lake_model"] != 1)
     )
-    # A1: source-inactive columns must not evaluate singular flux operands.
+    # Source-inactive columns must not evaluate singular flux operands.
     defaults = {
         "ps": 100000.0,
         "t1": 260.0,
@@ -208,7 +208,7 @@ def ice_mass_changes(f, delt: torch.Tensor):
     snowd, t1, t2 = f["snowd"], f["t1"], f["t2"]
     snow_only = f["tmelt"] <= snowd * DSLI
     snowmt = torch.where(snow_only, f["tmelt"] / DSLI, snowd)
-    # The rejected snow-only branch must not divide at the melting point (A1).
+    # The rejected snow-only branch must not divide at the melting point.
     melt_t1 = torch.where(~snow_only, t1, -1.0)
     h1 = torch.where(
         snow_only,

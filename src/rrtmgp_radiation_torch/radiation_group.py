@@ -1,25 +1,25 @@
 # Copyright (c) 2026 IC Weather LLC. Licensed under LICENSE and PERMISSIONS.md.
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""Oracle-lineage RRTMGP radiation group (G3.4).
+"""RRTMGP radiation group of the GFS v17 suite.
 
 This module ports the radiation group of the custom suite
-``MPAS_GFS_v17_tempo_rrtmgp`` as compiled in the TEMPO+RRTMGP oracle tree
-(ccpp-physics 5ef5adc lineage plus the G3 patch, rte-rrtmgp v1.7):
+``MPAS_GFS_v17_tempo_rrtmgp`` as compiled in the TEMPO+RRTMGP Fortran reference
+(ccpp-physics 5ef5adc with local patches, rte-rrtmgp v1.7):
 
 ``GFS_rrtmgp_setup`` -> ``GFS_rrtmgp_pre`` -> ``GFS_radiation_surface`` ->
 ``GFS_rrtmgp_cloud_mp`` -> ``GFS_rrtmgp_cloud_overlap`` ->
 ``GFS_cloud_diagnostics`` -> ``rrtmgp_aerosol_optics`` -> ``rrtmgp_sw_main`` -> ``rrtmgp_lw_main`` ->
 ``GFS_radiation_post``.
 
-Layout follows the package checkpoint convention: layer fields are
+Layout: layer fields are
 ``[nlay, ncol]``, interface fields ``[nlay+1, ncol]``, g-point fields
 ``[ngpt, nlay, ncol]``; the vertical index 0 is the surface (``top_at_1`` is
 false for the MPAS host, which is the only orientation supported here).
 
 Scope and declared inputs:
 
-* ``GFS_radiation_surface`` uses the profile's uncoupled Noah-MP
+* ``GFS_radiation_surface`` uses the uncoupled Noah-MP
   ``ialb=iems=2`` inputs (``frac_grid`` either way). ``GFS_cloud_diagnostics``
   ports bottom-up ``gethml`` (maximum-random or decorrelation length). ``fluxr``
   retains the source accumulation order. Solar astronomy uses a tensor NCEP date
@@ -37,11 +37,11 @@ The rte-rrtmgp v1.7 kernels used here (level Planck source, LW quadrature,
 ``tau_thresh`` series, SW ``min_k``/``min_mu0`` and the direct-beam clamps)
 are written in this module; the gas-optics interpolation and the cloud
 look-up tables reuse the package kernels, whose Fortran counterparts did not
-change numerically between 74a0e09 and v1.7 (G3.0 census).
+change numerically between 74a0e09 and v1.7.
 
 All tensor work is torch; branches are masks. Static configuration and offline
 coefficient preparation remain host-side. Date/hour and solar scalars can stay
-on the numerical device. This does not close skipped-step lifecycle ownership.
+on the numerical device.
 """
 
 from __future__ import annotations
@@ -175,7 +175,7 @@ IMP_PHYSICS_TEMPO = 88
 
 
 class RadiationConfigError(ValueError):
-    """Raised for a configuration the oracle radiation group would reject or that is not ported."""
+    """Raised for a configuration the Fortran radiation group would reject or that is not ported."""
 
 
 @dataclass(frozen=True)
@@ -263,7 +263,7 @@ class RadiationConfig:
     aer_jdat: torch.Tensor | None = None
 
     def require_supported(self) -> None:
-        """Fail closed outside the ported oracle configuration."""
+        """Fail closed outside the ported configuration."""
 
         problems = []
         if self.iovr not in (1, 3) or self.iovr_convcld != 1:
@@ -358,10 +358,9 @@ def _mt_twist(mt: torch.Tensor) -> torch.Tensor:
     (``kk >= n-m`` reads new words). Integer XOR is exact, so the words equal the per-slice form.
 
     The slices after the first read ``new0`` and the mix terms, not ``new1``: XOR is exact and associative, so
-    ``new0[:169] ^ mix[227:396]`` is ``new1[:169]``. Read by three slices, ``new1`` (five reads of ``mt``) was stored
-    by a kernel of its own and read back (Inductor's reuse rule; r8g frame 469, ``triton_poi_fused_bitwise_xor_0``,
-    5.5 ms per 60 km radiation step on the RTX PRO 6000, round 8); now each slice forms its words in the one kernel
-    that writes the state.
+    ``new0[:169] ^ mix[227:396]`` is ``new1[:169]``. Read by three slices, ``new1`` (five reads of ``mt``) would be
+    stored by a kernel of its own and read back (Inductor's reuse rule); instead each slice forms its words in the one
+    kernel that writes the state.
     """
 
     mix = _mt_mix(mt[:, 0:623], mt[:, 1:624])
@@ -509,13 +508,12 @@ def mcica_cloud_mask(seeds: torch.Tensor, cld_frac: torch.Tensor, overlap_param:
     each layer's ``ngpt`` words are compared as soon as they exist; the overlap rules need only the layer above
     (decorrelation: ``r(l-1)``; maximum-random: the draw that opened the current cloudy run, carried). The same words
     and the same predicates give the same mask bit for bit. No word array of the column exists (``ngpt * nlay``
-    int64 per column, 9 GB at 60 km for LW), and with ``region`` the twist and each layer are their own regions, so
-    spent twist blocks are released (one region over all layers kept every block until its last kernel: 1.1 GiB at
-    x1.10242, round 7). FP32 compares the integer words, FP64 the source uniforms (words / (2**32 - 1)). Tempering
-    is word by word, so FP32 tempers each layer's words in its layer region, as it reads them: the twist region writes
-    the state only (writing the tempered block as well cost 409 MB per LW twist at 60 km, round 8).
+    int64 per column), and with ``region`` the twist and each layer are their own regions, so spent twist blocks are
+    released (one region over all layers would keep every block until its last kernel). FP32 compares the integer
+    words, FP64 the source uniforms (words / (2**32 - 1)). Tempering is word by word, so FP32 tempers each layer's
+    words in its layer region, as it reads them: the twist region writes the state only.
     ``column_cloudy`` (``[ncol]``): the mask ANDed with it, as each layer is formed (an AND of the whole mask
-    afterwards read and wrote it again: 3.2 ms per 60 km radiation step on the RTX PRO 6000, LW and SW, round 8).
+    afterwards would read and write it again).
     """
     nlay, ncol = cld_frac.shape
     if cld_frac.dtype not in (torch.float32, torch.float64):
@@ -540,8 +538,7 @@ def mcica_cloud_mask(seeds: torch.Tensor, cld_frac: torch.Tensor, overlap_param:
             words = pieces[0]  # [ncol, ngpt] int32 state words
         elif integer:
             # A layer spanning two twist blocks: its layer region joins the two pieces as it reads them (an eager
-            # join wrote and read the layer's words again: 18 CatArrayBatchedCopy kernels, 1.93 ms per 60 km
-            # radiation step on the RTX PRO 6000, LW and SW, round 8 w3t).
+            # join would write and read the layer's words again).
             return tuple(pieces)
         else:
             words = torch.cat(pieces, dim=1)
@@ -575,9 +572,7 @@ def _level_major_bands(values: torch.Tensor) -> torch.Tensor:
     """A band array computed as ``[nlay, nband, ncol]`` (``band_axis=1`` of its producer), written level-major and
     returned as its transposed view ``[nband, nlay, ncol]``: the band solves read its band rows column-innermost, and
     the compiled producer reads each layer's rows once for all bands. Computed band-major and transposed here, the
-    producer's kernel ran band-outermost and read its per-layer inputs once per band from memory (r8g: LW cloud band
-    optics 6.96 ms and a transposing copy 0.78 ms, LW aerosol 7.45 ms per 60 km radiation step, against 1.77 ms for
-    the cloud kernel that read them once; round 8)."""
+    producer's kernel would run band-outermost and read its per-layer inputs once per band from memory."""
     return values.contiguous().transpose(0, 1)
 
 
@@ -1001,7 +996,7 @@ def run_rrtmgp_cloud_mp(
     """Port ``GFS_rrtmgp_cloud_mp_run`` for the Thompson/TEMPO microphysics branch.
 
     ``imp_physics`` other than Thompson (8), GFDL (11) or TEMPO (88) is the
-    oracle's ``else`` error; GFDL and Thompson are not ported in this lineage
+    Fortran ``else`` error; GFDL and Thompson are not ported
     (Thompson needs ``cmp_reff_Thompson``) and raise as well.
 
     ``scales`` holds trainable 0-d tensor scales by name (an absent name is no op): ``reliq_conv`` and
@@ -1341,8 +1336,8 @@ def _longwave_sources_tensor(pfrac, totplnk, temp_ref, bands, tlay, tlev, tsfc, 
 def _longwave_surface_source(pfrac_sfc, bands, sfc_planck):
     """``sfc_source`` of ``_longwave_sources_tensor`` from its operands only: the surface layer's Planck fraction
     (``pfrac[:, 0, :]``) and the surface table (``planck_by_band[0]``). A compiled region's layout normalization
-    copies a strided view it is passed: it copied the layer and level tables this does not read (1.6 ms per 60 km
-    radiation step on the RTX PRO 6000, round 8)."""
+    copies a strided view it is passed, so passing the whole tables would copy the layer and level tables this does
+    not read."""
     return pfrac_sfc * sfc_planck.index_select(1, bands).transpose(0, 1)
 
 
@@ -1406,11 +1401,10 @@ def shortwave_gas_optics_v17(table: ReducedGasOpticsTable, pre: Mapping[str, tor
     formed (``_derivative_free``).
 
     The zero fields here, of the McICA cloud fields and of ``tau_safe`` stay full ``zeros_like`` /
-    ``ones_like`` tensors: with scalar or broadcast zeros the whole-group compiled VJP missed eager
-    (cnvw gradient 83 % off on 64 columns). The training forward and its saved
-    activations are exact there; the compiled backward graph differs from an eager run of the same
-    graph, independent of fusion size, buffer reuse, pattern passes and thread count (Inductor
-    defect, cause not isolated).
+    ``ones_like`` tensors: with scalar or broadcast zeros the whole-group compiled VJP differs from
+    eager. The forward and its saved activations are exact there; the compiled backward graph differs
+    from an eager run of the same graph, independent of fusion size, buffer reuse, pattern passes and
+    thread count (an Inductor defect whose cause is not isolated).
     """
     play, tlay = pre["p_lay"], pre["t_lay"]
     if preparation is None:
@@ -1573,8 +1567,8 @@ def _lw_solve(*, transport_optics, sfc_emis: torch.Tensor, sfc_src: torch.Tensor
     down sweep reduces each level of its block as it forms it (``_lw_scatter_down_levels``), so the down levels and the
     reduction regions are not written and read again, and adds the reductions to ``previous`` (those of the bands
     before, per level, or None) in the same region; it returns the per-level ``[1, ncol]`` sums of this band and those
-    before (a list per direction), so no band's level array is joined and added outside the regions (w3t: 32 cats and
-    30 adds, 2.5 ms per 60 km radiation step on the RTX PRO 6000, round 8 w4). Same sums in the same order. Its
+    before (a list per direction), so no band's level array is joined and added outside the regions. Same sums in
+    the same order. Its
     regions take the band's g-points as a dynamic axis (``_any_width``). ``level_axis``: the level axis of
     ``transport_optics`` (default: 0 with a ``region``, as ``_lw_transport_optics`` writes them then, else 1)."""
     call = (lambda fn: fn) if region is None else region
@@ -1768,9 +1762,7 @@ def _gpoint_sum(flux, width):
 def _any_width(values):
     """``values`` (tensors, None, or tuples of them), each tensor with its leading axis marked dynamic
     (``maybe_mark_dynamic``). The banded inference solves pass every tensor a band region reads whose leading axis is
-    the band's g-points (or 1), so each region compiles one graph for all band widths: with the band widths
-    static, the radiation inference check compiled 226 more graphs (11 LW and 8 SW widths) and took 270 s from a cold
-    cache instead of about 120 s (round 8)."""
+    the band's g-points (or 1), so each region compiles one graph for all band widths instead of one per width."""
     for x in values:
         if isinstance(x, tuple):
             _any_width(x)
@@ -1962,7 +1954,7 @@ def _shortwave_cloud_optics_sum(cloud, *, tables, rough, band_axis=0):
     tables to the SW cloud optics, whose tables can be narrower (liquid to 20 um against the LW 21.5 um); upstream
     then reports an out-of-bounds error and leaves that column without grid-cloud optics, an invalid result, while a
     lookup past the table would extrapolate. Here each SW lookup clamps the radii to the SW table bounds, as the
-    oracle's recorded Fortran patch does (``orchestration/fortran_patches``). It changes the SW cloud optics only
+    patched Fortran reference does. It changes the SW cloud optics only
     where a radius lies outside the SW table; the cloud state and the LW radii are unchanged."""
     limits = tables.files["sw_cloud"].tensors
     return _cloud_optics_sum(compute_shortwave_cloud_optics_byband, cloud, tables=tables, rough=rough, band_axis=band_axis,
@@ -2043,9 +2035,8 @@ def _sw_band_optics(tau, ssa, g, aer, mask, c_tau, c_ssa, c_g, cloudy, level_maj
 
 def _sw_band_layer_levels(tau, ssa, g, aer, mask, c_tau, c_ssa, c_g, cloudy, level_major, mu0_s, positive, direct):
     """``_sw_layer_levels`` of one band's layer chunk from the inputs of its all-sky optics (``_sw_band_optics``,
-    the chunk's layers): the optics are formed in the region that reads them, so they are not written and read
-    again (the band optics region wrote tau, ssa and g, 10 ms per 60 km radiation step on the RTX PRO 6000, round 8
-    w2b 469/*). Same expressions per element."""
+    the chunk's layers): the optics are formed in the region that reads them, so tau, ssa and g are not written and
+    read again. Same expressions per element."""
     optics = _sw_band_optics(tau, ssa, g, aer, mask, c_tau, c_ssa, c_g, cloudy, level_major)
     return _sw_layer_levels(*(optics[name].transpose(0, 1) for name in ("tau", "ssa", "g")), mu0_s, positive, direct)
 
@@ -2068,7 +2059,7 @@ def _sw_solve_banded(parts, *, mask, cloudy, band_lims_gpt, mu0, sfc_alb_dir, sf
     band)."""
     tau, ssa, g = parts["gas"]
     # The band regions read coalesced band rows: band arrays that arrive band-innermost (a column stride of nband) are
-    # copied column-innermost once (the LW band arrays likewise, round 6); _sw_daylit_optics writes them so.
+    # copied column-innermost once (the LW band arrays likewise); _sw_daylit_optics writes them so.
     aer = None if parts["aer"] is None else tuple(_column_innermost(x) for x in parts["aer"])
     c_tau, c_ssa, c_g = (_column_innermost(x) for x in parts["cloud"])
     width = max(int(hi) - int(lo) + 1 for lo, hi in band_lims_gpt)
@@ -2092,7 +2083,7 @@ def _sw_solve_banded(parts, *, mask, cloudy, band_lims_gpt, mu0, sfc_alb_dir, sf
 
 def _sw_cloud_mask(columns, *, ngpt, config, region=None):
     """McICA cloud mask of ``_sw_daylit_optics`` (boolean ``[ngpt, nlay, ncol]``), drawn in its own region so
-    the random-number work is not live during the gas optics (round-4 M5c)."""
+    the random-number work is not live during the gas optics."""
     cloudy = _column_cloudiness(columns["cld_frac"]) > EPS_PRE
     return mcica_cloud_mask(columns["icsdsw"], columns["cld_frac"], columns.get("cloud_overlap_param"), ngpt=ngpt,
                             iovr=config.iovr, region=region, column_cloudy=cloudy)
@@ -2137,8 +2128,7 @@ def _sw_daylit_optics(columns: dict[str, torch.Tensor], *, tables: RrtmgpTableBu
             config.merra2_optics, columns["aer_nm"], columns["p_lev"], columns["p_lay"], columns["tv_lay"],
             columns["relhum"], band_axis=1)) if config.iaerflg != 0 else None)
         # The gas asymmetry is zero: a stride-0 zero here, not the filled [ngpt, nlay, ncol] array every band's optics
-        # read (w2b 468/1 triton_poi_fused_zeros_like_5, 2.2 GB written per 60 km radiation step). The derivative
-        # forms keep the filled zeros of shortwave_gas_optics_v17 (see its docstring).
+        # read. The derivative forms keep the filled zeros of shortwave_gas_optics_v17 (see its docstring).
         tau = gas.pop("tau")
         parts = {"gas": (tau, gas.pop("ssa"), tau.new_zeros(()).expand(tau.shape)), "aer": aer,
                  "cloud": tuple(_level_major_bands(x) for x in (c_tau, c_ssa, c_g)), "level_major": level_major}
@@ -2148,7 +2138,7 @@ def _sw_daylit_optics(columns: dict[str, torch.Tensor], *, tables: RrtmgpTableBu
     # G-point-sized fields are released as soon as they are dead (the solve's peak is otherwise
     # set by gas, aerosol, cloud and all-sky optics that are no longer read). The aerosol increment
     # precedes the McICA cloud fields so the gas fields die first; the two share no differentiable
-    # operand, so the reverse pass is unchanged (gradients bitwise, scratch/r4 rad_grad check).
+    # operand, so the reverse pass is unchanged (bitwise equal gradients).
     if config.iaerflg != 0:
         # rrtmgp_aerosol_optics (setaer, MERRA-2) by band, incremented into the gas optics by band
         aer = merra2_sw_optics(config.merra2_optics, columns["aer_nm"], columns["p_lev"], columns["p_lay"],
@@ -2385,7 +2375,7 @@ def run_rrtmgp_sw_main(
     merged = run_compacted(daylit, columns, day, region="radiation.sw_day", fraction=day_fraction,
                            axes={name: value.ndim - 1 for name, value in columns.items()})
     out = {name: merged[name] for name in _SW_OUTPUTS}
-    # r4 resets once before the daylit block loop. Zero-day calls retain inout.
+    # The Fortran reference resets cldtausw once before the daylit block loop. Zero-day calls retain inout.
     out["cldtausw"] = torch.where(torch.any(day), merged["cldtausw"], state["cldtausw_prev"])
     out["sfc_alb_dir_gpt"] = alb_dir
     return out
@@ -2623,7 +2613,7 @@ def _lw_solve_banded(inputs, *, sfc_emis, sfc_src, region, band_lims_gpt, weight
     """
     clr_tau, mask, c_tau, c_ssa, c_g, secant, pfrac, lay_planck, lev_planck = inputs
     # The band regions read coalesced band rows: band arrays that arrive band-innermost (a column stride of nband) are
-    # copied column-innermost once (round 6: strided reads made the LW sweeps 144 -> 642 ms). The inference producers
+    # copied column-innermost once (strided reads are uncoalesced). The inference producers
     # write the cloud and aerosol band arrays level-major (_level_major_bands), which needs no copy.
     c_tau, c_ssa, c_g, lay_planck, lev_planck = (_column_innermost(x) for x in (c_tau, c_ssa, c_g, lay_planck, lev_planck))
     aerosol = None if aerosol is None else _column_innermost(aerosol)

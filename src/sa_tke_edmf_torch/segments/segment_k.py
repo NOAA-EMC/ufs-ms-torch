@@ -521,7 +521,7 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     dw2 = (u1[:, :-1] - u1[:, 1:]) ** 2 + (v1[:, :-1] - v1[:, 1:]) ** 2
     shr2 = torch.maximum(dw2, torch.full_like(dw2, source_real(1e-4, state.config))) * rdzt * rdzt
     pcnvflg = state.require("pcnvflg") > 0.5
-    # Bound the compiler graph at large depths; L16 can fuse the same helpers.
+    # Bound the compiler graph at large depths; up to 16 levels one island fuses the helpers.
     seed_runner = _mixing_length_seed_block
     if KM <= 16:
         seed_runner = lambda *args: run_compile_island(

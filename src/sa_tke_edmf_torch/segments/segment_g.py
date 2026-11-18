@@ -37,7 +37,7 @@ def levels_over(base: torch.Tensor, first: int, levels: list[torch.Tensor]) -> t
     """``base`` with levels ``first, first + 1, ...`` (dim 1) replaced by ``levels``, in one slice.
 
     Stacking the untouched levels as per-level views ``base[:, j]`` made Inductor emit one copy
-    kernel per level on CUDA (offline sm_80 codegen, x1.10242); values are unchanged.
+    kernel per level on CUDA; values are unchanged.
     The levels stack level-major (each level's row contiguous) and scatter back transposed.
     """
     return run_compile_island("g_plume_recurrence", "assemble_levels", _levels_over,
@@ -295,13 +295,13 @@ def _tracer_plume_recurrence(
         return qcko_tracers_base
     # Joined in one compiled island (no layout normalization of the strided slot base): eager, between the
     # islands of this loop, the cat of the pieces, the clone of the base and the transposed copy were three
-    # passes (round 8 wave 3, 60 km: 1.1 ms). Same rows, same values.
+    # passes. Same rows, same values.
     return levels_over(qcko_tracers_base, 1, [row for piece in pieces for row in piece])
 
 
 def _tracer_plume_levels(cnvflg, kpbl, previous, xlamueq_rows, zl_rows,
                          q1_tracers_rows, base_rows, levels):
-    """Bound live recurrence outputs; a 26-level fused FP64 kernel exhausted H100 driver memory."""
+    """Bound live recurrence outputs; a fused FP64 kernel over many levels can exhaust GPU driver memory."""
     tracer_cols = []
     for j in range(base_rows.shape[0]):
         kk = levels[j]
@@ -447,7 +447,7 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     kpbl = state.require("kpbl").to(torch.int64)
     vpert = state.require("vpert")
     # Not copied: the plume block writes no input in place, and each of these outputs is a new tensor (levels_over,
-    # the mass-flux and entrainment forms, the qcko join). The copies moved 0.6 GB per 60 km step (round 8).
+    # the mass-flux and entrainment forms, the qcko join).
     buo = state.require("buou")
     wush = state.require("wush")
     tkemean = state.require("tkemean")

@@ -33,7 +33,7 @@ HostView = Callable[[Mapping[str, Any]], Mapping[str, Any]]
 Rebind = Callable[[dict[str, Any], Mapping[str, Any]], None]
 # Comparable description of caches that recording must not fill.
 CacheView = Callable[[], Any]
-# Process-wide evidence that recording and replay actually happened.
+# Process-wide counts of recordings and replays.
 COUNTERS = {"captures": 0, "replays": 0}
 
 

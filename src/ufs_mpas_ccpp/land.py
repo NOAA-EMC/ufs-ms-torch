@@ -305,10 +305,10 @@ def _apply_noahmp_compiled(statein, grid, prefix: PhysicsPrefixResult, hpbl: tor
 
     Without a recorded gradient: three exact-policy regions, the part before the canopy iteration
     loop, one loop pass (four flag specializations, run 20 times from Python) and the part after.
-    One region unrolled the 20 passes, which held 40 % of its FX graph and of its cold compile. Each
-    part equals eager bit for bit. With a gradient recorded: one region, as before. Region
-    boundaries regroup the sums of gradient contributions, so the parts' reverse mode differed
-    from eager by up to 4 ulp (aot_eager, 80-column capture) where the single region's is exact.
+    A region that unrolls the 20 passes has a much larger graph and compile time. Each part equals
+    eager bit for bit. With a gradient recorded: one region. Region boundaries regroup the sums of
+    gradient contributions, so a split reverse mode differs from eager by a few ulp, where the single
+    region's is exact.
     The prefix is bound outside the regions (no tensor work).
     """
     # The calendar and the parameter scales enter the regions as 1-element views: see _region_calendar. The scales'
@@ -335,10 +335,9 @@ def _apply_noahmp_compiled(statein, grid, prefix: PhysicsPrefixResult, hpbl: tor
 
 
 # What crosses a region boundary. Host records of the plan's partitions stay out: Dynamo realizes a
-# host list it returns and guards every value in it (480,000 guards, 58 s at x1.10242). So do 0-d
-# CPU float64 tensors (the calendar, the energy tables' scalars): torch 2.8 gives each such region
-# input a float symbol, specializes it after tracing and restarts the whole trace (9 + 20 s at
-# x1.10242). Each part takes them from the same source as eager instead.
+# host list it returns and guards every value in it. So do 0-d CPU float64 tensors (the calendar, the
+# energy tables' scalars): torch 2.8 gives each such region input a float symbol, specializes it after
+# tracing and restarts the whole trace. Each part takes them from the same source as eager instead.
 _HOST_PARTITION_ENTRIES = ("columns", PREPARED_METADATA_KEY)
 
 

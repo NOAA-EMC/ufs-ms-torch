@@ -51,7 +51,7 @@ def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     zi = phii * (1.0 / GRAV)
     zl = phil * (1.0 / GRAV)
     # zi[:, 1:] formed as its own array (the same product per element): the view (row stride KM + 1, offset 1)
-    # was copied at the entry of each plume island that reads it (round 8 wave 4).
+    # is otherwise copied at the entry of each plume island that reads it.
     zm = phii[:, 1:] * (1.0 / GRAV)
     pix = psk[:, None] / prslk
     plyr = F32_0P01 * prsl

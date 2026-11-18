@@ -5,7 +5,7 @@
 
 Inductor checks every indirect load (``tl.device_assert``) unless it can prove
 the index range itself, which it cannot for indices loaded from memory. The
-checks cost about 6-7% of a forecast step. A compiled graph may run without
+checks add a measurable cost to each forecast step. A compiled graph may run without
 them only when, for the call at hand:
 
 1. every index it consumes is a graph input, reached through view-only steps
@@ -38,7 +38,7 @@ import torch
 
 # (index input position, operand input position or None, operand dim, static rows)
 Requirement = tuple[int, int | None, int, int]
-# Process-wide evidence of which kernels CUDA region calls actually used.
+# Process-wide record of which kernels CUDA region calls actually used.
 COUNTERS = {"checked_calls": 0, "unchecked_calls": 0}
 
 # Methods and functions that only reshape or select without new values.
@@ -415,9 +415,8 @@ def proven_index_backend(options: dict[str, Any]) -> Callable[..., Any]:
     """The Dynamo backend for ``options``; equal options share one object.
 
     Dynamo keys cached graphs by backend identity. compile_utils creates one
-    wrapper per specialization key, and per-wrapper backends filled each
-    region's cache until Dynamo hit recompile_limit and ran it eager (GPU
-    session nccl-r3b: 7194 instead of 1888 kernels per step).
+    wrapper per specialization key; a backend per wrapper would fill each
+    region's cache until Dynamo hits recompile_limit and runs the region eagerly.
     """
     checked_options = {**options, "assert_indirect_indexing": True}
     unchecked_options = {**options, "assert_indirect_indexing": False}

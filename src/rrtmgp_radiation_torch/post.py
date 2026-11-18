@@ -35,8 +35,8 @@ def compute_heating_rate(
 ) -> torch.Tensor:
     """Match RTE/RRTMGP `mo_heating_rates::compute_heating_rate_general`.
 
-    The checkpoint convention stores Fortran `(ncol,nlev)` arrays as
-    `(nlev,ncol)`, so the vertical interface axis is axis 0.
+    Fortran `(ncol,nlev)` arrays are stored as `(nlev,ncol)`, so the vertical
+    interface axis is axis 0.
     """
 
     up = _to_real(flux_up, name="flux_up")

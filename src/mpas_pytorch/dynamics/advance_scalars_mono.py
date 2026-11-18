@@ -482,8 +482,8 @@ def _monotonic_scalar_transport_vertical_neighbor_bounds_numeric(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Local vertical bounds, neighbor bounds and the vertical scalar flux.
 
-    Same expressions and order as the former inline block: levels are joined
-    with ``torch.cat`` instead of slice stores, which moves no arithmetic.
+    Levels are joined with ``torch.cat`` instead of slice stores, which moves
+    no arithmetic.
     """
     so = scalar_old_all[cell_start:cell_stop, :, :]
     sn = scalar_new_all[cell_start:cell_stop, :, :]
@@ -1425,7 +1425,7 @@ def _monotonic_scalar_transport_streaming_scale_prepare_numeric(
     if torch.is_grad_enabled():
         # Under AD (eager, or a compiled region tracing for reverse mode) the quotients divide in the
         # working dtype through fct_quotient, whose derivatives never square the denominator: near eps
-        # that square underflows in float32, and the clamp's zero cotangent then made 0/0. The quotient
+        # that square underflows in float32, and the clamp's zero cotangent would then make 0/0. The quotient
         # equals the no-grad path's on every device (IEEE division is correctly rounded).
         scale_in_limited = fct_clamp_01(fct_quotient(
             s_max_patch * rho_zz_int_rows.unsqueeze(2) - scalar_cell_patch,
@@ -2249,11 +2249,11 @@ def _monotonic_scalar_transport_streaming_scalar_transport_region(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Orchestrate monotonic scalar transport streaming phase scalar tiles outside compiled numeric code.
+    """Run monotonic scalar transport streaming phase scalar tiles outside compiled numeric code.
 
     Both the public chunk loop and this scalar-tile loop stay outside compile.
     Every tile uses the same functional numeric callable; concatenation and
-    final-scalar scratch selection are orchestration-only operations.
+    final-scalar scratch selection run outside it.
     """
     tile_region = _monotonic_scalar_transport_streaming_scalar_transport_tile_region
     if _tile_region is not None:
@@ -2446,7 +2446,7 @@ def _monotonic_scalar_transport_stencil_field_with_zero_padding(
     """Return a scalar stencil field with the unused padding row set to zero.
 
     monotonic-scalar-transport uses the trailing cell row as the safe gather target for absent
-    neighbors.  Differentiable and compiled execution keep the old functional
+    neighbors.  Differentiable and compiled execution keep a functional
     clone boundary; forward-only eager execution canonicalizes that unused row in
     place instead of cloning the full 3D scalar field.
     """
@@ -2495,7 +2495,7 @@ def _monotonic_scalar_transport_source_tendency_numeric(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply the source tendency to the solve rows, then zero the tendency.
 
-    Same expression and order as the former inline block. The tendency is only
+    The tendency is only
     read: its zeroed rows go into a new field (it may be a broadcast zero, see
     stencil_ops._read_only_zeros).
     """
@@ -2532,10 +2532,7 @@ def _monotonic_scalar_transport_density_update_numeric(
     write_end: int,
     n_vert_levels: int,
 ) -> torch.Tensor:
-    """rho_zz_int on the solve rows from the flux divergences.
-
-    Same expressions and order as the former inline block.
-    """
+    """rho_zz_int on the solve rows from the flux divergences."""
     rows = slice(read_start, read_stop)
     horiz_div = _sum_density_flux_slots(
         edge_field=uhAvg,
@@ -3115,7 +3112,7 @@ def atm_advance_scalars_mono_work(
     _emit_scratch_outputs: bool = True,
     coef_3rd_scale: torch.Tensor | None = None,
 ) -> dict:
-    """Public monotonic-scalar-transport entrypoint with runner-owned scalar chunk orchestration.
+    """Public monotonic-scalar-transport entrypoint with runner-owned scalar chunking.
 
     ``coef_3rd_scale`` (0-d tensor or None; ``config["parameter_scales"]["config_coef_3rd_order"]``) multiplies
     coef_3rd_order and adv_coefs_3rd at their uses; 1.0 is bitwise neutral.

@@ -352,7 +352,7 @@ def atm_init_coupled_diagnostics(
         # after every edge slot, so each subtraction rounds independently.
         rw_interior = _subtract_fortran_order(rw_interior, masked_contrib)
         # Zero bottom and top interfaces by functional padding: both AD modes and compiled regions
-        # see one copy (a write into a fresh zero buffer lost its tangent under Inductor).
+        # see one copy (a write into a fresh zero buffer loses its tangent under Inductor).
         rw = torch.nn.functional.pad(rw_interior, (1, 1))
     else:
         rw = torch.zeros((nCells, nVertLevels + 1), dtype=compute_dtype, device=device)

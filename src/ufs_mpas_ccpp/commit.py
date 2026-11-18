@@ -281,7 +281,7 @@ def commit_native(
     constants: ConstantsProfile = UFS_CONSTANTS,
     halo=None,
 ) -> NativeCommitResult:
-    """Compose the actual TL1 boundary without captured intermediate injection.
+    """Compose the TL1 boundary from the live operators, without injected intermediates.
 
     One fully owned rank has no received wind-increment or primary halo rows.
     A partitioned domain (``domain.mpi_size`` ranks) commits its owned cells and
@@ -291,7 +291,7 @@ def commit_native(
     rtheta_p, exner) before the output refresh; no mutation intervenes. Ledger sums
     run over all cells in global-ID order (``ufs_mpas_ccpp.distributed``).
     This operator does not initialize geometry, run CCPP groups, synchronize
-    dycore time levels, or qualify a complete forecast/restart boundary.
+    dycore time levels, or define a complete forecast/restart boundary.
     """
     nc, ne, ranks = domain.n_cells, domain.n_edges, domain.mpi_size
     partitioned = halo is not None

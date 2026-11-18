@@ -51,8 +51,7 @@ def run_physics_sequence(statein, grid, prefix, hpbl, noah_case, *,
     pbl = scheme(run_pbl_sequence)(statein, grid, surface, dtp=dtp, dtf=dtf,
         dtidx=dtidx, control=pbl_control, parameter_scales=parameter_scales)
     prepared = apply_gwd_pre(pbl.prefix)
-    # gwd.dx_factor and gwd.tauamp have sites on the GFS v17 path only (R4 runs UGWP v0 without LS/BL drag); the gates
-    # judge them on the stored v17 case.
+    # gwd.dx_factor and gwd.tauamp have sites on the GFS v17 path only (R4 runs UGWP v0 without LS/BL drag).
     gwd = parameters.select(parameter_scales, GWD_PARAMETER_KEYS)
     if "alpha_fd" in gwd:
         # TOFD alpha_fd*s, on alpha_fd's device and dtype (drag_suite_psl validates both); both GWD paths.

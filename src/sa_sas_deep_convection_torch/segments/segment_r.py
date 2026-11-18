@@ -13,7 +13,7 @@ from sa_sas_deep_convection_torch.state import SaSasDeepConvectionState, require
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
-    """Run lines 3020-3112 of ``samfdeepcnv_run`` for the approved active case."""
+    """Run lines 3020-3112 of ``samfdeepcnv_run``."""
 
     cnvflg = state.require("cnvflg").clone()
     asqecflg = state.require("asqecflg").clone()

@@ -85,7 +85,7 @@ def commit_thermodynamics(
     The returned ledger operands have not undergone a global/MPI reduction.
     With ``ledgers=False`` they are not formed (None); the committed state is unchanged.
     Experimental ``pressure_thickness`` retains the live hydrostatic producer's
-    layer pressure before interface rounding. Only phase one admits that representation.
+    layer pressure before interface rounding. Only phase one accepts that representation.
     The normal coordinator does not supply it.
     """
     if not isinstance(phase, CommitPhase):
@@ -289,7 +289,7 @@ def commit_thermodynamics(
         "invalid reconstructed pressure",
     )
     # Stored once (compiled): the halo-row cats are pointwise on CUDA, and Inductor evaluated the FP64 power again
-    # in the cat kernel (round 8: one more FP64 power over [ncol, nlev] per commit, 0.84 ms at 60 km).
+    # in the cat kernel (one more FP64 power over [ncol, nlev] per commit).
     exner = stored(_pressure_power(pressure, constants))
     theta = temperature / exner
     theta_m = theta * moist_factor

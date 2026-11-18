@@ -30,7 +30,7 @@ def _freeze(values):
 
 def _finite_flags(primals):
     # Return row flags across the compiled boundary. A fused global reduction
-    # otherwise scans every field with one CUDA block on the 60km workload.
+    # otherwise scans every field with one CUDA block on large meshes.
     return tuple(torch.isfinite(value).all(dim=tuple(range(1, value.ndim)))
                  if value.ndim > 1 else torch.isfinite(value).reshape(-1)
                  for value in primals)

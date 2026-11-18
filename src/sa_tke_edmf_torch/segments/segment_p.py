@@ -17,7 +17,7 @@ def _tridin_heat_tracers(lower: torch.Tensor, diagonal: torch.Tensor, upper: tor
     KM = diagonal.shape[0]
     # Level-major rows (``_heat_tracer_system_rhs`` writes them, with the first sweep row in ``previous``): each
     # sweep step reads one contiguous row ([ncol] or [ncol, ntrac]) per operand. The joins and end rows are
-    # compiled regions around the compiled level blocks (eager, they were strided copies and cats, G4a).
+    # compiled regions around the compiled level blocks (eager, they are strided copies and cats).
     pieces = [[value[None]] for value in previous]
     for first in range(1, KM - 1, 4):
         stop = min(first + 4, KM - 1)
@@ -76,7 +76,7 @@ def _heat_forward_levels(lower, diagonal, upper, rhs_heat, rhs_tracers,
 
 
 def _heat_backward_levels(upper, heat, tracers, below_heat, below_tracers):
-    # Bounded outputs prevent a 54-level/9-tracer fused kernel's 12-16 KiB thread stack.
+    # Bounded outputs keep a fused kernel over many levels and tracers from needing a large thread stack.
     heat_rows, tracer_rows = [], []
     for k in range(upper.shape[0] - 1, -1, -1):
         below_heat = heat[k] - upper[k] * below_heat
@@ -261,8 +261,8 @@ def _heat_tracer_system_rhs(q1: torch.Tensor, t1: torch.Tensor, delp: torch.Tens
     heat_middle = ((heat_from_below[:, :km1 - 1] + heat_from_above[:, 1:]) + up_heat[:, 1:]) + down_heat[:, 1:]
     rhs_heat = torch.cat((heat_bottom[None], heat_middle.t(), heat_from_below[:, km1 - 1][None]), dim=0)
     # All KM rows as one expression, so each plume term is read once and the level-major result is written once:
-    # compiled on CUDA, joining the rows 0..KM-2 with the top row stored both parts [ncol, levels, ntrac] and copied
-    # them again into the join (round 8 wave 3: 1.3 GB moved by three kernels). Row r > 0 starts from the
+    # compiled on CUDA, joining the rows 0..KM-2 with the top row stores both parts [ncol, levels, ntrac] and copies
+    # them again into the join. Row r > 0 starts from the
     # interface-below terms of row r - 1; the plume terms (rows 0..KM-2) are padded with a row that the top row,
     # which takes the interface-below terms alone, never selects.
     row = torch.arange(KM, device=device)[None, :, None]
@@ -289,8 +289,7 @@ def _heat_tracer_recovery(q1, t1, delp, prsl, zi, rdzt, dkt, q_half, tcko, tcdo,
     system = region("heat_tracer_rhs", _heat_tracer_system_rhs, q1, t1, delp, prsl, zi, rdzt, dkt, q_half, tcko, tcdo, qcko, qcdo, xmf, xmfd, heat, evap, kpbl, mrad, krad, pcnvflg, scuflg, dt2, sa3dtke, use_lpt, ntcw, ntiw)
     solved_heat, solved_tracers = region("heat_tracer_thomas", _tridin_heat_tracers, *system)
     # Vapor and the borrowing hydrometeors are carried as their own fields and joined with the other tracers once
-    # (in _heat_tracer_tendencies): each borrow rewrote all tracers before (round 8: three [ncol, KM, 9] passes and
-    # two strided slot copies per 60 km step).
+    # (in _heat_tracer_tendencies), so a borrow does not rewrite all tracers.
     vapor = region("heat_vapor_borrow", _borrow_tracer_negative_energy, solved_tracers, NTQV - 1, delp, active=active, lower_bound=lower_bound, upper_bound=upper_bound, k_count=KM // 2)
     vapor = region("heat_vapor_borrow_all", _borrow_negative_energy, vapor, delp, k_count=KM)
     hydrometeors, hydrometeor_slots = [], [ntcw - 1] + ([ntrw - 1] if ntrw > 0 else [])
@@ -323,8 +322,8 @@ def _heat_tracer_tendencies(solved_heat, vapor, nonvapor_tracers, t1, q1, rtg, p
     rho_a = prsl[:, 0] / (RD * t1[:, 0] * (1.0 + FV * torch.clamp_min(q1[:, 0, NTQV - 1], QMIN)))
     dtsfc = rho_a * CP * heat
     dqsfc = rho_a * HVAP * evap
-    # The non-vapor tendencies are an output only for the dtend diagnostics: as a region output they were stored and
-    # read back by the rtg join (round 8, 60 km: 0.63 ms); otherwise the join forms them.
+    # The non-vapor tendencies are an output only for the dtend diagnostics: as a region output they are stored and
+    # read back by the rtg join; otherwise the join forms them.
     return solved_tracers, ten_t, rtg, qtend_nonvapor if diagnostics else None, dtsfc, dqsfc
 
 def run(state: SaTkeEdmfState) -> SaTkeEdmfState:

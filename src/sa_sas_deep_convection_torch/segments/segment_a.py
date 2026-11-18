@@ -12,13 +12,12 @@ from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConv
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
-    """Run lines 320-344 of ``samfdeepcnv_run`` for the approved active case."""
+    """Run lines 320-344 of ``samfdeepcnv_run``."""
     _, KM, NN, NTR, NTC = runtime_dimensions(state)
 
     qtr = state.require("qtr")
     # The host binds q1 to the vapour slot of gq0 (a stride-ntrac view). Stored once as its own array for every
-    # later reader: the islands of A and C each copied the view at entry (0.41 ms per 60 km step on the RTX PRO
-    # 6000, round 8 wave 4). Values unchanged.
+    # later reader: otherwise the islands of A and C each copy the view at entry. Values unchanged.
     q1 = state.require("q1").contiguous()
     t1 = state.require("t1")
     u1 = state.require("u1")
@@ -111,7 +110,7 @@ def _entry_initialization_block(
     NTR = qtr.shape[2] - 2
     ncol = q1.shape[0]
     # The tendencies are zero until segment U forms them: stride-0 zeros (no fills; compaction takes their rows as
-    # views, round 8), a distinct tensor object each.
+    # views), a distinct tensor object each.
     ten_t = t1.new_zeros(()).expand(t1.shape)
     ten_u = u1.new_zeros(()).expand(u1.shape)
     ten_v = v1.new_zeros(()).expand(v1.shape)

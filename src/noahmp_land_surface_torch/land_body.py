@@ -1,12 +1,10 @@
 # Copyright (c) 2026 IC Weather LLC. Licensed under LICENSE and PERMISSIONS.md.
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""Torch helpers for the Noah-MP land-body H/I/J checkpoint surfaces.
+"""Noah-MP land-column physics (``noahmp_sflx``) called by the driver in ``driver.py``.
 
-This module is intentionally separate from ``driver.py`` so it can be wired into
-the cumulative target after the H/I/J implementation is reviewed.  The routines
-below follow the source-smoke option corridor only and reject unsupported
-branches instead of broadening the target claim silently.
+The routines follow the Noah-MP options of the GFS v17 suite and raise
+``NotImplementedError`` for unsupported branches.
 """
 
 from __future__ import annotations
@@ -92,7 +90,7 @@ LAND_BODY_SUPPORTED_OPTIONS = {
 
 @dataclass(frozen=True)
 class LandBodyState:
-    """Column-major state needed immediately after Noah-MP land boundary G."""
+    """Column-major input state of the land-body physics (case fields and the driver's ``G__`` outputs)."""
 
     column_indices: torch.Tensor
     vegtype: torch.Tensor
@@ -216,7 +214,7 @@ class LandBodyState:
 
 @dataclass(frozen=True)
 class LandBodyHIJ:
-    """Vectorized H/I/J fields before checkpoint-shaped emission."""
+    """Vectorized land-body results by group (``h``, ``i``, ``j``) and the driver-facing ``tail`` fields."""
 
     h: Mapping[str, torch.Tensor]
     i: Mapping[str, torch.Tensor]
@@ -376,7 +374,7 @@ def _g_boundary_matrix(g_outputs: Mapping[str, torch.Tensor], field: str, indice
         return values[indices]
     if field in g_outputs:
         return g_outputs[field][indices]
-    # Legacy checkpoint keys carry static column labels, not tensor values.
+    # Per-column keys (``G__<field>__col<n>``) carry static column labels, not tensor values.
     prefix = f"G__{field}__col"
     labels = sorted(int(key[len(prefix):]) for key in g_outputs if key.startswith(prefix))
     if not labels:
@@ -688,11 +686,10 @@ def state_from_case_after_g(
     device: str | torch.device | None = None,
     dtype: torch.dtype | None = None,
 ) -> LandBodyState:
-    """Build H/I/J helper inputs from a materialized case and current G output.
+    """Build the land-body inputs from a materialized case and the driver's ``G__`` outputs.
 
-    This reads only case JSON fields and the target's own G emissions.  It does
-    not read or infer from checkpoint/oracle values. ``dtype`` defaults to the case's
-    working dtype (``_case_real``): float64 for checkpoint parity, float32 when the
+    This reads only case JSON fields and those driver outputs. ``dtype`` defaults to the case's
+    working dtype (``_case_real``): float64, the precision of the Fortran reference, or float32 when the
     coupled state is float32.
     """
     dtype = _case_real(case_data) if dtype is None else dtype
@@ -1340,7 +1337,7 @@ def _divide_snow_source_corridor(
     snliq: torch.Tensor,
     stc: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Port Noah-MP ``divide`` for the sealed one/two-layer land snow corridor."""
+    """Port Noah-MP ``divide`` for one- and two-layer land snow packs."""
 
     msno = torch.clamp(-isnow, min=0, max=3)
     dz, ice, liq, temp = _snow_slots_from_fortran_order(isnow, dzsnso, snice, snliq, stc)
@@ -1890,7 +1887,7 @@ def _phasechange_source_corridor_flat_impl(
     sh2o: torch.Tensor,
     dt: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Port Noah-MP ``phasechange`` for the sealed ``opt_frz=1`` corridor."""
+    """Port Noah-MP ``phasechange`` for ``opt_frz=1``."""
 
     sneqv = snow_water_equiv
     snowh = snow_depth
@@ -1971,8 +1968,7 @@ def _phasechange_source_corridor_flat_impl(
     imelt = imelt * keep_after_reset
     xm = hm * dt_col / NOAHMP_HFUS
 
-    # Thin snow with no explicit snow layer.  This corridor is included for
-    # completeness; the currently sealed snow cases both have explicit layers.
+    # Thin snow with no explicit snow layer.
     thin_active = (snow_levels == 0) & (sneqv > 0.0) & (xm[:, 3] > 0.0)
     temp1 = sneqv
     sneqv_thin = torch.clamp(temp1 - xm[:, 3], min=0.0)
@@ -2473,9 +2469,8 @@ def _numerical_water_loss(errwat: torch.Tensor) -> torch.Tensor:
 
     It enters the water-budget diagnostic only, as its own named sink; it is not added to surface runoff. The
     soil-water solve can lose a small water depth in its iterations; added to runoff, that round-off sized loss
-    would become a physical flux whose derivative is dominated by round-off. GFS v17 has no such term; the Fortran
-    reference carries the same diagnostic (fortran_patches/noahmp_physical_runoff_20261104.patch), so runoff
-    equals the noahmp_sflx output in both."""
+    would become a physical flux whose derivative is dominated by round-off. GFS v17 has no such term; the patched
+    Fortran reference carries the same diagnostic, so runoff equals the noahmp_sflx output in both."""
     return torch.where(errwat < 0.0, -errwat, errwat * 0.0)
 
 

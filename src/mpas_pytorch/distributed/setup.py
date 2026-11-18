@@ -15,9 +15,8 @@ import torch.distributed as dist
 def scatter_cpu_shards(output, payload=None, *, src=0, group=None):
     """Stream root's shards in 16 MiB messages with length and SHA-256 checks.
 
-    Large object scatter stalls in the measured macOS Gloo setup path (G38).
-    This retains the qualified benchmark's delivery protocol. It neither
-    changes halo transport nor copies the global case to every GPU.
+    Large object scatter stalls in the macOS Gloo setup path. This delivery
+    neither changes halo transport nor copies the global case to every GPU.
     """
     rank, world = dist.get_rank(), dist.get_world_size()
     if (src != 0 or len(output) != 1 or dist.get_backend(group) != "gloo"

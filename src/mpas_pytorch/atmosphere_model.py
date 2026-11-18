@@ -1123,13 +1123,13 @@ def _prepare_timestep_state(
         config=full_config,
         dt=dt if dt is not None else float(full_config["config_dt"]),
     ):
-        # R4 synchronizes time levels, then refreshes output/solve diagnostics.
+        # The UFS physics commit synchronizes time levels; output/solve diagnostics are then refreshed.
         # The integrator creates its saved time levels from these live primaries.
         # Cold initialization would replace source-owned rw and base fields.
         state["nVertLevels"] = _dimension_from_shape(
             {**mesh, **state}, "nVertLevels", state["u"].shape[1]
         )
-        # The live UFS commit retains native topology. The merge verifies this
+        # The UFS physics commit retains native topology. The merge verifies this
         # contract with tensor assertions instead of inferring a host policy.
         state["_edge_ordering_mismatch"] = False
         refresh_output_diagnostics(state, full_config)
@@ -1432,7 +1432,7 @@ def _init_coupled_diagnostics(
     recomputed from the current prognostic state.
 
     The function handles the index convention mismatch: atm_init_coupled_diagnostics
-    operates on 0-based arrays without padding, while the orchestration state uses
+    operates on 0-based arrays without padding, while the model state uses
     1-based arrays with +1 padding. Results are embedded into padded arrays.
 
     Args:
@@ -2335,8 +2335,8 @@ def run_simulation(
             before returning. Disable this for prognostic-only adjoint
             objectives to avoid rebuilding a large final diagnostic graph
             unnecessarily. This controls returned output fields, not the
-            five-field continuation used by qualified global forecasts.
-        on_phase: Optional observation callback. Production benchmark runners
+            five-field continuation used by global forecasts.
+        on_phase: Optional observation callback. Benchmark runners
             use ``forecast_integration_begin``/``forecast_integration_end`` to
             time the same post-initialization forecast interval as native MPAS.
 
@@ -2569,7 +2569,7 @@ def run_simulation(
                     )
                 # Ordinary forward continuation consumes the complete boundary
                 # snapshot directly. Re-deriving rho_p/rtheta_p/pressure_p here
-                # was measured to change the next timestep by roundoff.
+                # changes the next timestep by roundoff.
                 # Own preparation outputs before starting the recurring timestep
                 # root, independent of the preparation graph's recording phase.
                 state = cuda_graph_step_boundary(state)
@@ -2599,7 +2599,7 @@ def run_simulation(
                     and native_context is None
                 ):
                     # Only checkpointed reverse mode rematerializes from this
-                    # support; elsewhere it kept step-0 diagnostics alive.
+                    # support; elsewhere it would keep step-0 diagnostics alive.
                     boundary_static_support = profiled_call(
                         "mpas.static_boundary_capture",
                         full_config,
@@ -2832,8 +2832,8 @@ def run_simulation(
                         ) -> dict[str, Any]:
                             # A checkpoint boundary is an exact discrete-model
                             # boundary, not a compact restart. Rebuilding these
-                            # diagnostics changed the forward trajectory from
-                            # step two onward and differentiated a different map.
+                            # diagnostics changes the forward trajectory from
+                            # step two onward and differentiates a different map.
                             _checkpoint_exact_diagnostic_keys(sd)
                             working_state = dict(sd)
                             step_result = atm_srk3(

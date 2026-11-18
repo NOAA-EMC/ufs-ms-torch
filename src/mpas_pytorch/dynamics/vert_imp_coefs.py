@@ -284,10 +284,9 @@ def atm_compute_vert_imp_coefs_work(
             gamma_tri: Tridiagonal factorization coefficient (nCells+1, nVertLevels)
 
     Note:
-        Default execution keeps the Thomas k-ordering exactly. PyTorch-native
-        scan recurrences remain opt-in until the drift-proof/budget chain
-        authorizes them for production; the Thomas path is the reference
-        comparison path.
+        Default execution keeps the Thomas k-ordering exactly; the Thomas path
+        is the reference comparison path. PyTorch-native scan recurrences are
+        opt-in.
     """
     compute_dtype = zz.dtype
     device = require_consistent_device(
@@ -313,7 +312,7 @@ def atm_compute_vert_imp_coefs_work(
     dtseps = 0.5 * dts * (1.0 + epssm)
     rcv = rgas / (cp - rgas)
     c2 = cp * rcv
-    # Some orchestration paths carry nVertLevels+1 metric vectors. vertical-implicit-coefficients uses
+    # Some callers pass nVertLevels+1 metric vectors. vertical-implicit-coefficients uses
     # Fortran levels k=1..nVertLevels, so trim to this working range.
     rdzw_k = rdzw[:nVertLevels]
     fzm_k = fzm[:nVertLevels]
@@ -339,8 +338,7 @@ def atm_compute_vert_imp_coefs_work(
     # =========================================================================
     # Step 4: Cell-parallel coefficient assembly and batched tridiagonal factorization
 
-    # Default execution keeps k-ordering exact. Scan recurrences are opt-in until
-    # the drift-proof/budget chain authorizes them for production.
+    # Default execution keeps k-ordering exact. Scan recurrences are opt-in.
     # =========================================================================
     cofwr_s = torch.zeros(n_solve, nVertLevels, dtype=compute_dtype, device=device)
     cofwz_s = torch.zeros(n_solve, nVertLevels, dtype=compute_dtype, device=device)
@@ -407,7 +405,7 @@ def atm_compute_vert_imp_coefs_work(
         c_tri_s = torch.zeros(n_solve, nVertLevels, dtype=compute_dtype, device=device)
 
         if nVertLevels > 1:
-            # keep explicit indexed expression text for guardrail traceability:
+            # Levels 1..nVertLevels-1 of a_tri_s, b_tri_s and c_tri_s:
             # a_tri_s[:, 1:nVertLevels], b_tri_s[:, 1:nVertLevels], c_tri_s[:, 1:nVertLevels]
             a_rest = (
                 -cofwz_s[:, 1:nVertLevels]

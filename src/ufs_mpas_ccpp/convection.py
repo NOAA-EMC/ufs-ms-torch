@@ -131,8 +131,8 @@ def convection_core(fields, *, control, shallow=False):
 def convection_post(fields, *, control, shallow=False):
     """Source post with live diagnostic slots, cloud carry and water correction.
 
-    This selects TEMPO, SAMF and the R4 tracer table. No source stderr ledger
-    qualification is implied by the numerical state/diagnostic update.
+    This selects TEMPO, SAMF and the R4 tracer table. The source's stderr ledger
+    output is not reproduced.
     """
     if type(shallow) is not bool:
         raise TypeError("convection kind must be static")
@@ -295,9 +295,9 @@ _FIELD_SCALES = {"deep": {"samf.tau_deep": "tau_scale", "samf.cinpcr_deep": "cin
                           "samf.rhcrt_deep": "rhcrt_scale"},
                  "shal": {"samf.tau_shal": "tau_scale", "samf.cinpcr_shal": "cinpcr_scale",
                           "samf.rhcrt_shal": "rhcrt_scale"}}
-# samf.tau_shal is tier 2 (registry note): the shallow dtconv reaches the outputs only
+# samf.tau_shal has a weak effect: the shallow dtconv reaches the outputs only
 # through advfac = min(cat_adj_shal*tauadv/dtconv, 1), capped at 1 (or dtconv at its clamp) on every stored shallow
-# column at s = 1, so it has no gradient there at s = 1 (s = 0.5 changes outputs on cycle 1).
+# column at s = 1, so it has no gradient there at s = 1 (s = 0.5 does change outputs).
 
 
 def _scaled_coefficients(coefficients, parameter_scales):

@@ -10,7 +10,7 @@ def working_power(base: torch.Tensor | float, exponent: torch.Tensor | float) ->
     """Evaluate a real power consistently across batch boundaries and devices.
 
     FP32 scalar/vector pow differ both in exponent precision and evaluation. On CPU and CUDA, round the
-    exponent to the state dtype, evaluate in FP64, then round once (one form, the one validated on CPU), so
+    exponent to the state dtype, evaluate in FP64, then round once (one form on both devices), so
     FP32 is mixed precision at these sensitive powers; on CUDA the FP64 power runs at the device's FP64
     throughput. MPS cannot hold FP64 and keeps the native FP32 power, as ``mpas_pytorch.precision.working_power``
     does. The casts remain on-device and preserve JVP/VJP. No tensor values reach the host.

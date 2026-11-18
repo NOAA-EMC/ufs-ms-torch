@@ -356,7 +356,7 @@ def initialize_surface(
             "invalid initialized Noah-MP soil parameters",
         )
         active_frozen = land_mask[:, None] & (x("tslb")[:, :4] < 273.15 - 1.0e-3)
-        # Safe inactive operands preserve the source branch and reverse-mode AD (A1).
+        # Safe inactive operands preserve the source branch and reverse-mode AD.
         safe_t = torch.where(active_frozen, x("tslb")[:, :4], 260.0)
         safe_b = torch.where(active_frozen, b, 1.0)
         safe_psi = torch.where(active_frozen, psi, 1.0)

@@ -848,8 +848,8 @@ def _synthesize_vector_geometry_fields(
 
     # mpas_rbf_interp_initialize always rebuilds these three geometry fields,
     # followed by mpas_init_reconstruct rebuilding coeffs_reconstruct.  Keeping
-    # nonzero init.nc copies created a split state: coefficients used fresh
-    # geometry while later dynamics observed stale geometry.
+    # nonzero init.nc copies would create a split state: coefficients would use
+    # fresh geometry while later dynamics observed stale geometry.
     need_local_vertical = True
     need_edge_normals = True
     need_tangent_plane = True

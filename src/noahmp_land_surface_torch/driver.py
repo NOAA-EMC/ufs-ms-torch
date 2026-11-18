@@ -1,13 +1,11 @@
 # Copyright (c) 2026 IC Weather LLC. Licensed under LICENSE and PERMISSIONS.md.
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""Torch-native Noah-MP profile-SCM A-O target.
+"""Noah-MP land-surface driver (``noahmpdrv``) of the GFS v17 suite in PyTorch.
 
-The implementation in this module is intentionally bounded to the sealed
-profile-SCM corpus.  It follows the instrumented Fortran call order through the
-driver-owned A-O surfaces, delegates H/I/J land physics to the reviewed land
-body helpers, and keeps unsupported raw Noah-MP option paths as explicit
-``NotImplementedError`` branches.
+The module follows the Fortran call order of the driver, computes the glacier columns, and
+delegates the land-column physics to ``land_body``. Unsupported Noah-MP options raise
+``NotImplementedError``.
 """
 
 from __future__ import annotations
@@ -58,7 +56,7 @@ PREPARED_METADATA_KEY = "_prepared_metadata"
 
 
 class NoahMpProductionOutput(NamedTuple):
-    """Flat final-O production surface used by benchmarks and CUDA timing."""
+    """Flat tensor outputs of the driver, one per field."""
 
     O__errflg: torch.Tensor
     O__tskin: torch.Tensor
@@ -96,8 +94,8 @@ PENMAN_A4 = 35.86
 def load_case(case: str | Mapping[str, Any], *, copy_mapping: bool = True) -> dict[str, Any] | Mapping[str, Any]:
     if isinstance(case, Mapping):
         # {**case}, not dict(case): Dynamo traces dict(mapping) by wrapping every nested value, here each
-        # per-column entry of "columns" (with a guard on each), so a compiled call traced O(ncol) Python
-        # values (x1.163842: 81 min of Noah-MP tracing on CPU). The unpacked copy keeps them unrealized.
+        # per-column entry of "columns" (with a guard on each), so a compiled call traces O(ncol) Python
+        # values. The unpacked copy keeps them unrealized.
         return {**case} if copy_mapping else case
     path = CASE_DIR / f"{case}.json"
     if not path.exists():
@@ -564,7 +562,7 @@ def _selected_glacier_snow_age(
     tauss: torch.Tensor,
     return_age: bool = False,
 ) -> torch.Tensor:
-    """Return the BATS snow-age fraction used by the selected GFS-v17 source."""
+    """Return the BATS snow-age fraction of GFS v17 Noah-MP."""
 
     dela0 = 1.0e-6 * dt
     arg = 5.0e3 * (1.0 / NOAHMP_TFRZ - 1.0 / tg)
@@ -588,7 +586,7 @@ def _glacier_tsnosoi_step(
     snow_levels: torch.Tensor,
     dt: float,
 ) -> torch.Tensor:
-    """Port the sealed ``tsnosoi_glacier`` heat solve for rows -2:4."""
+    """Port the ``tsnosoi_glacier`` heat solve for rows -2:4."""
 
     top = snow_levels + 1
     zbot = snowh * 0.0 - 8.0 - snowh
@@ -925,7 +923,7 @@ def _glacier_snowwater_opt2(
     *, stc: torch.Tensor, dzsnso: torch.Tensor, snice: torch.Tensor, snliq: torch.Tensor, snow_levels: torch.Tensor, snowh: torch.Tensor, sneqv: torch.Tensor,
     qsnow: torch.Tensor, snowhin: torch.Tensor, sfctmp: torch.Tensor, qsnsub: torch.Tensor, qsnfro: torch.Tensor, qrain: torch.Tensor, imelt: torch.Tensor, ficeold: torch.Tensor, fsh: torch.Tensor, dt: float,
 ):
-    """Package snowwater_glacier opt_gla2 with three fixed tensor snow slots."""
+    """``snowwater_glacier`` (opt_gla=2) with three fixed tensor snow slots."""
     zero = torch.zeros_like(snowh)
     sh2o = torch.zeros_like(stc[:, 3:])
     sice = torch.ones_like(sh2o)
@@ -1003,7 +1001,7 @@ def _glacier_snowwater_opt2(
         qin = torch.where(active[:, row], qout, qin)
     qsnbot = qin / dt
 
-    # R4 snowh2o_glacier synchronizes aggregate SWE after the layer fluxes.
+    # snowh2o_glacier synchronizes aggregate SWE after the layer fluxes.
     exchanged_sneqv = zero
     for row in range(3):
         exchanged_sneqv = exchanged_sneqv + torch.where(active[:, row], snice[:, row], 0.0)
@@ -1034,8 +1032,7 @@ _glacier_snowwater_opt2_impl = _glacier_snowwater_opt2
 
 
 def _glacier_snowwater_opt2(**kwargs: torch.Tensor | float) -> tuple[torch.Tensor, ...]:
-    # Expanded package physics is source-qualified on CPU, not compiled/CUDA.
-    # Keep the same tensor engine eager unless compilation is explicitly selected.
+    # Runs eagerly unless a caller compiles it explicitly.
     return _glacier_snowwater_opt2_impl(**kwargs)
 
 
@@ -1050,13 +1047,13 @@ def _selected_glacier_snowwater_minus2(
     qsnsub: torch.Tensor,
     dt: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Port the selected-source ``snowwater_glacier`` snowxy=-2 corridor.
+    """Port ``snowwater_glacier`` for ``snowxy = -2`` of the ``GFS_V17_PROFILE_SCM_TABLE_VARIANT`` source.
 
-    The selected GFS-v17 source predates the package glacier-reservoir reset.  For
-    the sealed profile it compacts two layers, combines the thin lower layer,
+    That source predates the glacier-reservoir reset of the default variant.  For its
+    reference glacier column it compacts two layers, combines the thin lower layer,
     divides the pack back to two layers, applies sublimation, and caps SWE at
-    100 mm.  Keeping this as a separate source-lineage kernel prevents accidental
-    contamination of the current-package glacier semantics.
+    100 mm.  A separate kernel keeps these semantics apart from the default
+    variant's glacier code.
     """
 
     zero = stc[:, 0] * 0.0
@@ -1086,7 +1083,7 @@ def _selected_glacier_snowwater_minus2(
         dt=dt,
     )
 
-    # The second layer is below the selected source's 0.05 m minimum, so
+    # The second layer is below that source's 0.05 m minimum, so
     # combine_glacier collapses the pack to one layer before divide_glacier.
     dzc, liqc, icec, tempc = _glacier_combo_temperature(
         dz=dz2,
@@ -1100,8 +1097,8 @@ def _selected_glacier_snowwater_minus2(
     )
 
     # DIVIDE first halves the single layer, then fixes the top layer at 0.05 m
-    # and merges its excess into the lower layer.  The selected 0.10 m split
-    # threshold is not crossed by this sealed corridor.
+    # and merges its excess into the lower layer.  This column does not cross
+    # the 0.10 m split threshold.
     half_dz = dzc / 2.0
     half_ice = icec / 2.0
     half_liq = liqc / 2.0
@@ -1125,8 +1122,8 @@ def _selected_glacier_snowwater_minus2(
     dz1 = zero + 0.05
     temp1 = tempc
 
-    # snowh2o_glacier removes sublimation from the top active layer.  The
-    # selected opt_gla=2 profile has no liquid/rain drainage in this case.
+    # snowh2o_glacier removes sublimation from the top active layer.  This
+    # column has no liquid/rain drainage.
     ice1 = ice1 - qsnsub * dt
 
     # snowwater_glacier computes the overflow from the pre-sublimation 201 mm
@@ -1573,7 +1570,7 @@ def _final_o_from_penman_flat_impl(
     use_surface_temperature: bool,
     prsl1_input: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Flat final-O projection shared by parity and compiled execution."""
+    """Flat driver outputs (``NoahMpProductionOutput`` order) from the land-step results."""
 
     prsl1 = ps * 0.995 if prsl1_input is None else prsl1_input
     virtual_temperature_for_density = t1 * (1.0 + CON_FVIRT * torch.clamp(q1, min=1.0e-8))
@@ -1584,8 +1581,8 @@ def _final_o_from_penman_flat_impl(
         sensible_heat_total / density / CON_CP,
         # Deliberate change from GFS v17 (noahmpdrv exports evap = latent heat / density / con_hvap): the
         # moisture flux is the water Noah-MP removes, (ecan + etran + edir) / density. One latent heat for every
-        # phase misstates the water where it sublimates (snow, ice), so the atmosphere gained a different water
-        # mass than the land lost; the exported evap now closes the coupled water budget.
+        # phase misstates the water where it sublimates (snow, ice), so the atmosphere gains a different water
+        # mass than the land loses; the exported evap closes the coupled water budget.
         evaporation_total / density,
         potential_evaporation,
         runoff_surface,
@@ -1798,7 +1795,7 @@ def _glacier_tail(f_fields: Mapping[str, torch.Tensor]) -> dict[str, torch.Tenso
 
 
 NOAHMP_DRIVER_OUTPUT_FIELDS = tuple("cm ch sfalb weasd snwdph tskin tprcp srflag smc stc slc canopy trans tsurf zorl rb1 fm1 fh1 ustar1 stress1 fm101 fh21 rmol1 flhc1 flqc1 snowxy tvxy tgxy canicexy canliqxy eahxy tahxy cmxy chxy fwetxy sneqvoxy alboldxy qsnowxy wslakexy zwtxy waxy wtxy tsnoxy zsnsoxy snicexy snliqxy lfmassxy rtmassxy stmassxy woodxy stblcpxy fastcpxy xlaixy xsaixy taussxy smoiseq smcwtdxy deeprechxy rechxy albdvis albdnir albivis albinir emiss sncovr1 qsurf gflux drain evap hflx ep runoff cmm chh evbs evcw sbsno pah ecan etran edir snowc stm snohf smcwlt2 smcref2 wet1 t2mmp q2mp zvfun ztmax rca".split())
-# Per-column R4 call water-budget terms (mm/step); "active" and "glacier" masks accompany them.
+# Per-column water-budget terms of one land call (mm/step); "active" and "glacier" masks accompany them.
 NOAHMP_WATER_BUDGET_TERMS = (
     "begin_soil_mm", "end_soil_mm", "begin_snow_mm", "end_snow_mm",
     "begin_canopy_mm", "end_canopy_mm", "begin_aquifer_mm", "end_aquifer_mm",
@@ -1952,7 +1949,7 @@ def _group_spread_index(selector: torch.Tensor, like: torch.Tensor) -> tuple[tor
 def _spread_into(base: torch.Tensor, value: torch.Tensor, member: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
     """``base.index_copy(0, selector, value)`` as a selection: one pointwise pass over the grid per field.
 
-    Separate scatters (two per field and group) were most of the compiled copyback's kernels; these
+    Separate scatters (two per field and group) would be most of the compiled copyback's kernels; these
     passes share their index reads and fuse. The values are the same bits.
     """
     keep = member.reshape((member.numel(),) + (1,) * (base.ndim - 1))
@@ -2001,7 +1998,7 @@ def noahmp_driver_finish(ctx: Mapping[str, Any]) -> dict[str, torch.Tensor]:
         density = prsl1 / (CON_RD * virtual_temperature)
         soiltype = _col_int(subset, "soiltyp", device=dev)[:, 0] - 1
         copyback.update({name: l[name] for name in ("cm", "ch", "rb1", "fm1", "fh1", "ustar1", "stress1", "fm101", "fh21")})
-        # Preserve the real-8 oracle's driver sentinel.
+        # noahmpdrv's undefined-value sentinel.
         undefined = 9.99e20
         # Keep the exact clipped-zero output without differentiating sqrt(0).
         zvfun_squared = torch.clamp((tail["z0_total"] - 0.1) / 0.9, min=0.0, max=1.0) * torch.clamp(tail["vegetation_fraction"], min=0.1)

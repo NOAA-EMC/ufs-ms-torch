@@ -5,7 +5,7 @@
 
 This follows ``MP/TEMPO/mp_tempo.F90:mp_tempo_run`` and
 ``mp_tempo_post.F90:mp_tempo_post_run``
-around the unchanged TEMPO v3 core, for the configuration the oracle GFS v17
+around the unchanged TEMPO v3 core, for the configuration the GFS v17
 suite uses: no aerosol-aware and no hail-aware fields (the optional
 ``nc/nwfa/nifa/ng/volg`` arrays are absent) and no ``land_input``.
 
@@ -28,7 +28,7 @@ Per call (``mp_tempo.F90:430-575``):
 The TEMPO import-time configuration must be what ``mp_tempo_init`` sets up: the
 CCPP host constants (``TEMPO_TORCH_HOST_CONSTANTS=ufs_physcons``) and
 ``tempo_init(hailaware_flag=.false.)`` (``TEMPO_TORCH_HAIL_AWARE_INIT=0``), see
-``segments/_host_constants.py``; the entry raises otherwise. Semi-Lagrangian
+``host_constants.py``; the entry raises otherwise. Semi-Lagrangian
 sedimentation follows the Fortran operation order.
 
 The sedimentation loops use the static substep bound from ``min_layer_depth``,
@@ -65,7 +65,7 @@ from tempo_torch.parameters import TABLE_SPECS
 
 
 CON_G = 9.80665  # physcons.F90 con_g
-# MPAS tracer table of the oracle lane: qv qc qr qi qs qg ni nr sgs_tke o3mr.
+# MPAS tracer table of the GFS v17 TEMPO configuration: qv qc qr qi qs qg ni nr sgs_tke o3mr.
 MPAS_NTRAC = 10
 MPAS_TRACER_INDEX: Mapping[str, int] = {
     "ntqv": 1,
@@ -160,10 +160,10 @@ class MpTempoInitialization:
 def mp_tempo_init(*, spechum: torch.Tensor, tables: torch_native.TorchFrozenTables,
     semi_sedi: bool, convert_dry_rho: bool = True, restart: bool = False,
     is_initialized: bool = False, do_sat_adj: bool = False) -> MpTempoInitialization:
-    """Selected non-aerosol R4 initialization using prepared frozen coefficients.
+    """``mp_tempo_init`` without aerosols, using prepared frozen coefficients.
 
     Host constants and their derived coefficients use the existing import-time
-    UFS profile. Load and authenticate tables outside numerics, then pass their
+    UFS profile. Load and check tables outside numerics, then pass their
     device tensors here. The non-aerosol source only changes specific humidity;
     its local density/height scratch has no copyback. MPAS reprojects Statein
     after physics_init, so this transient result must not modify native tracers.
@@ -444,7 +444,7 @@ def _mp_tempo_run(
             + torch.clamp_min(rain_p, 0.0)
         ) / 1000.0
         frozen_fraction = diags["frozen_fraction"].reshape(-1)
-        # Plain lookups, not dict.get: compile-reachable code keeps no .get calls (structural ratchet).
+        # Plain lookups, not dict.get: compile-reachable code keeps no .get calls.
         refl_core = diags["refl10cm"] if "refl10cm" in diags else None
         step_diagnostics = result.workspace.diagnostics
         if torch_native.SEDIMENTATION_SUBSTEP_OVERFLOW in step_diagnostics:

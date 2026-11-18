@@ -70,7 +70,7 @@ def sfc_nst_run(fields, solhr, table, control: NSSTControl):
     """Update all 26 source writes, retaining untouched input buffers."""
     active = fields["wet"] & fields["flag_iter"] & (fields["use_lake_model"] != 1)
     eligible = fields["wet"] & (fields["use_lake_model"] != 1)
-    # Neutralize only source-inactive rows before singular arithmetic (A1).
+    # Neutralize only source-inactive rows before singular arithmetic.
     f = {
         name: torch.where(active, fields[name], value)
         for name, value in {

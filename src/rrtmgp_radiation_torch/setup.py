@@ -231,7 +231,7 @@ def _coszmn(
     deltim: float,
     con_pi: float,
 ) -> torch.Tensor:
-    """Port `module_radiation_astronomy::coszmn` for checkpoint-shaped columns."""
+    """Port `module_radiation_astronomy::coszmn` for column tensors."""
 
     pid12 = con_pi / 12.0
     ratio = deltsw / deltim

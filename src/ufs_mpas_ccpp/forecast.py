@@ -29,8 +29,9 @@ the driver checks planned names before cold initialization, on every distributed
 ``operational_profile`` sets the runtime switches of a forecast: observers off, the shortwave
 daylit bound of the run, step graphs on (CUDA graphs on GPU, the eager emulator on CPU; one
 ``StepGraphRunner`` for the whole forecast, so each step variant records once), no column chunk (every
-scheme full batch over the owned columns, radiation included), and the qualified compile policy
-(whole-scheme compile off by default; on CPU float64 compiled equals eager bitwise). Overflowed compaction buffers rerun one rung up (``on_overflow="rerun"``).
+scheme full batch over the owned columns, radiation included), and the default compile policy
+(whole-scheme compile off by default; on CPU float64 compiled equals eager bitwise). Overflowed compaction
+buffers rerun one rung up (``on_overflow="rerun"``).
 With step graphs disabled, global and CPU-partitioned forecasts retain native-five phases across output times.
 """
 
@@ -395,7 +396,7 @@ def run_forecast(case: Mapping[str, Any] | str | Path, output_dir: str | Path, *
         with torch.no_grad():
             state = initialize_cold_cycle(native, mesh, config=config, **case["cold_arguments"]).state
             mark_cold_boundary(state.native_state, mesh=mesh, config=config, dt=float(dt))
-            if owned:  # the initial fields and cold-start operands are not read again (10.5 GiB at x1.163842)
+            if owned:  # the initial fields and cold-start operands are not read again
                 native = case = None
             previous = operational_profile(state, duration_seconds=total, arguments=arguments,
                                            scheme_compile=scheme_compile)

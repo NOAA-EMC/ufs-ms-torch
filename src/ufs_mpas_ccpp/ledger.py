@@ -61,8 +61,8 @@ def _ordered_totals(values: torch.Tensor, initial: torch.Tensor) -> torch.Tensor
 def _observer_totals(values: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
     """Source-ordered observer totals; off (NaN) on CUDA.
 
-    The ordered scan runs serially per column on CUDA (about 5.5 s of an A100
-    cycle), and no physics reads these totals.
+    The ordered scan runs serially per column on CUDA, which is slow, and no
+    physics reads these totals.
     """
     if values.is_cuda:
         return torch.full_like(initial, float("nan"))

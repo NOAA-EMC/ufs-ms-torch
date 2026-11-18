@@ -101,7 +101,7 @@ def _transport_levels(previous, previous_water, profiles, entrainment, base, wat
 
 
 def _descending_blocks(count):
-    # Bound live FP64 outputs; full-depth recurrence fusion exhausted H100 driver memory (G158).
+    # Bound live FP64 outputs; full-depth recurrence fusion can exhaust GPU driver memory.
     for stop in range(count, 0, -4):
         yield max(0, stop - 4), stop
 

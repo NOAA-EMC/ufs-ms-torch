@@ -96,7 +96,7 @@ INIT = PROFILES[TEMPO_DEFAULT]
 # tempo_init(hailaware_flag=...) -> initialize_graupel_vars (module_mp_tempo_params.F90:411-426):
 # hail-aware keeps av_g/bv_g(idx_bg1) at the new coefficients; otherwise the "old"
 # coefficients replace them before initialize_parameters builds cge/cgg. The standalone
-# reference driver initializes hail-aware; the oracle GFS v17 suite passes lthailaware=F.
+# reference driver initializes hail-aware; the GFS v17 suite passes lthailaware=F.
 HAIL_AWARE_INIT_ENV = "TEMPO_TORCH_HAIL_AWARE_INIT"
 _hail_value = os.environ.get(HAIL_AWARE_INIT_ENV, "1") or "1"
 if _hail_value not in ("0", "1"):

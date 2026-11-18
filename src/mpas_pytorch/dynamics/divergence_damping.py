@@ -512,8 +512,8 @@ def atm_divergence_damping_3d(
             config_len_disp=config_len_disp,
             stage_key=("direct_call",),
         )
-    # Outside autograd and outer compilation ``ru_p`` is updated in place (as
-    # the row assignment did before); the region then stores into its rows.
+    # Outside autograd and outer compilation ``ru_p`` is updated in place;
+    # the region then stores into its rows.
     update_in_place = (
         not torch.is_grad_enabled()
         and not _compile_active()

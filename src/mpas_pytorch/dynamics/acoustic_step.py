@@ -898,8 +898,7 @@ def _acoustic_step_acoustic_solve_region(
         full_width_levels=full_width,
     )
 
-    # Default execution keeps Thomas k-ordering. Scan recurrences are opt-in until
-    # the drift-proof/budget chain authorizes them for production.
+    # Default execution keeps Thomas k-ordering. Scan recurrences are opt-in.
     rw_rows = tridiagonal_solve(
         a_tri_active, alpha_tri_active, gamma_tri_active, rw_rows
     )
@@ -1881,8 +1880,8 @@ def atm_advance_acoustic_step_work(
             rtheta_pp_old: Previous rho*theta perturbation
             rw_p: Updated rho*w perturbation
             wwAvg: Updated accumulated rho*omega
-            w: Vertical velocity (unchanged in this version)
-            exner: Exner function (unchanged in this version)
+            w: Vertical velocity (unchanged)
+            exner: Exner function (unchanged)
     """
     device = require_consistent_device(
         "atm_advance_acoustic_step_work",

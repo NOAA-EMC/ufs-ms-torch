@@ -61,7 +61,7 @@ def refresh_host_diagnostics(
 
     Output thermodynamics cover nCells. Wind reconstruction covers nCellsSolve:
     the source does not supply includeHalos to mpas_reconstruct. This function
-    does not perform transport or replace halo primaries with captured outputs.
+    does not perform transport or replace halo primaries with saved outputs.
     The selected R4 native water-vapor index is zero, as in the canonical helper.
     """
     mesh = reconstruction_mesh

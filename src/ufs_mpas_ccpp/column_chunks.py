@@ -149,7 +149,7 @@ def join(parts: list, *, axis: int, size: int, ncol: int, rows: torch.Tensor | N
 # Columns of the eager first call that primes a compiled chunk kernel (run_column_chunks ``warm``).
 # 1024 = 2 x compaction.MIN_COLUMNS: at every capacity fraction below 1 a compacted region of the slice runs
 # its compacted path, as a whole chunk does, so the warm call registers the same overflow-region bits that
-# compiled regions read (64 columns ran dense and left them unset: convection and TEMPO recompiled).
+# compiled regions read (a smaller slice runs dense and leaves them unset, so convection and TEMPO recompile).
 WARM_COLUMNS = 1024
 
 
@@ -235,7 +235,7 @@ def run_column_chunks(call: Callable[[Any], Any], columns: Any, *, ncol: int, si
     grad = torch.is_grad_enabled()
     if warm is not None and not eager_regions_active():
         # The eager first call only fills caches; on WARM_COLUMNS columns it does not set the memory
-        # peak, as a whole eager chunk did. A slice may overflow a compaction buffer the chunks fit:
+        # peak, as a whole eager chunk would. A slice may overflow a compaction buffer the chunks fit:
         # its overflow bits are discarded (the flag is put back), so it never forces a rerun.
         count = size if warm_columns is None else min(warm_columns, size)
         flag = overflow_flag(device)

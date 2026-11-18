@@ -107,7 +107,7 @@ def compute_nonprognostic_gases(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Port `module_radiation_gases::getgases` for gases used by RRTMGP pre.
 
-    The active sealed profile uses `ico2=2`, which selects a 15-degree monthly
+    The GFS v17 suite uses `ico2=2`, which selects a 15-degree monthly
     CO2 table below 788 hPa and a global annual mean above that pressure. Other
     non-prognostic gases are constants in the upstream routine.
     """
@@ -192,8 +192,8 @@ def _fpvs_table_on_device(device: torch.device, dtype: torch.dtype = torch.float
     """Prebuilt ``fpvs`` table per device and working dtype; a compiled region reads it as an input.
 
     Built in float64 on the host (funcphys::gpvs) by preparation or the eager first call. A plain
-    dict, not ``lru_cache``: Dynamo traces through ``lru_cache`` and rebuilt the table inside every
-    graph that reached it.
+    dict, not ``lru_cache``: Dynamo traces through ``lru_cache`` and rebuilds the table inside every
+    graph that reaches it.
     """
     key = (device, dtype)
     table = _FPVS_DEVICE_TABLES.get(key)

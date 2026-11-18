@@ -19,7 +19,7 @@ def _limiter_ratio(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
-    """Run lines 2405-2567 of ``samfdeepcnv_run`` for the approved active case."""
+    """Run lines 2405-2567 of ``samfdeepcnv_run``."""
     _, KM, NN, NTR, NTC = runtime_dimensions(state)
 
     cnvflg = state.require("cnvflg")
@@ -140,7 +140,7 @@ def _tvd_moisture_block(cnvflg, ktcon, kb, jmin, eta, etad, edto, del_, q1, qo, 
     tem1_neg = q1[:, : KM - 1] + ph_neg * (qo[:, : KM - 1] - q1[:, : KM - 1])
     flux = torch.where(tem > 0.0, tem * tem1_pos, torch.where(tem < 0.0, tem * tem1_neg, torch.zeros_like(tem)))
     flxtvd[:, 1:] = torch.where(level_layer_lt, flux, flxtvd[:, 1:])
-    # Deliberate change from GFS v17 (samfdeepcnv.F; Fortran patch samf_launch_exchange_20261116): upstream subtracts
+    # Deliberate change from GFS v17 (samfdeepcnv.F): upstream subtracts
     # the double-counted exchange at jmin+1 and kb with the TVD interface value tem1, while the plumes were launched
     # with the cell humidity qo. Pairing each sink with qo makes the subtraction remove exactly the water the plume
     # took, so the column's water is conserved; it changes dellaq at those two levels.

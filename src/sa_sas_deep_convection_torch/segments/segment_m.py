@@ -12,7 +12,7 @@ from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConv
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
-    """Run lines 2242-2400 of ``samfdeepcnv_run`` for the approved active case."""
+    """Run lines 2242-2400 of ``samfdeepcnv_run``."""
     _, KM, NN, NTR, NTC = runtime_dimensions(state)
 
     cnvflg = state.require("cnvflg")
@@ -300,7 +300,7 @@ def _feedback_increment_block(
 
 def _conditioned_heat_feedback(heo, hcko, hcdo, eta, etad, aup, adw, edto,
                                entr, detr, down_det, down_entr, dz, factor):
-    """Experimental shifted linear heat flux, not selected by the coordinator.
+    """Optional shifted linear heat flux (``conditioned_heat``); the default path does not use it.
 
     Substitute each heat H=A+(H-A), with A the lower environmental heat.
     The coefficient sum multiplies A. Preserve its mass-flux residual: rounded

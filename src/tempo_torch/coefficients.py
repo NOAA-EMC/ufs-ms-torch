@@ -1,7 +1,7 @@
 # Copyright (c) 2026 IC Weather LLC. Licensed under LICENSE and PERMISSIONS.md.
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""Offline TEMPO coefficient construction from the retained NumPy oracle.
+"""Offline TEMPO coefficient construction in NumPy.
 
 Only immutable constants and prepared coefficient buffers cross into the runtime.
 No live model state enters this module.
@@ -27,7 +27,7 @@ _STATIC_SNOW_B = np.asarray(_parameters.SB, dtype=np.float64)
 _STATIC_SNOW_CSE = np.asarray(_parameters.CSE, dtype=np.float64)
 _STATIC_SNOW_CSG = np.asarray(_parameters.CSG, dtype=np.float64)
 # Frozen TEMPO REAL64 initialization for the fall-speed numerator. Host
-# math.gamma differs at these two arguments; preserve the NumPy oracle below.
+# math.gamma differs at these two arguments; keep the values below.
 _STATIC_SNOW_CSG = _STATIC_SNOW_CSG.copy()
 _STATIC_SNOW_CSG[3] = 3.51325214469320013
 _STATIC_SNOW_CSG[9] = 7.61279965268895031

@@ -2,7 +2,7 @@
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """Torch-native TEMPO microphysics: the segments B-S of ``tempo_main`` as tensor operations (CPU and GPU, both AD
-modes). The NumPy reference segments under ``tools.porting.tempo`` stay the accuracy oracle.
+modes).
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ def _complex_beta_constant_python(m1: complex, m2: complex) -> complex:
 
 _TORCH_TABLE_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
 _TORCH_STATIC_NDARRAY_FAST_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
-# Working dtypes of the native backend: float64 (the parity dtype) and float32 (profiling).
+# Working dtypes of the native backend: float64 (the parity dtype) and float32.
 WORKING_DTYPES = (torch.float32, torch.float64)
 _TORCH_SCALAR_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
 _TORCH_INT_SCALAR_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
@@ -47,8 +47,8 @@ DEFAULT_LONG_DT_EULERIAN_SEDIMENTATION_SUBSTEPS = 24
 DEFAULT_LONG_DT_EULERIAN_THRESHOLD_SECONDS = 120.0
 DEFAULT_PRODUCTION_SEMI_SEDIMENTATION_SUBSTEPS = 1
 DEFAULT_SNOW_SEDIMENTATION_SUBSTEPS = 4
-# The caps above were accuracy-gated only on the approved corpus (dt <= 120 s,
-# nz=59). Fortran substeps each column int(dt*vt/dz + 1) times
+# The caps above were checked against the Fortran reference only for dt <= 120 s
+# and nz=59. Fortran substeps each column int(dt*vt/dz + 1) times
 # (module_mp_tempo_main.F90 rain/graupel/snow_fallspeed), divided by 10 on the
 # semi-Lagrangian path (main.F90:601,642). A caller that knows its grid passes
 # ``min_layer_depth``; the loop count then becomes max(cap, bound), where the
@@ -181,7 +181,7 @@ def _lane_buffer(active: torch.Tensor, group: str) -> tuple[torch.Tensor, torch.
     lanes: Inductor's CPU loop split (torch 2.8) fails on a flattened pointwise node fused beside
     [column, level] nodes when the column count is not a multiple of the levels.
     """
-    # Plain lookups, not dict.get: compile-reachable code keeps no .get calls (structural ratchet).
+    # Plain lookups, not dict.get: compile-reachable code keeps no .get calls.
     fraction = LANE_COMPACTION[group] if group in LANE_COMPACTION else 1.0
     lanes = active.numel()
     size = compaction.capacity(lanes, fraction)
@@ -266,7 +266,7 @@ def _sedimentation_substep_tiers(
     exactly. A tier whose buffer is too small sets overflow region ``tempo.<kind>.<first>``; that
     step's results are not exact and the driver reruns it with a larger buffer.
     """
-    # Plain lookups, not dict.get: compile-reachable code keeps no .get calls (structural ratchet).
+    # Plain lookups, not dict.get: compile-reachable code keeps no .get calls.
     axes = {name: axes[name] if axes is not None and name in axes else 0 for name in columns}
     kind_tiers = SEDIMENTATION_COMPACTION[kind] if kind in SEDIMENTATION_COMPACTION else ()
     tiers = [(first, fraction) for first, fraction in kind_tiers if first < bound]
@@ -1311,7 +1311,7 @@ def run_tempo_native(
     the entry gas mass and temperature with which the phase changes heat (``mp_tempo_run`` forms both).
     ``min_layer_depth`` (m, the host grid's thinnest layer) raises each
     sedimentation loop to ``sedimentation_substep_bound`` when that exceeds
-    the corpus cap, with fall-speed ceiling ``max_sedimentation_fall_speed``
+    the default cap, with fall-speed ceiling ``max_sedimentation_fall_speed``
     for rain and graupel and ``max_snow_sedimentation_fall_speed`` (default:
     the same) for snow. ``diagnostics[SEDIMENTATION_SUBSTEP_OVERFLOW]`` flags any
     column whose Fortran substep count exceeded the loop actually run, and the
@@ -1549,7 +1549,7 @@ def _finish_tempo_native_from_q(
     copy: bool,
     radar_and_effective_radii: bool = True,
 ) -> TorchSegmentSResult:
-    """Finish the single production science path after the graph-stable Q boundary."""
+    """Run segments R1, R2 and S after the Q boundary."""
     r1_result = run_r1(
         q_result,
         dt=dt,
@@ -4041,8 +4041,8 @@ def run_n(
     phase_mass = input_state["terminal_heat_mass_scale"]
     # Physics change: upstream TEMPO heats its phase changes with its own lvap(T) and 1/(cp*(1+qv)) of the current
     # state, which MPAS does not conserve. The coupled model uses MPAS's latent heat and the entry gas mass
-    # (native_vapor_phase_heat_coefficients) for the bulk sums; the phase rates do not change. The Fortran oracle
-    # carries the same change (fortran_patches/tempo_entry_heat_mass_*, tempo_terminal_phase_heat_*).
+    # (native_vapor_phase_heat_coefficients) for the bulk sums; the phase rates do not change. The Fortran
+    # reference used for comparison carries the same change.
     phase_lvap, phase_ocp = native_vapor_phase_heat_coefficients(phase_temperature, phase_mass)
 
     tend, tendencies = limit_and_sum_tendencies_tensor(
@@ -4309,7 +4309,7 @@ def run_o(
     phase_heat_mass = input_state["terminal_heat_mass_scale"]
     # Physics change: cloud condensation and rain evaporation heat with MPAS's latent heat and the entry gas mass,
     # not upstream TEMPO's lvap(T) and 1/(cp*(1+qv)) of the current state, so that MPAS conserves energy across the
-    # phase change; the rates do not change (fortran_patches/tempo_entry_heat_mass_*, tempo_terminal_phase_heat_*).
+    # phase change; the rates do not change.
     phase_lvap, phase_ocp = native_vapor_phase_heat_coefficients(phase_heat_temperature, phase_heat_mass)
     idx_d = _int_scalar(0, temp)
     idx_c = _int_scalar(0, temp)
@@ -6234,7 +6234,7 @@ def run_q(
             rho=o_rho,
             # Physics change: upstream TEMPO uses 1/(cp*(1+qv)) of the current state; the entry gas mass, as in the
             # other phase heat, keeps the terminal freezing and melting heat conserved by MPAS (MPAS applies its own
-            # Cv when it commits the tendency; fortran_patches/tempo_terminal_phase_heat_*).
+            # Cv when it commits the tendency).
             ocp=1.0 / (_scalar(constants.CP, temp) * input_state["terminal_heat_mass_scale"]),
             qi1d=input_state["qi"],
             ni1d=input_state["ni"],
@@ -6337,7 +6337,7 @@ def run_q(
         + diagnostics["snow_liquid_equiv_precip"]
         + diagnostics["graupel_liquid_equiv_precip"]
     )
-    # The cloud water deposited at the ground counts as liquid precipitation (fortran_patches/tempo_cloud_deposition_*).
+    # The cloud water deposited at the ground counts as liquid precipitation.
     frozen_fraction = frozen_numerator / (
         frozen_numerator + diagnostics["rain_precip"] + diagnostics["cloud_precip"] + _scalar(constants.R1, temp)
     )
@@ -6859,7 +6859,7 @@ def sum_tendencies_tensor(
     orho = 1.0 / rho
     # Physics change: upstream TEMPO takes lfus2 = LSUB - lvap and the constant LSUB for vapor/ice. In MPAS moist
     # thermodynamics the liquid/ice heat is LFUS and the vapor/ice heat lvap + LFUS; with the upstream values
-    # deposition heats too much and freezing too little (fortran_patches/tempo_terminal_phase_heat_*).
+    # deposition heats too much and freezing too little.
     lfus2 = _scalar(constants.LFUS, temp)
     lsub = lvap + lfus2
     updated["qvten"] = updated["qvten"] + (
@@ -7800,7 +7800,7 @@ def _snow_fall_speed_values(rhof: torch.Tensor, smob: torch.Tensor, smoc: torch.
     smoc_safe = torch.where(active, smoc, 1.0)
     # Float32 runs evaluate the fall-speed moments in float64 and round vts once (float64 runs: unchanged). With
     # little snow mrat is large: mrat ** MU_S is huge and ils ** cse tiny, and the float32 backward of their product
-    # overflows (NaN in a 24 h float32 window adjoint). This changes float32 vts at round-off level.
+    # overflows to NaN. This changes float32 vts at round-off level.
     work = torch.float64 if smob.dtype == torch.float32 else smob.dtype
     csg_w, cse_w = csg.to(work), cse.to(work)
     mrat = 1.0 / (smoc_safe.to(work) / smob_safe.to(work))
@@ -8223,7 +8223,7 @@ def _ppm_face_values(
     qmi_formula = 2.0 * qa[..., 1:nz] - qpi_formula
     # Upstream TEMPO resets on qpi > 0, which keeps a negative upper face: the remapped cell then goes negative, the
     # limit clips it to zero and water appears. This resets on qpi < 0, as for qmi, so the scheme conserves the
-    # falling mass; the Fortran oracle carries the same change (fortran_patches/tempo_positive_sedimentation_*).
+    # falling mass; the Fortran reference used for comparison carries the same change.
     reset = (dip * dim <= 0.0) | (qpi_formula < 0.0) | (qmi_formula < 0.0)
     return torch.where(reset, qa[..., 1:nz], qpi_formula), torch.where(reset, qa[..., 1:nz], qmi_formula)
 
@@ -8463,8 +8463,8 @@ def freeze_cloud_melt_ice_tensor(
 
     xri = torch.clamp_min(qi1d + qiten_work * dt_value, _scalar(0.0, temp))
     # Physics change: upstream TEMPO melts any ice and freezes any cloud water above zero. This uses the R1 presence
-    # cutoff of the cloud and ice checks, so round-off remnants below R1 do not move number or heat
-    # (fortran_patches/tempo_phase_presence_*). The kernel below makes the same test.
+    # cutoff of the cloud and ice checks, so round-off remnants below R1 do not move number or heat.
+    # The kernel below makes the same test.
     melt = (temp > _scalar(constants.T0, temp)) & (xri > _scalar(constants.R1, temp))
     qcten_work = torch.where(melt, qcten_work + xri * odt_value, qcten_work)
     ncten_work = torch.where(melt, ncten_work + ni1d * odt_value, ncten_work)
@@ -9332,7 +9332,7 @@ def _table_index_0based(index_1based: torch.Tensor | int | np.integer, reference
 
 
 def prepare_torch_tables(tables: Any, reference: torch.Tensor | Mapping[str, torch.Tensor]) -> Any:
-    """Materialize TEMPO lookup tables as torch tensors before compiled/timed runs."""
+    """Materialize TEMPO lookup tables as torch tensors before compiled runs."""
     arrays = getattr(tables, "arrays", None)
     if not isinstance(arrays, Mapping):
         return tables
@@ -9447,8 +9447,7 @@ def _libm_square(values: torch.Tensor) -> torch.Tensor:
     """The correctly rounded FP32 square, the bits of ``_libm_power(values, 2.0)``, with one FP64 multiply in
     place of an FP64 pow. A 24-bit significand squared has at most 48 bits, so the FP64 product is exact and its one
     rounding to FP32 is the correctly rounded square; a correctly rounded FP64 pow returns the same exact value.
-    The equality with the pow form is shown on CPU, eager and compiled (``checks/test_precision.py``). FP64 keeps
-    the libm power: there the product itself is rounded."""
+    FP64 keeps the libm power: there the product itself is rounded."""
     if values.dtype == torch.float32:
         wide = values.to(torch.float64)
         return (wide * wide).to(torch.float32)
@@ -9574,7 +9573,7 @@ def _tiny_value(reference: torch.Tensor) -> float:
     """The divide/log guard: 1e-300 in float64 (unchanged), the smallest normal number otherwise.
 
     1e-300 rounds to 0 in float32, so the guard vanished and masked lanes computed 0/0, whose backward
-    turned every parameter gradient into NaN (modelTuning reverse checks, 2026-10-28).
+    turned every parameter gradient into NaN.
     """
     return 1.0e-300 if reference.dtype == torch.float64 else float(torch.finfo(reference.dtype).tiny)
 
@@ -10432,7 +10431,7 @@ def _driver_diagnostic_copyback_tensor(
     return {
         # Physics change: upstream TEMPO leaves the cloud water that sediments to the ground out of the surface
         # precipitation, so it leaves the water budget. It joins the liquid precipitation here and the frozen-fraction
-        # denominator in ``run_q`` (fortran_patches/tempo_cloud_deposition_*).
+        # denominator in ``run_q``.
         "rain_precip": r1_workspace.rain_precip + r1_workspace.cloud_precip,
         "ice_liquid_equiv_precip": r1_workspace.ice_liquid_equiv_precip,
         "snow_liquid_equiv_precip": r1_workspace.snow_liquid_equiv_precip,

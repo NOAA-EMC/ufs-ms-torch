@@ -59,7 +59,7 @@ class TridiagonalSolve(torch.autograd.Function):
     Notes:
     - Input `rhs` is expected to have shape `(nCells, nVertLevels + 1)`.
     - The extra last level is the boundary value used during back substitution.
-    - Compatible with gradient checkpointing in later phases when
+    - Compatible with gradient checkpointing when
       `torch.utils.checkpoint(..., use_reentrant=False)` is used.
 
     Second-order extensibility (double backward) options:

@@ -29,7 +29,7 @@ def reset_microphysics_scratch(statein, prefix, *, nn):
     for name in ("dtdt", "dudt", "dvdt", "del", "rhc", "save_tcp"):
         work[name] = torch.zeros_like(statein.tgrs)
     # The tracer-wide zero resets are stride-0 zeros (no fills of [ncol, nlev, ntrac]; their readers write new
-    # tensors, round 8). Distinct tensor objects, as before.
+    # tensors). Distinct tensor objects.
     for name in ("dqdt", "save_q"):
         work[name] = _zero_like(statein.qgrs)
     work["del_gz"] = torch.zeros_like(statein.phii)
@@ -136,7 +136,7 @@ def interstitial_3(statein, prefix, *, control, crtrh, rhcmax):
 
 def prepare_microphysics_prefix(native_state, mesh, statein, grid, prefix, *,
     log_pressure, forcing, dtp, control, crtrh, rhcmax, h2o_log_pressure=None, h2o_forcing=None):
-    """Project live dycore output, seed Stateout and execute E6a in cap order.
+    """Project live dycore output, seed Stateout and execute the pre-convection interstitials in cap order.
 
     The caller retains the projection's native surface pressure. Deformation,
     soil state and all unrelated radiation/surface carries remain live. Source

@@ -148,7 +148,7 @@ _DYNAMICS_TENDENCY_REGION_COMPILE_TARGETS = frozenset(
 )
 
 # Evolving fields cross the whole-stage compiled boundary. Dimensions,
-# connectivity, metrics, namelist choices, and orchestration controls are bound
+# connectivity, metrics, namelist choices, and runner controls are bound
 # once by DynamicsTendencyNumericPlan and never appear as runtime compiler inputs.
 _DYNAMICS_TENDENCY_DYNAMIC_ARGUMENT_NAMES = (
     "u",
@@ -196,10 +196,9 @@ _DYNAMICS_TENDENCY_OPTIONAL_DYNAMIC_ARGUMENT_NAMES = frozenset(
     {"visc4_scale", "smagorinsky_scale", "del4u_div_scale", "coef_3rd_scale"}
 )
 
-# Retain these legacy/public arguments at the API boundary, but do not expose
+# Retain these public arguments at the API boundary, but do not expose
 # them as whole-stage compiler inputs.  The canonical numeric body does not read
-# them.  Tests verify this from the AST so a future equation change cannot
-# silently consume the plan-owned ``None`` placeholders.
+# them; the plan passes ``None`` placeholders for them.
 _DYNAMICS_TENDENCY_UNUSED_SOURCE_ARGUMENT_NAMES = (
     "qv_init",
     "exner",
@@ -380,7 +379,7 @@ def resolve_dynamics_tendency_ad_compile_mode(
     device_type = torch.device(device).type
     # Compile changes the ordered adjoint's floating-point accumulation on CPU.
     # Keep the implicit policy exact; compiled modes require an explicit runner
-    # request until their AD drift proof is independently authorized.
+    # request.
     effective = (
         ("whole_region_aot" if whole_region_selected else "eager")
         if requested == "auto"
@@ -1091,7 +1090,7 @@ def _dynamics_tendency_use_ordered_reverse_vjp(
     *tensors: torch.Tensor,
     tangent_tensors: tuple[torch.Tensor, ...] = (),
 ) -> bool:
-    """Use measured output-owned transposes only for ordinary reverse AD.
+    """Use output-owned transposes only for ordinary reverse AD.
 
     A forward tangent on any of ``tensors`` or ``tangent_tensors`` (inputs whose gradient the transpose also
     returns, such as a parameter scale) selects the plain numeric path.
@@ -1702,7 +1701,7 @@ class _NormalVelocityTendencyVerticalTendencyFunction(torch.autograd.Function):
             ctx.n_vert_levels,
             flux_divisor,
         )
-        # Preserve direct callers using the historical eight-argument surface.
+        # Direct callers may omit flux_divisor (eight arguments): one None per remaining input.
         return grad_u, grad_rw, *(None for _ in ctx.needs_input_grad[2:])
 
 
@@ -3512,9 +3511,8 @@ def _edge_advective_cell_tendency_ordered_backward(
         if grad_scale is None:
             grad_scale = adv_coef_3rd_base.new_zeros(())
 
-    # ``sign(ru_edge)`` is locally constant away from its switch at zero.  The
-    # release preflight rejects directions that cross that switch, so the exact
-    # smooth-region contribution through the sign selector is zero.
+    # ``sign(ru_edge)`` is locally constant away from its switch at zero, so
+    # the exact smooth-region contribution through the sign selector is zero.
     grad_ru = grad_ru_direct
     return grad_field, grad_ru, grad_scale
 
@@ -3702,11 +3700,11 @@ def _cell_owned_edge_advective_cell_tendency(
     sign_ru: torch.Tensor,
     coef_3rd_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """A/B-only cell-owned form of the vertical-velocity-horizontal-advection/theta-horizontal-advection advective cell tendency.
+    """Cell-owned form of the vertical-velocity-horizontal-advection/theta-horizontal-advection advective cell tendency.
 
     This deliberately trades redundant per-cell edge-flux work for avoiding the
-    global edge-owned ``edge_flux_sum`` tensor. It is not the default path; it is
-    wired only for controlled CUDA A/B runs.
+    global edge-owned ``edge_flux_sum`` tensor. It is not the default path; it
+    serves only CUDA comparison runs.
     """
     safe_adv_cells = _dynamics_tendency_slot_field(edge_adv_cell_relation, 0, "indices")
     adv_coef = _dynamics_tendency_slot_field(edge_adv_cell_relation, 4, "coefficients")
@@ -5364,7 +5362,7 @@ def _subtract_weighted_pair_delta_slots_fortran_order(
     The upstream MPAS loop starts with the accumulated del2 tendency and
     subtracts each edge contribution immediately.  Summing the edge terms first
     and subtracting the total changes the binary64 association and is therefore
-    not numerically equivalent under the release contract.
+    not bitwise equivalent.
     """
     cell1 = _dynamics_tendency_pair_field(cell_pair_relation, 0, "first")
     flux_valid = _dynamics_tendency_pair_field(cell_pair_relation, 2, "valid")
@@ -6665,8 +6663,7 @@ def _theta_horizontal_advection_theta_finalization_theta_tendency_padded_region(
 
 
 # Section field -> (padded region, its internal compile name). Each compiles
-# when its section is compiled (precedent: the monotonic streaming-tile
-# internal regions).
+# when its section is compiled.
 _DYNAMICS_TENDENCY_PADDED_SECTIONS = MappingProxyType(
     {
         "mixing_initialization_mixing_initialization": (
@@ -7305,8 +7302,8 @@ def _dynamics_tendency_canonical_composition(
     rt_diabatic_tend: torch.Tensor,  # (nCells+1, nVertLevels)
     scalars: torch.Tensor,  # (nCells+1, nVertLevels, num_scalars)
     t_init: torch.Tensor,  # (nCells+1, nVertLevels)
-    tend_w_pgf: torch.Tensor | None,  # legacy, currently unused
-    tend_w_buoy: torch.Tensor | None,  # legacy, currently unused
+    tend_w_pgf: torch.Tensor | None,  # unused
+    tend_w_buoy: torch.Tensor | None,  # unused
     ur_cell: torch.Tensor,  # (nCells+1, nVertLevels)
     vr_cell: torch.Tensor,  # (nCells+1, nVertLevels)
     qtot: torch.Tensor,  # (nCells+1, nVertLevels) Pre-computed by the caller
@@ -8212,7 +8209,7 @@ def _dynamics_tendency_canonical_composition(
 
     # =========================================================================
 
-    # Add Euler tendency to tend_u (no physics tendency in checkpoint)
+    # Add Euler tendency to tend_u
 
     if not normal_velocity_mixing_normal_velocity_finalization_completed:
         if tend_u_solve_patch is None:
@@ -8773,7 +8770,7 @@ def _dynamics_tendency_canonical_composition(
         else:
             theta_work_solve = theta_m[cell_slice, :] - t_init[cell_slice, :]
 
-    # Add Euler tendency to tend_theta (no physics tendency in checkpoint)
+    # Add Euler tendency to tend_theta
 
     if tend_theta_solve_patch is None:
         tend_theta_solve_patch = tend_theta[cell_solve_start:cell_solve_end, :]
@@ -8882,7 +8879,7 @@ _DYNAMICS_TENDENCY_WORK_ARGUMENT_NAMES = tuple(
 def _validate_dynamics_tendency_numeric_plan_inputs(
     call_arguments: Mapping[str, Any],
 ) -> None:
-    """Validate orchestration contracts once, before entering compiled math."""
+    """Validate runner contracts once, before entering compiled math."""
     tensor_names = (
         "u",
         "v",

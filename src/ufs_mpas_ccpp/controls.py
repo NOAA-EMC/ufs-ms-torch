@@ -18,7 +18,7 @@ replacement may be a new tensor, a leaf that requires grad, a dual tensor or a p
   ``d = d0 - (f(x0) - f(x))``: unchanged controls give the carried bytes exactly (the carried value
   comes from the commit's own operation order, not from ``f``), and derivatives are those of ``f``.
 - ``rw`` is a control of its own: the split-explicit solver carries it beside ``w``, and at a cycle
-  boundary it departs from the coupled-diagnostic relation (relative 1.5e-3 at x1.10242, cycle 3),
+  boundary it departs from the coupled-diagnostic relation (relative differences of order 1e-3),
   while every anchored diagnostic agrees with its relation to rounding.
 - On a partition (``config["_halo_exchanger"]``) the owned rows are the controls: the halo rows of the
   native controls are taken from their owners (the dycore's ``ufs_controls`` halo group), with their

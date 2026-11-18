@@ -1,7 +1,7 @@
 # Copyright (c) 2026 IC Weather LLC. Licensed under LICENSE and PERMISSIONS.md.
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""Integrated SA-SAS shallow-convection PyTorch driver for cumulative port gates."""
+"""SA-SAS shallow-convection PyTorch driver: the segments of ``samfshalcnv_run`` in order."""
 
 from __future__ import annotations
 
@@ -291,7 +291,7 @@ def _recurrence_chunk(name, fn, *args, **kwargs):
 
 def _pair_rows(mask, first_terms, second_terms):
     """The level-major mask rows and term pairs of ``_ordered_pair_sums``: one compiled region (a tiled transpose)
-    instead of two eager strided copies in the scheme's orchestration (round 8 wave 4). Values are copies."""
+    instead of two eager strided copies in the scheme's orchestration. Values are copies."""
     return mask.t().contiguous(), torch.stack((first_terms.t(), second_terms.t()), dim=1)
 
 
@@ -313,8 +313,7 @@ def _place(base, value, start, *, dim=1):
     """``base`` with ``value`` in place of its indices ``start:start + value.shape[dim]`` along ``dim``.
 
     Joining per-level cells (``unbind`` then one ``torch.stack``) made Inductor emit one copy kernel
-    per level and field (1,837 kernels in the compiled shallow variant at x1.10242); a
-    chunk result enters as one slice. Values are unchanged.
+    per level and field; a chunk result enters as one slice. Values are unchanged.
     """
     return torch.slice_scatter(base, value, dim=dim, start=start, end=start + value.shape[dim])
 
@@ -1003,7 +1002,7 @@ def _run_scheme_through_e(state: SaSasShallowConvectionState, through: str) -> d
     NN = qtr_shape[2]
     NTC = fields["fscav"].numel()
     layout = tracer_layout(state)
-    # Legacy harness table: ntr = ntrac = nn - 2. A declared layout (G3.2 oracle MPAS
+    # Legacy table: ntr = ntrac = nn - 2. A declared layout (e.g. the MPAS TEMPO
     # table) gives ntr = nsamftrac independent of nn and of the host tracer count.
     NTR = layout.ntr
     NTRAC = layout.ntrac
@@ -1028,8 +1027,8 @@ def _run_scheme_through_e(state: SaSasShallowConvectionState, through: str) -> d
     if (layout.name == "legacy" and NTR < 8) or (_runs_through(through, "Q") and fields["dtend"].shape[2] < NTRAC + 4):
         raise ValueError("the declared generic-post diagnostic contract needs eight tracers and ntr+4 dtend slots")
     dtype = q1.dtype
-    # The source cap owns these scalars. Profile fixtures happen to match the
-    # module defaults, but evolved coupled calls use a different dt and clam.
+    # The source cap owns these scalars: coupled calls can use a dt and clam other
+    # than the module defaults.
     C1, CAT_ADJ_SHAL, CLAM = (fields[n] for n in ("c1", "cat_adj_shal", "clam"))
     CP, CSCALE, DELT = (fields[n] for n in ("cp", "cscale", "delt"))
     EPS, EPSM1, EVEF = (fields[n] for n in ("eps", "epsm1", "evef"))
@@ -2012,7 +2011,7 @@ def _run_scheme(state: SaSasShallowConvectionState, through: str,
 
 # GFS_SCNV_generic_post: tracers left out of the tracer dtend under cscnv/satmedmf/trans_trac/ras.
 DTEND_EXCLUDED = ("ntcw", "ntiw", "ntclamt", "ntrw", "ntsw", "ntrnc", "ntsnc", "ntgl", "ntgnc", "ntsigma")
-# Legacy harness table of the frozen shallow corpus (TKE last, ntclamt=4, ntsigma=7).
+# Legacy tracer table (TKE last, ntclamt=4, ntsigma=7).
 LEGACY_INDICES = {"ntqv": 1, "ntcw": 2, "ntiw": 3, "ntclamt": 4, "ntrw": 5, "ntsw": 6, "ntsigma": 7}
 
 
@@ -2034,15 +2033,15 @@ def tracer_layout_from(fields: dict[str, torch.Tensor], config: dict[str, Any]) 
 
 
 def tracer_layout(state: SaSasShallowConvectionState) -> ConvectionTracerLayout:
-    """The resolved convective tracer layout (legacy harness table when undeclared)."""
+    """The resolved convective tracer layout (legacy table when undeclared)."""
 
     return tracer_layout_from(state.fields, state.config)
 
 
 def _run_post(fields: dict[str, torch.Tensor], config: dict[str, Any]) -> None:
-    """GFS_SCNV_generic_post (oracle source): layout-driven slots, CCPP cloud rule.
+    """GFS_SCNV_generic_post of the MPAS-coupled CCPP: layout-driven slots, CCPP cloud rule.
 
-    With ``config['samf_water_reconciliation']`` (oracle runtime
+    With ``config['samf_water_reconciliation']`` (Fortran
     ``MPAS_UFS_SAMF_WATER_RECONCILIATION=1``) the MPAS water reconciliation runs after
     the tendency application. The commit-residual validation and the ledgers write no
     state and are not ported.
@@ -2104,7 +2103,7 @@ def _run_post(fields: dict[str, torch.Tensor], config: dict[str, Any]) -> None:
         fields["gt0"] = gt0
         fields["errflg"] = torch.maximum(fields["errflg"], reconcile_errflg)
 
-    # imfshalcnv is SAMF in every sealed configuration.
+    # imfshalcnv is SAMF in every supported configuration.
     fields["rainc"] = fields["rainc"] + frain * fields["rn"]
     npdf3d = int(config.get("npdf3d", 3))
     num_p3d = int(config.get("num_p3d", 4))
@@ -2120,7 +2119,7 @@ def _run_post(fields: dict[str, torch.Tensor], config: dict[str, Any]) -> None:
         fields["cnvc_phy_f3d"] = fields["cnvc_phy_f3d"].clone()
     dtend = fields["dtend"].clone()
     if bool(config.get("lssav", True)) and bool(config.get("flag_for_scnv_generic_tend", True)) and bool(config.get("ldiag3d", True)):
-        # dtidx (harness rule): T, u, v -> slots 1-3, qv -> 4, tracer n >= 2 -> slot 4+n.
+        # dtidx: T, u, v -> slots 1-3, qv -> 4, tracer n >= 2 -> slot 4+n.
         dtend[:, :, 0] = dtend[:, :, 0] + (fields["ten_t"] * delt) * frain
         dtend[:, :, 1] = dtend[:, :, 1] + (fields["ten_u"] * delt) * frain
         dtend[:, :, 2] = dtend[:, :, 2] + (fields["ten_v"] * delt) * frain

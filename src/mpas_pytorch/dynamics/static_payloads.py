@@ -725,7 +725,7 @@ class StaticSlotRelation:
     def gather(
         self, field: torch.Tensor, *, fill_value: float | torch.Tensor = 0.0
     ) -> torch.Tensor:
-        """Gather row-slot values with GraphCast-style fill semantics."""
+        """Gather row-slot values; invalid slots take ``fill_value``."""
         if not isinstance(fill_value, torch.Tensor) and _uses_static_autograd(
             field, self.indices, self.valid
         ):

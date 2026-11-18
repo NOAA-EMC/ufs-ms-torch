@@ -152,10 +152,10 @@ _COMPILED_FORWARD_AD_EXPERIMENT_TARGETS = frozenset(
 )
 # Inductor options of differentiable compiles, per region. WORKAROUND, torch 2.8.0 CPU codegen:
 # with pointwise expressions inlined into later kernels, Inductor drops
-# whole gradient terms of these regions (zero VJP for ru in theta-tendency; 7e-3 on w), bisected to
-# the lowering of a sum of index_put scatter-add results. Realizing pointwise nodes avoids it here but
-# miscompiles other regions (monotonic streaming transport), so it is scoped to the regions it fixes.
-# The section-3 derivative checks of each compiled region guard it.
+# whole gradient terms of these regions (zero VJP for ru in theta-tendency), in the lowering of a
+# sum of index_put scatter-add results. Realizing pointwise nodes avoids it here but miscompiles
+# other regions (monotonic streaming transport), so it is scoped to the regions it fixes.
+# The derivative checks of each compiled region guard it.
 _DIFFERENTIABLE_INDUCTOR_OPTIONS: dict[str, dict[str, object]] = {
     name: {"realize_opcount_threshold": 0}
     for name in (
@@ -163,7 +163,7 @@ _DIFFERENTIABLE_INDUCTOR_OPTIONS: dict[str, dict[str, object]] = {
         "dynamics_tendency_theta_horizontal_advection_theta_hadv_section",
         "dynamics_tendency_vertical_velocity_horizontal_mixing_vertical_velocity_vertical_transport_w_tendency_region",
         "dynamics_tendency_dyn_tend_whole_stage",
-        # vorticity's gradient (rel 0.85 wrong) with inputs captured under AD
+        # vorticity's gradient is wrong with inputs captured under AD
         "dynamics_tendency_normal_velocity_mixing_normal_velocity_finalization_u_tendency_region",
     )
 }
@@ -176,7 +176,7 @@ _COMPILED_AD_EVIDENCE_DTYPES = ("float64", "float32")
 # Inductor options of compiles for MPS: Metal kernels take at most 31 buffer arguments, and the
 # default fusion builds kernels with more (the shader then fails to compile).
 _MPS_INDUCTOR_OPTIONS: dict[str, object] = {"max_fusion_size": 4}
-# The ordered 55-level column solves read more buffers per kernel: smaller fused groups.
+# The ordered column solves read more buffers per kernel: smaller fused groups.
 _MPS_REGION_INDUCTOR_OPTIONS: dict[str, dict[str, object]] = {
     name: {"max_fusion_size": 2}
     for name in ("acoustic_step_acoustic_flux_solve_region", "acoustic_step_acoustic_flux_solve_pack_region")
@@ -1209,8 +1209,8 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         stage="monotonic_scalar_transport",
         cpu_evidence=(),
         gpu_evidence=(),
-        # Compiled VJP bitwise with eager VJP on CPU (x1.10242 5-step state VJP);
-        # experiment lane only.
+        # Compiled VJP bitwise with eager VJP on CPU (5-step state VJP);
+        # cpu_experiment policy only.
         compiled_reverse_ad_policy="cpu_experiment",
     ),
     _candidate_helper_spec(
@@ -1364,9 +1364,8 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         stage="acoustic_step",
         cpu_evidence=(),
         gpu_evidence=(),
-        # CPU qualification covers four cases, five outputs, seeds19/73 and
-        # all checkpoint policies. Execution still needs both experiment flags;
-        # CUDA production admission remains closed.
+        # Compiled reverse AD on CPU needs both experiment flags; CUDA
+        # admission stays closed.
         compiled_reverse_ad_policy="cpu_experiment",
     ),
     _candidate_helper_spec(
@@ -1429,8 +1428,8 @@ _COMPILE_KERNEL_SPECS: tuple[CompileKernelSpec, ...] = (
         cpu_evidence=(),
         gpu_evidence=(),
         allow_hot=False,
-        # Compiled VJP bitwise with eager VJP on CPU (x1.10242 5-step state VJP);
-        # experiment lane only.
+        # Compiled VJP bitwise with eager VJP on CPU (5-step state VJP);
+        # cpu_experiment policy only.
         compiled_reverse_ad_policy="cpu_experiment",
     ),
     _candidate_helper_spec(
@@ -2640,7 +2639,7 @@ _INSTALLED_AD_EVIDENCE_FILES: dict[str, tuple[int, int]] = {}
 def _install_config_ad_evidence(config: Mapping[str, Any] | None) -> None:
     """Install the evidence files ``config_torch_compile_ad_evidence`` names, once per file version.
 
-    An execution-only key, so a host (I-JEDI) admits compiled AD through the configuration it
+    An execution-only key, so a host application admits compiled AD through the configuration it
     already passes. A named file that does not validate raises: compiled AD was asked for.
     """
     paths = (config or {}).get("config_torch_compile_ad_evidence")
@@ -3080,7 +3079,7 @@ def compile_enabled(config: dict) -> bool:
     """Return whether compile wrapping is enabled for this run."""
     # A caller's per-call execution choice (private, so not part of the continuation
     # identity): run this call's regions eagerly, e.g. a derivative request that the
-    # compiled regions are not qualified for.
+    # compiled regions are not validated for.
     if config.get("_torch_compile_suspended") is True:
         return False
     value = _resolve_config_scalar(config, "config_use_torch_compile", False)
@@ -3343,7 +3342,7 @@ def kernel_compiled_reverse_ad_enabled_for_device(
         )
     )
     # An experiment declaration grants execution, never validation authority.
-    # New targets without AD receipts need BOTH explicit experiment switches.
+    # New targets without AD evidence need BOTH explicit experiment switches.
     if not spec.ad_evidence and not (requested == "experiment" and evidence_generation):
         return False
     if requested == "experiment" and evidence_generation:
@@ -3881,14 +3880,13 @@ def maybe_compile_kernel(
                     "acoustic_step_acoustic_flux_solve_pack_region",
                     "vertical_implicit_coefficients_vert_imp_coefs",
                 ):
-                    # Ordered 55-level sweeps exceed Inductor's default fusion
+                    # Ordered column sweeps exceed Inductor's default fusion
                     # size. Keep final packing in the region, allowing stores
                     # into output views instead of escaping per-level
                     # temporaries. Scoped to the column-recurrence regions.
                     cuda_options["max_fusion_size"] = 2048
                     # One recurrence per column: the default 1D block of 1024
-                    # columns leaves too few threads in flight (60 km A100:
-                    # 20,608 threads for 163,842 columns). Coordinate-descent
+                    # columns leaves too few threads in flight. Coordinate-descent
                     # tuning searches block/warp launch shapes; it changes how
                     # columns map to threads, never the per-column arithmetic.
                     cuda_options["coordinate_descent_tuning"] = True
@@ -4072,7 +4070,7 @@ def maybe_compile_kernel(
         elif carries_autodiff and not allow_reverse_autodiff:
             reason = "reverse_ad_not_enabled"
         elif carries_autodiff:
-            # Evidence judged these calls only: another signature is a graph nobody checked.
+            # Evidence judged these calls only: another signature is a graph the evidence does not cover.
             judged = _judged_call_signatures(
                 fn_name,
                 _call_device_type(args, kwargs),

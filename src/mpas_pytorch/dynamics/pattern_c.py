@@ -207,7 +207,7 @@ def _build_pattern_c_connectivity_payload(
 
 
 class _PatternCOrderedViewReduce(torch.autograd.Function):
-    """Batched Pattern-C forward with the legacy ordered gather adjoint."""
+    """Batched Pattern-C forward with the adjoint of the per-slot ordered gather graph."""
 
     @staticmethod
     def forward(
@@ -299,8 +299,8 @@ class _PatternCOrderedViewReduce(torch.autograd.Function):
         )
         apply_masks = ctx.apply_valid_masks and ctx.slot_valid_matrix_all is not True
 
-        # Separate gather nodes in the legacy ordered graph accumulate their
-        # shared-index adjoints in reverse graph order. Preserve that contract.
+        # Separate gather nodes in the per-slot ordered graph accumulate their
+        # shared-index adjoints in reverse graph order. Preserve that order.
         for slot in range(slot_cells_matrix.shape[1] - 1, -1, -1):
             indices = slot_cells_matrix[:, slot]
             scalar_values = gather_rows(scalar_field, indices)

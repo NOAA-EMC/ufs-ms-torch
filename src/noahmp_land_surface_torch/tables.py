@@ -1,7 +1,7 @@
 # Copyright (c) 2026 IC Weather LLC. Licensed under LICENSE and PERMISSIONS.md.
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""Frozen Noah-MP table helpers for the Torch target."""
+"""Frozen Noah-MP table helpers."""
 
 from __future__ import annotations
 
@@ -168,8 +168,8 @@ def noahmp_table_bundle(
 ) -> NoahMpTableBundle:
     """Return frozen Noah-MP driver tables cached per device and working dtype.
 
-    The tables are read-only in the target path.  Caching avoids rebuilding and
-    re-copying many tiny constants around each CUDA forward/profile iteration.
+    The tables are read-only at run time.  Caching avoids rebuilding and
+    re-copying many tiny constants on each CUDA forward call.
     """
 
     return _cached_noahmp_table_bundle(*_canonical_device(device), table_variant, dtype)

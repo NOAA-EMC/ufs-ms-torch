@@ -973,8 +973,8 @@ def _large_step_recovery_prognostic_numeric(
         )
     )
     # Compiled, ru_patch is stored once: the w recovery gathers it from every edge slot of each
-    # cell, and inlined each slot's gather of ru_save + ru_p was stored as its own [cells, levels]
-    # buffer (six at 60 km) and read back by the surface and interior sums.
+    # cell, and inlined each slot's gather of ru_save + ru_p would be stored as its own
+    # [cells, levels] buffer and read back by the surface and interior sums.
     ru_patch = _stored_when_compiled(ru_patch)
 
     if nVertLevels > 1:

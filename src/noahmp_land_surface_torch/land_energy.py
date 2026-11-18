@@ -1,10 +1,10 @@
 # Copyright (c) 2026 IC Weather LLC. Licensed under LICENSE and PERMISSIONS.md.
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""Torch-native Noah-MP land energy helpers for the sealed land corridor.
+"""Torch-native Noah-MP land energy helpers.
 
-This module ports the radiation/albedo and bare-ground flux pieces used by
-``module_sf_noahmplsm.F90`` for the current sealed Noah-MP corpus:
+This module ports the radiation/albedo and bare-ground flux pieces of
+``module_sf_noahmplsm.F90`` for these Noah-MP options:
 
 * ``idveg=4``
 * ``opt_rad=3``
@@ -13,8 +13,7 @@ This module ports the radiation/albedo and bare-ground flux pieces used by
 * ``opt_trs=2``
 * ``opt_stc=3``
 
-It deliberately does not read checkpoint or NetCDF oracle files.  It reads only
-the frozen Noah-MP table file and accepts tensor state prepared by the caller.
+It reads only the frozen Noah-MP table file and accepts tensor state prepared by the caller.
 """
 
 from __future__ import annotations
@@ -163,7 +162,7 @@ class LandEnergyTables:
 
 @dataclass(frozen=True)
 class SoilWaterOptRun1Result:
-    """Outputs from the fixed ``opt_run=1``/``opt_inf=1`` water corridor."""
+    """Outputs from the ``opt_run=1``/``opt_inf=1`` soil-water solve."""
 
     sh2o: torch.Tensor
     smc: torch.Tensor
@@ -253,7 +252,7 @@ class BareFluxResult:
 
 @dataclass(frozen=True)
 class BtranResult:
-    """Soil water stress factors for the fixed ``opt_btr=1`` corridor."""
+    """Soil water stress factors for ``opt_btr=1``."""
 
     btran: torch.Tensor
     btrani: torch.Tensor
@@ -298,7 +297,7 @@ class VegFluxResult:
 
 @dataclass(frozen=True)
 class ThermopropResult:
-    """Outputs from the fixed-corpus ``thermoprop`` source corridor."""
+    """Outputs from ``thermoprop``."""
 
     df: torch.Tensor
     hcpct: torch.Tensor
@@ -915,7 +914,7 @@ def ground_albedo(
     albsnd: torch.Tensor,
     albsni: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fortran ``groundalb`` for the sealed soil-surface corridor."""
+    """Fortran ``groundalb`` for the soil surface."""
 
     inc = torch.clamp(0.11 - 0.40 * smc[:, 0], min=0.0)
     albsod = torch.minimum(albsat + inc[:, None], albdry)
@@ -1505,7 +1504,7 @@ def tsnosoi_source_corridor(
     ssoil: torch.Tensor,
     dt: torch.Tensor | float,
 ) -> torch.Tensor:
-    """Port ``tsnosoi``/``hrt``/``hstep``/``rosr12`` for sealed opt_stc=3 cases."""
+    """Port ``tsnosoi``/``hrt``/``hstep``/``rosr12`` for opt_stc=3."""
 
     return _tsnosoi_source_corridor_flat_impl(
         temperature_snow_soil=state.temperature_snow_soil,
@@ -1536,7 +1535,7 @@ def _tsnosoi_source_corridor_flat_impl(
     ssoil: torch.Tensor,
     dt: torch.Tensor | float,
 ) -> torch.Tensor:
-    """Flat tensor/literal ``tsnosoi`` kernel used by the scoped compile path."""
+    """Flat tensor/literal ``tsnosoi`` kernel used by the compiled path."""
 
     stc = temperature_snow_soil
     zsnso = interface_depth
@@ -1705,7 +1704,7 @@ def _soilwater_srt_opt_run1_inf1(
     qseva: torch.Tensor,
     etrani: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Vectorized ``srt`` corridor for ``opt_run=1`` and ``opt_inf=1``."""
+    """Vectorized ``srt`` for ``opt_run=1`` and ``opt_inf=1``."""
 
     factr = torch.clamp(smc / smcmax, min=0.01)
     wdf = dwsat * working_power(factr, bexp + 2.0) * (1.0 - fcr)
@@ -1796,7 +1795,7 @@ def _soilwater_sstep_opt_run1(
     rhstt: torch.Tensor,
     dtfine: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Vectorized ``sstep`` corridor for four-layer ``opt_run=1`` soil water."""
+    """Vectorized ``sstep`` for four-layer ``opt_run=1`` soil water."""
 
     rhstt_scaled = rhstt * dtfine[:, None]
     ai_scaled = ai * dtfine[:, None]
@@ -1877,7 +1876,7 @@ def _groundwater_opt_run1_source_corridor(
     wa_initial: torch.Tensor,
     wt_initial: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Vectorized ``groundwater`` source corridor used by the default Noah-MP run."""
+    """Vectorized ``groundwater`` used by the default Noah-MP run."""
 
     device = sh2o.device
     dtype = sh2o.dtype
@@ -1991,12 +1990,10 @@ def _soilwater_opt_run1_inf1_source_corridor_flat_impl(
     iteration_count: int = 6,
     sice_initial: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Port ``soilwater`` + ``groundwater`` for sealed ``opt_run=1`` cases.
+    """Port ``soilwater`` + ``groundwater`` for ``opt_run=1``.
 
-    This is intentionally narrow: it covers the fixed four-soil-layer,
-    ``opt_inf=1``/``opt_run=1`` source-smoke corridor used by the bare/no-canopy
-    checkpoint cases.  It does not implement alternate runoff, infiltration, lake,
-    crop, or dynamic water-table options.
+    It covers four soil layers with ``opt_inf=1``/``opt_run=1`` only.  It does not
+    implement alternate runoff, infiltration, lake, crop, or dynamic water-table options.
     """
 
     dt_tensor = dt
@@ -2113,7 +2110,7 @@ def soilwater_opt_run1_inf1_source_corridor(
     iteration_count: int = 6,
     sice_initial: torch.Tensor | None = None,
 ) -> SoilWaterOptRun1Result:
-    """Port ``soilwater`` + ``groundwater`` for sealed ``opt_run=1`` cases."""
+    """Port ``soilwater`` + ``groundwater`` for ``opt_run=1``."""
 
     dt_tensor = _as_vector(dt, state.temperature_forcing)
     zwt = _as_vector(zwt_initial, state.temperature_forcing)
@@ -2824,7 +2821,7 @@ def _vege_flux_setup(
     friction_velocity: torch.Tensor | None = None,
     czil_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """``vege_flux`` up to its canopy iteration loop (``opt_sfc=3,opt_crs=2`` land corridor): the loop
+    """``vege_flux`` up to its canopy iteration loop (``opt_sfc=3,opt_crs=2`` land columns): the loop
     state. ``_vege_flux_iteration`` runs one pass and ``_vege_flux_finish`` the rest."""
 
     sfctmp = temperature_forcing
@@ -3371,7 +3368,7 @@ def _vege_flux_iterations(env: dict[str, Any], step: Any = None) -> dict[str, An
 
 
 def _vege_flux_opt_sfc3_flat_impl(**kwargs: Any) -> tuple[torch.Tensor, ...]:
-    """Port ``vege_flux`` for the sealed ``opt_sfc=3,opt_crs=2`` land corridor (``_vege_flux_setup`` arguments)."""
+    """Port ``vege_flux`` for ``opt_sfc=3,opt_crs=2`` land columns (``_vege_flux_setup`` arguments)."""
     return _vege_flux_finish(_vege_flux_iterations(_vege_flux_setup(**kwargs)))
 
 
@@ -3634,7 +3631,7 @@ def _mynn_psi_lookup(
     if tables_initialized:
         interpolated = full(base_zolf) + fraction * (full(next_zolf) - full(base_zolf))
     else:
-        # In the selected GFS-v17 profile lifecycle ``psi_init`` is guarded by
+        # In GFS v17 ``psi_init`` is guarded by
         # do_mynnsfclay=.false.; the static lookup arrays therefore retain their
         # Fortran zero initialization even when iopt_sfc=4 is selected.
         interpolated = torch.zeros_like(zolf)

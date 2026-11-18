@@ -17,7 +17,7 @@ from sa_sas_deep_convection_torch.thermo import _fpvs_table_for_device
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
-    """Run lines 3373-3500 of ``samfdeepcnv_run`` for the approved active case."""
+    """Run lines 3373-3500 of ``samfdeepcnv_run``."""
     _, KM, NN, NTR, NTC = runtime_dimensions(state)
 
     cnvflg = state.require("cnvflg")
@@ -33,7 +33,7 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
     edto = state.require("edto")
     xmb = state.require("xmb")
     # The islands below write no input (they copy before any indexed store), so the state's tensors enter them as
-    # they are: copies here cost one full pass each on the compacted buffer (round 8 wave 4).
+    # they are: copies here cost one full pass each on the compacted buffer.
     qeso = state.require("qeso")
     new_t1 = state.require("new_t1")
     new_q1 = state.require("new_q1")

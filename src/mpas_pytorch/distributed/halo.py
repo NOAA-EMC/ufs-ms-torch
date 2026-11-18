@@ -5,8 +5,8 @@
 
 Communication is a policy around the same tensor arithmetic. It does not
 average gradients, replicate the global state, or implement numerical kernels.
-The initial policy completes each phase before returning; overlap comes after
-complete distributed timestep correctness.
+Each phase completes before it returns; communication does not overlap
+computation.
 """
 
 from __future__ import annotations

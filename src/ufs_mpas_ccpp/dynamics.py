@@ -32,8 +32,8 @@ class PhysicsDynamicsResult:
 
 def dycore_experimental(config: dict, device: torch.device, dtype: torch.dtype | None = None) -> bool:
     """Whether the coupled step requests the dycore's experimental capabilities: a partitioned run (the
-    distributed dycore, ``mpas_pytorch.distributed``), a non-CPU device or a float32 state (the release
-    preview admits CPU float64 only)."""
+    distributed dycore, ``mpas_pytorch.distributed``), a non-CPU device or a float32 state (CPU float64
+    is the reference configuration)."""
     return (config.get("_halo_exchanger") is not None or torch.device(device).type != "cpu"
             or (dtype is not None and dtype != torch.float64))
 
@@ -130,9 +130,9 @@ def advance_physics_dynamics(
 
 
 # Dycore work buffers and time levels that each step creates again and no later step, physics or commit
-# reads (traced over a radiation and an ordinary cycle, ). The
-# dycore drops them from its result (private key ``_step_local_fields``), so the step boundary does not
-# carry them; a step that needed one would fail on the missing key.
+# reads (found by tracing a radiation and an ordinary cycle). The dycore drops them from its result (private
+# key ``_step_local_fields``), so the step boundary does not carry them; a step that needed one would fail on
+# the missing key.
 STEP_LOCAL_NATIVE_FIELDS = (
     "scalars_init", "scalars_old", "scalar_old", "scalars_new", "scalar_new",
     "theta_m_init", "theta_m_save", "rho_zz_init", "rho_zz_old", "rho_zz_int", "rho_zz_old_split",
@@ -142,7 +142,7 @@ STEP_LOCAL_NATIVE_FIELDS = (
     "h_edge", "rho_edge", "ke", "pv_edge", "divergence", "vorticity", "v", "h_divergence",
     "rt", "rthdynten", "p", "pp", "relhum", "precipw", "refl10cm", "rh2", "u10", "v10", "qtot",
     # The dycore's work buffers and per-step fields that a step creates (zeros or recomputed) when absent; carried,
-    # they stayed live through physics (41.7 KiB/col, 6.5 GiB at x1.163842).
+    # they would stay live through physics.
     "a_tri", "alpha_tri", "gamma_tri", "flux_arr", "flux_tmp", "flux_upwind_tmp", "horiz_flux_arr", "h", "kdiff",
     "pb", "pressure_b", "rb", "rtb", "rho_pp", "rho_zz_new", "rr", "rtheta_pp", "ruAvg", "ru_p", "rw_p", "s_max",
     "s_min", "scalar_tend", "scalar_tend_save", "scale_arr", "t", "tend_rho", "tend_rho_zz", "tend_theta_euler",
@@ -157,10 +157,10 @@ def dycore_step_config(config: dict[str, Any], mesh: dict, *, differentiable: bo
     Private keys stay out of the continuation identity, so one run config serves every kind of
     step. One static payload store per mesh serves every step. Differentiable steps checkpoint the
     dycore's RK stages (``runtime_policy.dycore_checkpoint_enabled``). Compiled dycore regions run under
-    derivatives only where qualified: reverse mode with ``with_dycore_compile(reverse=True)``
-    (M9.3). Forward-mode steps, and reverse-mode steps of a forward-only compiled config, run the
-    regions eagerly: the eager differentiable step, which is the reference. Persist the
-    cold-step eager override in this config so later checkpoint recomputation keeps it.
+    derivatives only in reverse mode with ``with_dycore_compile(reverse=True)``. Forward-mode steps,
+    and reverse-mode steps of a forward-only compiled config, run the regions eagerly: the eager
+    differentiable step, which is the reference. Persist the cold-step eager override in this config so
+    later checkpoint recomputation keeps it.
     """
     # The UFS host builds the MPAS core without DO_PHYSICS: no end-of-step zeroing of negative scalars.
     step_config = {**config, "_dycore_static_payloads": _static_payloads(mesh),

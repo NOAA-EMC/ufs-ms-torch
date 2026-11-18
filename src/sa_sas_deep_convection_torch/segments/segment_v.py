@@ -44,7 +44,7 @@ def cloud_copy_rule(config: dict) -> str:
     """CCPP npdf3d/num_p3d/ncnvcld3d rule of GFS_DCNV_generic_post (cnvw/cnvc copy).
 
     The rule is host configuration and never inferred from ``imp_physics``. Missing
-    fields take the legacy harness values (npdf3d=3, num_p3d=4, ncnvcld3d=1).
+    fields take the legacy defaults (npdf3d=3, num_p3d=4, ncnvcld3d=1).
     """
 
     npdf3d = int(config.get("npdf3d", 3))
@@ -58,11 +58,11 @@ def cloud_copy_rule(config: dict) -> str:
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
-    """GFS_DCNV_generic_post (oracle source): layout-driven tracer slots, CCPP cloud rule.
+    """GFS_DCNV_generic_post of the MPAS-coupled CCPP: layout-driven tracer slots, CCPP cloud rule.
 
-    With ``config['samf_water_reconciliation']`` (the oracle runtime's
+    With ``config['samf_water_reconciliation']`` (the Fortran's
     ``MPAS_UFS_SAMF_WATER_RECONCILIATION=1``) the MPAS water reconciliation runs after
-    the tendency application, as in the oracle. The oracle's commit-residual check is a
+    the tendency application, as in the Fortran. The Fortran's commit-residual check is a
     validation of the application just performed with the same expressions and is not
     ported; its ledgers write no state.
     """
@@ -384,7 +384,7 @@ def _generic_post_block(
     rainc = frain * rn
     cldwrk_out = cldwrk + cldwrk * delt
     if ldiag3d and flag_for_dcnv_generic_tend:
-        # dtidx (harness rule): T, u, v -> slots 1-3, tracer n -> slot 3+n.
+        # dtidx: T, u, v -> slots 1-3, tracer n -> slot 3+n.
         dtend = dtend.clone()
         dtend[:, :, 0] = dtend[:, :, 0] + (ten_t * delt) * frain
         dtend[:, :, 1] = dtend[:, :, 1] + (ten_u * delt) * frain

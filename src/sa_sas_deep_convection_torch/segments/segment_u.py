@@ -14,7 +14,7 @@ from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConv
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
-    """Run lines 3503-3711 of ``samfdeepcnv_run`` for the approved active case."""
+    """Run lines 3503-3711 of ``samfdeepcnv_run``."""
     _, KM, NN, NTR, NTC = runtime_dimensions(state)
 
     cnvflg = state.require("cnvflg")
@@ -37,7 +37,7 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
     q1 = state.require("q1")
     qtr = state.require("qtr")
     # The islands below write no input (they copy before any indexed store), so the state's tensors enter them as
-    # they are: copies here cost one full pass each on the compacted buffer (round 8 wave 4).
+    # they are: copies here cost one full pass each on the compacted buffer.
     new_t1 = state.require("new_t1")
     new_u1 = state.require("new_u1")
     new_v1 = state.require("new_v1")

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 IC Weather LLC. Licensed under LICENSE and PERMISSIONS.md.
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""Torch-native thermodynamic helpers used by the SA-SAS profile harness."""
+"""Torch-native thermodynamic helpers of the SA-SAS deep-convection port."""
 
 from __future__ import annotations
 

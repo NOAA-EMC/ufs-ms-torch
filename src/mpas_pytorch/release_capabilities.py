@@ -3,9 +3,9 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """Frozen release-preview capability contract.
 
-This module is deliberately data-only.  The CLI, package metadata, release-scope
-documentation test, and configuration rejection tests all consume this one
-definition so that advertised support cannot drift between surfaces.
+This module is deliberately data-only.  The runtime entry points, history and
+restart I/O, and namelist metadata all consume this one definition so that
+advertised support cannot drift between surfaces.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ RESTART_CONTRACT = "MPAS-PyTorch restart schema v1"
 
 # Generated from the nhyd_model and damping records in the authoritative
 # Registry.xml identified by REGISTRY_SHA256.  Keeping the generated values in
-# the installed package makes capability reporting independent of a monorepo.
+# the installed package makes capability reporting independent of a source checkout.
 _GLOBAL_DYCORE_REGISTRY_DEFAULTS: dict[str, Any] = {
     "config_time_integration": "SRK3",
     "config_time_integration_order": 2,

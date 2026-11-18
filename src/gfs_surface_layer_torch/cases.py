@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class SurfaceCaseConfig:
-    """Scalar switches for one source-oracle run."""
+    """Scalar switches for one surface-layer call."""
 
     case_id: str
     ivegsrc: int

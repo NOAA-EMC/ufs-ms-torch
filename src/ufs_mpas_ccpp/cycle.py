@@ -309,7 +309,7 @@ def initialize_cold_cycle(native_state, mesh, *, config, surface_control: Surfac
     n_cells_global: int, mpi_size: int, h2o_diagnostics: bool = False) -> ColdCycleInitialization:
     """Build selected cold CCPP carry from already initialized MPAS buffers.
 
-    Tables and static controls come from offline preparation, never captures.
+    Tables and static controls come from offline preparation.
     Native MPAS initialization and table preparation precede this call. It runs
     the selected Noah surface and TEMPO state initializers, not all physics_init
     routines. This cold-only path must not reset continuing or restarted state.
@@ -449,10 +449,9 @@ def all_finite(values: list[torch.Tensor]) -> torch.Tensor:
     """Device Boolean: every element of every tensor in ``values`` is finite (no host read).
 
     The max-norm of a tensor is NaN or inf exactly when the tensor has a nonfinite element; one read per tensor
-    (0.036 s per x1.10242 state on 4 CPU threads, against 0.091 s for isfinite). CUDA's fused multi-tensor
-    ``_foreach_norm`` (``get_total_norm`` with ``foreach``) takes only a list of one dtype whose tensors are all dense: one mixed list fell back to one
-    reduction kernel per tensor (600 per 60 km step, 8 ms on an A100). So each dtype's contiguous tensors form one
-    list and the other tensors another.
+    (faster than isfinite). CUDA's fused multi-tensor ``_foreach_norm`` (``get_total_norm`` with ``foreach``)
+    takes only a list of one dtype whose tensors are all dense: a mixed list falls back to one reduction kernel
+    per tensor. So each dtype's contiguous tensors form one list and the other tensors another.
     """
     groups: dict[tuple[torch.dtype, bool], list[torch.Tensor]] = {}
     for value in values:
@@ -667,8 +666,8 @@ def _checkpointed_cycle(previous, arguments: Mapping[str, Any], *, operator=None
 
     The cycle runs under grad, then its graph is cut to one ``_CycleRecompute`` node, so until
     backward the cycle holds ``previous`` and that node. (A non-reentrant ``torch.utils.checkpoint``
-    drops the saved tensors but keeps every graph node: about 1.7 GiB per x1.10242 FP32 cycle,
-    against 0.17 GiB of new state.) The node's inputs are the differentiable tensors of ``previous``
+    drops the saved tensors but keeps every graph node, about ten times the memory of the cycle's
+    new state.) The node's inputs are the differentiable tensors of ``previous``
     and of ``arguments`` (the parameters); a graph walk raises if the cycle reaches any other
     differentiable leaf, so no gradient path is dropped.
     Native-phase callers supply their source operator and evolving-state selector;
@@ -1061,7 +1060,7 @@ _H2O_WEIGHTS: dict[tuple[int, int], tuple[Any, Any, tuple]] = {}
 COMPACTION_LOG: list[tuple[int, str]] = []
 _SEED_STREAMS: dict[tuple, tuple[tuple, RadiationSeedStream]] = {}
 # Radiation steps per prepared seed stream, and the byte budget of one draw's transients (about 32 bytes
-# per drawn value: fewer rows on large meshes; 32 rows at x1.163842).
+# per drawn value: fewer rows on large meshes).
 SEED_STREAM_ROWS, SEED_STREAM_BYTES = 32, 512 * 2**20
 _SEED_STREAM_FROZEN = contextvars.ContextVar("seed_stream_frozen", default=False)
 
@@ -1088,11 +1087,10 @@ def radiation_seed_stream(sec: torch.Tensor, step_index: int, *, ncol: int, init
 
     The draws depend only on the elapsed seconds, the date and the static domain
     (``radiation_seed_draws``), so one batched draw serves ``SEED_STREAM_ROWS`` radiation steps (one
-    serial Mersenne-twister pass for all rows; the shared permutation is 526 twist blocks at
-    x1.163842). ``sec`` is this step's elapsed seconds; each row's seconds follow the cycle's own
-    ``sec + dtp`` chain, so they equal the device clock bit for bit. A step outside the window refills
-    the same tensors in place (recorded step graphs read them). Like the ozone grid, the stream is kept
-    per run's static inputs (``global_ids``, ``initial_date``, ``dtp``, controls).
+    serial Mersenne-twister pass for all rows). ``sec`` is this step's elapsed seconds; each row's seconds
+    follow the cycle's own ``sec + dtp`` chain, so they equal the device clock bit for bit. A step outside
+    the window refills the same tensors in place (recorded step graphs read them). Like the ozone grid, the
+    stream is kept per run's static inputs (``global_ids``, ``initial_date``, ``dtp``, controls).
     """
     dtp = physics_arguments["dtp"]
     key = (id(global_ids), id(initial_date), id(dtp), ncol, n_cells_global, torch.is_inference_mode_enabled(),

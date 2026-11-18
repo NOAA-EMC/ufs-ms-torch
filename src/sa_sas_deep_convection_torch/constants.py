@@ -1,7 +1,7 @@
 # Copyright (c) 2026 IC Weather LLC. Licensed under LICENSE and PERMISSIONS.md.
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""Constants for the sealed SA-SAS deep-convection profile gate path."""
+"""Constants of the SA-SAS deep-convection port."""
 
 IM = 4
 KM = 16

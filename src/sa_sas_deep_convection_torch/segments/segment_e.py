@@ -14,7 +14,7 @@ from sa_sas_deep_convection_torch.state import runtime_dimensions, SaSasDeepConv
 
 
 def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
-    """Run lines 817-973 of ``samfdeepcnv_run`` for the approved active case."""
+    """Run lines 817-973 of ``samfdeepcnv_run``."""
     _, KM, NN, NTR, NTC = runtime_dimensions(state)
 
     cnvflg = state.require("cnvflg").clone()

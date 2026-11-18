@@ -417,7 +417,7 @@ def _vector_reconstruction_numeric(
     """Reconstruction arithmetic and padding (also the compile region)."""
     compute_dtype = u.dtype
     device = u.device
-    # Keep append-padding convention used throughout dycore orchestration.
+    # Keep the append-padding convention used throughout the dycore.
     u_reconstruct_x = torch.zeros(
         (nCells + 1, nVertLevels), dtype=compute_dtype, device=device
     )

@@ -77,7 +77,7 @@ FORTRAN_DEFAULTS: dict[str, Any] = {
     "config_apvm_upwinding": 0.5,
     "compute_diagnostics": False,
     "config_scalar_advection": True,
-    # monotonic-scalar-transport memory control. 0 preserves the historical all-scalars-at-once path;
+    # monotonic-scalar-transport memory control. 0 transports all scalars at once;
     # positive values tile monotonic scalar transport along the tracer dimension.
     "config_scalar_transport_chunk_size": 0,
     # Workspace reuse for pre-allocated scratch tensors.
@@ -107,7 +107,7 @@ FORTRAN_DEFAULTS: dict[str, Any] = {
     "config_mpas_cam_coef": 0.0,
     "config_number_cam_damping_levels": 4,
     "config_h_ScaleWithMesh": True,
-    # Vertical damping (runtime namelist defaults for twin-readiness)
+    # Vertical damping (runtime namelist defaults)
     "config_zd": 22000.0,
     "config_xnutr": 0.2,
     # dynamics-tendency mixing and curvature (Registry.xml defaults)

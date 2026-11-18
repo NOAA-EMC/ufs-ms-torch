@@ -98,7 +98,7 @@ class ExecutionPolicy:
 
         MPS cannot hold float64, including an intermediate in a combined to().
         Widen after leaving MPS; narrow before entering it. Integer fields keep
-        their dtype. This operation does not grant runtime/release admission.
+        their dtype.
         """
         if value.is_complex():
             raise MpasConfigError("complex model transfers are unsupported")

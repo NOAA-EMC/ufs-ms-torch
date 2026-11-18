@@ -25,7 +25,7 @@ def place_levels(base, value, start):
     """``base`` with levels ``start:start + value.shape[1]`` (dim 1) replaced by ``value``, one slice.
 
     Assembling chunk results as per-level views into ``torch.stack`` made Inductor emit one copy
-    kernel per level on CUDA (offline sm_80 codegen, x1.10242); values are unchanged.
+    kernel per level on CUDA; values are unchanged.
     """
     # Inductor can retain a broadcast base's zero strides in the scatter output.
     # Materialize that layout only; ordinary recurrence fields keep their layout.
@@ -78,7 +78,7 @@ def pack_profiles(*values):
     """One contiguous [level, profile, column, ...] packet for repeated bounded regions.
 
     A compiled island (one tiled transpose kernel): eager, the stack of level-leading views was a strided
-    batched copy (G4a, CatArrayBatchedCopy). Values are copies, unchanged.
+    batched copy (CatArrayBatchedCopy). Values are copies, unchanged.
     """
     from sa_sas_deep_convection_torch.compile import run_compile_island
 
@@ -217,7 +217,7 @@ def _blocked_affine_recurrence(keep, sources, denominator, update, old, initial,
 
     Inputs are level-major and equally shaped; ``sources`` preserves successive
     numerator additions. Inactive levels overwrite the carry, not skip a map.
-    This experimental helper is not selected by the production coordinator.
+    Optional (``microblock`` > 0); the default path does not use it.
     """
     count = (keep[0] if isinstance(keep, tuple) else keep).shape[0]
     if return_components and not compensated:

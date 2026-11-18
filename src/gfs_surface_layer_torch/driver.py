@@ -4,7 +4,7 @@
 """Torch-native GFS surface-layer kernels.
 
 The runtime functions in this module are intentionally tensor-only: no NumPy,
-NetCDF, source-oracle IO, or host synchronization belongs on the target path.
+NetCDF, reference-file IO, or host synchronization belongs on the runtime path.
 """
 
 from __future__ import annotations
@@ -410,7 +410,7 @@ def _apply_stability_outputs(
 
 def _evaluate_stability(*args, thsfc_loc):
     # Float32 evaluates in float64 and rounds each output once (no-op in float64). Every column
-    # computes both stability branches and all three surface types; in the discarded lanes float32
+    # computes both stability branches and all three surface types; in the discarded branches float32
     # backward factors (x**-1.5 at the 1e-30 floor, (a/b)/b) overflow, and 0 * inf is NaN.
     working = args[0].dtype
     if working == torch.float32:

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 IC Weather LLC. Licensed under LICENSE and PERMISSIONS.md.
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""Model-facing surface and cloud diagnostics for the GFS v17 oracle profile.
+"""Model-facing surface and cloud diagnostics of the GFS v17 suite.
 
 Equations follow radiation_surface.f setalb/setemis (ialb=iems=2,
 Noah-MP, uncoupled ice) and radiation_clouds.f gethml (bottom-up,

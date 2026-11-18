@@ -59,8 +59,8 @@ ZSP_GW = 106.5e3
 # Largest eddy-diffusion substep count per column the port unrolls (runtime_policy caps the loop below it).
 NSTAB_MAX = UGWP_V1_NSTAB_MAX
 # The wave loop's reference start: the launch layer of a column whose layer pressures are half the
-# reference ones (x1.10242: launch layers 25-33 over 25 coupled cycles, reference launch layer 31,
-# smallest pressure ratio to the reference 0.58 at layers 19-25).
+# reference ones. Fitted to measured coupled runs, where the smallest layer-pressure ratio to the
+# reference is 0.58.
 KSTART_PRESSURE_RATIO = 0.5
 _HPSKM = 7000. * 1.e-3  # ugwp_common hpscale in km
 _regional_compile = False
@@ -280,7 +280,7 @@ def ngwflux_update(tau_ngw: torch.Tensor, tau_ddd: torch.Tensor, xlat_d: torch.T
 
 def _clip(value: torch.Tensor, limit: float) -> torch.Tensor:
     """if (abs(x) >= limit) x = sign(limit, x); the bound is a float64 tensor (where of two Python
-    scalars is float32, P104)."""
+    scalars is float32)."""
     bound = value.new_full((), limit)
     return torch.where(value.abs() >= limit, torch.where(value < 0.0, -bound, bound), value)
 
@@ -300,9 +300,9 @@ def _wave_level(flux, vueff, ksrc, level, umfp, bn2_next, vzmet, fden_next,
     """One complete ordered wave level, including its masked output updates.
 
     Each wave's update is formed inside the ordered wave loop on its [ncol, nazd] slice, so compiled, the level
-    is one kernel over [ncol, nazd] that reads and writes the flux once (G4a: a spectrum update kernel and an
-    integral kernel that read its vc, heat and vmdiff back, 0.53 + 0.56 GB per level at 60 km). Values are the
-    same per element and the integrals keep the wave order.
+    is one kernel over [ncol, nazd] that reads and writes the flux once (not a spectrum update kernel and an
+    integral kernel that reads its vc, heat and vmdiff back). Values are the same per element and the integrals
+    keep the wave order.
     """
     active = level >= ksrc
     act2 = active[:, None]
@@ -423,7 +423,7 @@ def _ngw_prepare(fields: Mapping[str, torch.Tensor], tau_ngw: torch.Tensor, *, d
     # Interface mean flow, jk = 2..levs (index jk), with ktop = levs+1 extrapolated.
     TV = T * (1. + CON_FVIRT * Q)
     tvc, tvm = TV[:, 2:], TV[:, 1:-1]
-    two = atm.new_full((), 2.0)  # scalar/tensor division would multiply by a reciprocal (P27)
+    two = atm.new_full((), 2.0)  # scalar/tensor division would multiply by a reciprocal
     zthm = two / (tvc + tvm)
     uint = 0.5 * (U[:, 1:-1] + U[:, 2:])
     vint = 0.5 * (V[:, 1:-1] + V[:, 2:])
@@ -484,9 +484,8 @@ def _ngw_prepare(fields: Mapping[str, torch.Tensor], tau_ngw: torch.Tensor, *, d
 def _ngw_launch_flux(flux1, taub_src, rstar, rstar2, bvi, rhoi_src, RHOI, BN, *, zdci, nazd):
     """The launch spectrum normalized to the launch flux, and the saturation density fden_bn (level-major).
 
-    Its own region: inside ``_ngw_prepare`` Inductor formed the wave sum as an epilogue of the launch-level
-    reduction and evaluated flux1's FP64 power there again, one column per program (3.1 ms per 60 km step on the
-    RTX PRO 6000, round 8)."""
+    Its own region: inside ``_ngw_prepare`` Inductor forms the wave sum as an epilogue of the launch-level
+    reduction and evaluates flux1's FP64 power there again, one column per program."""
     ncol, nwav = flux1.shape
     fpu_src = torch.zeros_like(rstar)
     for inc in range(nwav):
@@ -667,8 +666,7 @@ def _ngw_finish(uold, vold, told, U, V, T, dzm, kvint, inner, pdudt, pdvdt, pdtd
     zinv = one / (nxtk(dzm) + dzm)
     mf = rcpd * kvint[:, :levs + 1] * (uzf * uzf + vzf * vzf) * zinv * zinv
     # Layers 1..levs formed as their own arrays (as dked in _ngw_diffusion_prepare), not strided views: the
-    # selections on those layers only, so no full-height result is stored and copied (round 8 wave 4, 0.23 ms per
-    # 60 km step on the RTX PRO 6000). The same values per element.
+    # selections on those layers only, so no full-height result is stored and copied. The same values per element.
     layers, inner = slice(1, None), inner[:, 1:]
     return (torch.where(inner, ze2[:, layers], pdudt[:, layers]), torch.where(inner, ze1v[:, layers], pdvdt[:, layers]),
             torch.where(inner, (heat_t + mf)[:, layers], pdtdt[:, layers]))
@@ -750,7 +748,7 @@ def apply_ugwpv1_gsldrag(statein, grid, prefix, hpbl, *, dtp, alpha_fd, dtidx, c
     (dx_factor_scale, tauamp_scale) of ugwpv1_gsldrag."""
     work, sfcprop = prefix.interstitial, prefix.sfcprop
     # q1 (the vapour slot of qgrs, a stride-ntrac view) stored once as its own array: the drag and wave-prepare
-    # regions each copied the view at entry (0.4 ms per 60 km step on the RTX PRO 6000, round 8 wave 4).
+    # regions would each copy the view at entry.
     fields = {
         "t1": statein.tgrs, "u1": statein.ugrs, "v1": statein.vgrs, "q1": statein.qgrs[:, :, 0].contiguous(),
         **{n: getattr(statein, n) for n in ("prsi", "prsl", "prslk", "phil", "phii")},

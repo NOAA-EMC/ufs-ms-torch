@@ -13,7 +13,7 @@ def load_cpu_case(path, *, physics_overrides=None):
     """Bootstrap native inputs on CPU before the existing precision/partition path.
 
     Only root calls this in a distributed forecast. Setup temporaries never become
-    forecast products. Legacy prepared files remain readable for regression oracles.
+    forecast products. Prepared case files remain readable.
     """
     path = Path(path)
     if path.is_dir():

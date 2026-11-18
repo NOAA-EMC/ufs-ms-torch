@@ -444,9 +444,9 @@ def _explicit_scalar_transport_vertical_boundary_flux_region(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute explicit-scalar-transport bottom/top vertical interface fluxes.
 
-    The interior third-order flux remains a separate helper because CPU Inductor
-    has shown non-bitwise drift for that expression. The boundary expressions
-    compile bitwise and are safe to validate independently.
+    The interior third-order flux is a separate helper because CPU Inductor
+    does not compile that expression bitwise. The boundary expressions
+    compile bitwise and can be checked independently.
     """
     if nVertLevels < 2:
         zeros = scalar_new_cells.new_zeros((scalar_new_cells.shape[0], num_scalars))
@@ -574,7 +574,7 @@ def _explicit_scalar_transport_scalar_update_region(
     nVertLevels: int,
     num_scalars: int,
 ) -> torch.Tensor:
-    """Compatibility wrapper for the formerly monolithic explicit-scalar-transport scalar update."""
+    """Compatibility wrapper that runs the split explicit-scalar-transport scalar update in one call."""
     scalar_tend_column = _explicit_scalar_transport_scalar_tend_column_region(
         scalar_tend_save_cells=scalar_tend_save_cells,
         uh_flux_divergence=uh_flux_divergence,
@@ -613,7 +613,7 @@ def _sum_explicit_scalar_transport_pre_gathered_slots(
     """Reduce pre-gathered explicit-scalar-transport cell-edge fluxes in Fortran slot order.
 
     One form on every device and mode: slot by slot, so no ``[nCells, slots, levels, scalars]``
-    contribution array is formed (the former CUDA/compiled branch; round-4 M1c). The gathers are per
+    contribution array is formed. The gathers are per
     slot too (``uh_slots[slot]``: ``[nCells, levels]``, ``flux_slots[slot]``: ``[nCells, levels,
     scalars]``): a whole-slot gather is read once per slot, so a compiled region stores it."""
     n_cells, n_slots = edge_sign.shape
@@ -993,7 +993,7 @@ def build_explicit_scalar_transport_numeric_plan(
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # The flux and the saved tendency leave with the base's rows outside the owned edges and cells (the
         # padded public layouts), formed in this region rather than by an eager copy of each whole field
-        # after it (G4a). With physics the saved tendency is the input itself.
+        # after it. With physics the saved tendency is the input itself.
         scalar_tend_column, horiz_flux, scalar_tend_patch = _explicit_scalar_transport_horizontal_transport_composition(
             scalar_new=scalar_new,
             scalar_tend_save_cells=scalar_tend_save[cell_start_v:cell_end_v],

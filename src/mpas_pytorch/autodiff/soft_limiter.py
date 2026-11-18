@@ -3,14 +3,13 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """Hard FCT primitives with derivatives of the actual forward program.
 
-The optional ``tau``/``eps`` arguments remain source-compatible with older
-callers, but do not alter the supported derivative. At smooth points PyTorch
-therefore differentiates the exact hard primal. Validation classifies and
-excludes directions that cross one of the operators' switching surfaces.
+The optional ``tau``/``eps`` arguments are accepted for source compatibility
+but do not alter the derivative. At smooth points PyTorch therefore
+differentiates the exact hard primal. The derivative is not defined in
+directions that cross one of the operators' switching surfaces.
 
-The private smooth helpers are retained only to construct explicit negative
-controls for the former straight-through behavior. Production functions never
-call them.
+The private smooth helpers exist only to construct negative controls. The
+public functions never call them.
 """
 
 from __future__ import annotations
@@ -23,18 +22,18 @@ _USE_MODULE_DEFAULT = object()
 
 
 def get_default_eps() -> float:
-    """Return the legacy experimental-smoother epsilon.
+    """Return the epsilon of the private smooth helpers.
 
-    Hard production derivatives do not consult this value. It remains only for
-    source compatibility and explicit negative-control experiments.
+    The hard derivatives do not consult this value. It exists only for source
+    compatibility and negative controls.
     """
     return _DEFAULT_EPS
 
 
 def set_default_eps(eps: float) -> None:
-    """Set the legacy experimental-smoother epsilon.
+    """Set the epsilon of the private smooth helpers.
 
-    This setting cannot alter a production FCT primal or derivative.
+    This setting cannot alter an FCT primal or derivative.
     """
     global _DEFAULT_EPS
     if eps <= 0.0:
@@ -54,7 +53,7 @@ def _coerce_tau(x: torch.Tensor, tau: float | torch.Tensor) -> torch.Tensor:
 
 
 def _stable_softplus(x: torch.Tensor, tau: float | torch.Tensor) -> torch.Tensor:
-    """Experimental smooth helper used only by negative controls."""
+    """Smooth helper used only by negative controls."""
     tau_t = _coerce_tau(x, tau)
     z = x / tau_t
     middle = tau_t * (
@@ -68,7 +67,7 @@ def _stable_softplus(x: torch.Tensor, tau: float | torch.Tensor) -> torch.Tensor
 
 
 def _soft_clamp_01_impl(x: torch.Tensor, tau: float | torch.Tensor) -> torch.Tensor:
-    """Experimental smooth-clamp helper used only by negative controls."""
+    """Smooth-clamp helper used only by negative controls."""
     return _stable_softplus(x, tau) - _stable_softplus(x - 1.0, tau)
 
 
@@ -119,9 +118,9 @@ def fct_neighbor_bounds(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reduce neighbor extrema with the hard primal and its exact derivative.
 
-    Exact ties are switching surfaces and are handled by the release
-    differentiability preflight. The ordered schedule uses one slot of scratch,
-    so ``slot_tile_width`` no longer selects a second numerical path.
+    Exact ties are switching surfaces, where the derivative is not defined. The
+    ordered schedule uses one slot of scratch, so ``slot_tile_width`` does not
+    select a second numerical path.
     """
     if field.ndim < 2 or indices.ndim != 2 or valid.shape != indices.shape:
         raise ValueError(
@@ -159,8 +158,7 @@ def fct_sign_pm(
 ) -> torch.Tensor:
     """Return the hard sign selector in ``{-1, +1}``.
 
-    Away from zero its derivative is exactly zero. Zero is a switching surface
-    that the release differentiability preflight reports.
+    Away from zero its derivative is exactly zero. Zero is a switching surface.
     """
     del eps
     # One fused elementwise op: a 0-d ``ones`` and its negation cost two

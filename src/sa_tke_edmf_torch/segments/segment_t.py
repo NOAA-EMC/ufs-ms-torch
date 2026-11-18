@@ -15,11 +15,11 @@ from sa_tke_edmf_torch.diagnostics import diagnostic_slots, set_diagnostic_
 def run(state: SaTkeEdmfState) -> SaTkeEdmfState:
     """``GFS_PBL_generic_post_run`` tendency handling.
 
-    ``config["tend_opt_pbl"]`` (default 1) selects the oracle ``case_PBL_ten`` branch:
+    ``config["tend_opt_pbl"]`` (default 1) selects the Fortran ``case_PBL_ten`` branch:
     1 apply now, 2 add to the dtdt/dudt/dvdt/dqdt sums, 3 add to the sums and apply
     them, 4 leave state and sums unchanged. With ``ldiag3d`` the PBL slices of dtend
-    are overwritten using source dtidx and globally unpacked tracers. Profiles
-    without dtidx retain their declared 3+n layout.
+    are overwritten using source dtidx and globally unpacked tracers. Without dtidx
+    the declared 3+n layout applies.
     """
 
     KM = state.require("q1").shape[1]

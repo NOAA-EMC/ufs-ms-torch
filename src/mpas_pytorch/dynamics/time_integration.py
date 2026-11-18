@@ -419,9 +419,8 @@ def _keep_shared_scalars_new_storage(
     result when both tensors span their storage with one layout: element for
     element the values the in-place store gave them. If the input state (the
     caller's tensors) holds it, or the layouts differ, the result is stored
-    into the input in place and the input becomes scalars_new again, as
-    before. Host metadata only (storage pointers, strides); no device
-    synchronization.
+    into the input in place and the input becomes scalars_new again. Host
+    metadata only (storage pointers, strides); no device synchronization.
     """
     new = current_state.get("scalars_new")
     if (
@@ -913,7 +912,7 @@ def _should_prefer_mesh_connectivity(
         return False
 
     if floating_dtype(state_dict) == torch.float32:
-        # Rounded momentum is not a topology oracle. Cold-start validation binds
+        # Rounded momentum cannot identify the topology. Cold-start validation binds
         # integer connectivity before rounding; never infer a different mesh from
         # an FP32 residual with FP64 cutoffs.
         if not torch.equal(state_dict["cellsOnEdge"], mesh_dict["cellsOnEdge"]):
@@ -1521,7 +1520,7 @@ def _validate_state_dict(
     # =========================================================================
     # Check 2: Key array shapes match expected dimensions
     # Arrays use 1-based+padded convention: shape is (N+1, ...) not (N, ...)
-    # Extended to cover connectivity, geometry, and vertical coefficient arrays.
+    # Covers connectivity, geometry, and vertical coefficient arrays.
     # =========================================================================
     shape_checks = _get_shape_checks(state_dict)
 
@@ -1678,7 +1677,7 @@ def _validate_state_dict(
 def _validate_mesh_dtypes(mesh_dict: dict[str, Any], strict: bool = True) -> None:
     """Validate that all floating-point tensors in mesh_dict are torch.float64.
 
-    This function fills the dtype validation gap for mesh dictionaries.
+    This function validates dtypes of mesh dictionaries.
     _validate_state_dict() performs dtype checks on state tensors but is not
     called on mesh_dict because mesh dicts may lack required dimension scalars
     (nCells, nEdges, nVertLevels). This function checks ONLY dtypes, without
@@ -2253,8 +2252,8 @@ def _reject_unsupported_advection_orders(config: dict[str, Any]) -> None:
 def _get_int_from_dict(d: dict[str, Any], key: str, default: Any = None) -> int:
     """Extract integer from dict, handling both tensor and Python int/float.
 
-    This helper addresses the validation vulnerability where _validate_state_dict()
-    accepts Python ints for dimensions, but unconditional .item() calls crash with
+    _validate_state_dict() accepts Python ints for dimensions, on which an
+    unconditional .item() call raises
     AttributeError: 'int' object has no attribute 'item'.
 
     Args:
@@ -2311,8 +2310,8 @@ def _get_int_from_dict(d: dict[str, Any], key: str, default: Any = None) -> int:
 def _get_float_from_dict(d: dict[str, Any], key: str, default: Any = None) -> float:
     """Extract float from dict, handling both tensor and Python int/float.
 
-    This helper addresses the validation vulnerability where _validate_state_dict()
-    accepts Python floats for values, but unconditional .item() calls crash with
+    _validate_state_dict() accepts Python floats for values, on which an
+    unconditional .item() call raises
     AttributeError: 'float' object has no attribute 'item'.
 
     Args:
@@ -2385,9 +2384,6 @@ def _check_edge_data_requires_nEdges(state_dict: dict[str, Any]) -> list[str]:
     If any of these keys are present, nEdges must be explicitly provided
     and cannot be approximated from nCells * 3. The approximation would
     cause shape mismatches for actual edge-sized tensors.
-
-    Comprehensive edge data detection
-    replacing the incomplete 4-key acoustic check.
 
     Args:
         state_dict: Dictionary of state/mesh tensors
@@ -2508,15 +2504,12 @@ def _get_shape_checks(state_dict: dict[str, Any]) -> dict[str, tuple]:
     Arrays with variable shapes (deriv_two, defc_a, defc_b) have None as
     expected_shape to skip validation.
 
-    This function extends shape validation beyond the 4 core state arrays
-    (u, w, rho_zz, theta_m) to cover connectivity, geometry, vertical
+    The checks cover the core state arrays (u, w, rho_zz, theta_m),
+    connectivity, geometry, vertical
     coefficient arrays, dynamics-tendency state arrays, diagnostic arrays, pressure arrays,
     initialization arrays, tendency arrays, mesh geometry, and reconstruction
     arrays. This catches malformed dicts early rather than failing deep in
     kernels with cryptic errors.
-
-    Extend shape validation to cover connectivity and geometry arrays.
-    Extend to cover 50+ arrays for explicit-scalar-transport/monotonic-scalar-transport/dynamics-tendency kernels.
     """
     # Use the helper functions for safe dimension extraction
     nCells = _get_int_from_dict(state_dict, "nCells")
@@ -2754,10 +2747,6 @@ def _validate_scalars_shape(
 
     Returns:
         List of validation issues (empty if valid).
-
-    Note:
-        This function adds validation for the scalars array
-        that was previously incomplete in _validate_state_dict().
     """
     issues: list[str] = []
 
@@ -2858,7 +2847,7 @@ def atm_rk_integration_setup(
             nCells + 1, nVertLevels + 1, dtype=compute_dtype, device=device
         )
 
-    # GAP-H1: Preserve checkpoint-provided physics tendency fields when present.
+    # Preserve checkpoint-provided physics tendency fields when present.
     # Dycore-only execution leaves the optional dynamics-tendency additive physics tendencies
     # absent so dynamics-tendency can skip zero-valued tensor traffic.
     nCells_plus_1 = nCells + 1
@@ -2908,11 +2897,11 @@ def atm_rk_integration_setup(
         # rho_zz_old_split is a density snapshot for transport-step density
         # interpolation.  It is read-only (never updated after initial copy),
         # but remains a live dependency of split-transport scalar tendencies.
-        # A detach here silently removed the initial-density contribution from
+        # A detach here would remove the initial-density contribution from
         # both forward- and reverse-mode derivatives.
         result["rho_zz_old_split"] = _time_level_copy(state_dict["rho_zz"])
 
-    # GAP-C2: Initialize rho_zz time levels for scalar advection
+    # Initialize rho_zz time levels for scalar advection
     # Upstream time levels map to rho_zz_old and rho_zz_new.
     # At setup, both start as initial rho_zz
     if "rho_zz" in state_dict:
@@ -2920,7 +2909,7 @@ def atm_rk_integration_setup(
         result["rho_zz_new"] = _time_level_copy(state_dict["rho_zz"])
 
     # =========================================================================
-    # Split dynamics-transport accumulators (GAP-4)
+    # Split dynamics-transport accumulators
     # When config_split_dynamics_transport > 1, ruAvg and wwAvg from each
     # dynamics substep are accumulated and then averaged for the transport step.
     # Initialize ruAvg_split and wwAvg_split to zero here.
@@ -2983,8 +2972,7 @@ def atm_rk_integration_setup(
     # ALWAYS overwrite aliases from canonical sources. The IC checkpoint may
     # contain stale Fortran-internal arrays (pp, rr, t_init, etc.) captured
     # from a different time level during Fortran initialization. Using these
-    # stale values causes wrong perturbations and numerical blowup (e.g.,
-    # pp off by 1770 Pa, rr off by 0.13, leading to 78 m/s velocity error).
+    # stale values causes wrong perturbations and numerical blowup.
     # =========================================================================
     alias_map = {
         # dynamics-tendency aliases (Fortran diag pool names -> PyTorch canonical names)
@@ -3010,8 +2998,7 @@ def atm_rk_integration_setup(
     # state(:,:,2) = state(:,:,1) at the start of each timestep.
     # The IC checkpoint may contain stale theta_m_save / rr_save from
     # a different Fortran time level; using them would cause the RK
-    # recovery to compute wrong perturbations (observed: 66 K error
-    # in theta_m_save vs theta_m, leading to 78 m/s velocity error).
+    # recovery to compute wrong perturbations.
     if "theta_m" in state_dict:
         result["theta_m_save"] = result["theta_m"].clone()
     if "rho_p" in result:
@@ -3027,8 +3014,8 @@ def atm_rk_integration_setup(
 
     # The IC checkpoint may contain STALE values (e.g., t_init = 0 instead
     # of theta_m) because it was captured before Fortran set these fields.
-    # Using stale t_init (all zeros vs theta_m ~237-835 K) causes massive
-    # spurious vertical diffusion in dynamics-tendency eddy viscosity.
+    # Using a stale t_init (all zeros) causes large spurious vertical
+    # diffusion in dynamics-tendency eddy viscosity.
     # =========================================================================
     # t_init is a constant reference profile (all zeros for GFS IC).
     # Never updated at runtime, never differentiated through.
@@ -3737,8 +3724,7 @@ def _atm_srk3_core(
 
     # =========================================================================
     # PROPAGATE DIMENSION SCALARS FROM MESH TO STATE
-    # When state and mesh are loaded from separate checkpoint files (e.g.,
-    # baroclinic_wave_ic.nc for state, mesh_complete.nc for mesh), the state
+    # When state and mesh are loaded from separate checkpoint files, the state
     # file may store nCells/nEdges/nVertLevels only as NetCDF dimensions (not
     # variables), so they won't appear in the loaded dict. The mesh file
     # typically has them as variables. Copy missing dimension scalars from
@@ -3838,7 +3824,7 @@ def _atm_srk3_core(
         )
         _validate_mesh_dtypes(mesh_dict, strict=strict)
 
-    # Enforce CPU-only execution contract early.
+    # Require one device for all inputs, early.
     require_consistent_device("atm_srk3 state", state_dict)
     if mesh_dict is not None:
         require_consistent_device("atm_srk3 mesh", mesh_dict)
@@ -4086,7 +4072,7 @@ def _atm_srk3_core(
                     current_state["rt"] = current_state["rtheta_p"]
 
         # =====================================================================
-        # GAP-4: Dynamics substep finish (atm_rk_dynamics_substep_finish)
+        # Dynamics substep finish (atm_rk_dynamics_substep_finish)
 
         # Part B: Accumulate ruAvg_split / wwAvg_split from each substep
         # =====================================================================
@@ -4217,7 +4203,7 @@ def _atm_srk3_core(
                         )
 
     # =========================================================================
-    # GAP-4: Split transport RK3 loop
+    # Split transport RK3 loop
     # When config_split_dynamics_transport > 1, scalar advection is performed
     # in a separate RK3 loop AFTER all dynamics substeps complete, using the
     # time-averaged ruAvg/wwAvg and the full timestep dt (not dt_dynamics).
@@ -5342,7 +5328,7 @@ def execute_rk_step(
        - Reused from cache at rk_step==3 (coefficients depend on dts which varies per stage)
 
     2. Compute dynamic tendencies (dynamics-tendency) - BEFORE acoustic loop
-       Note: small-step-perturbation (set_smlstep_pert_variables) goes here but is not yet implemented
+       followed by small-step-perturbation (atm_set_smlstep_pert_variables_work)
     3. Loop over acoustic substeps (acoustic-step) - uses tend_* from dynamics-tendency
     4. Recover large step variables (large-step-recovery)
     5. Compute solve diagnostics (diagnostic-solve) - computes diagnostics for next RK step
@@ -5571,12 +5557,12 @@ def execute_rk_step(
     if "rdzw" in state_dict and "rdnw" not in state_dict:
         state_dict["rdnw"] = state_dict["rdzw"]
 
-    # CPU-only execution contract.
+    # Require one device for all inputs.
     require_consistent_device("execute_rk_step inputs", state_dict)
 
     # =========================================================================
     # Infer device from input tensors for default tensor creation
-    # This ensures defaults match the device of input tensors (CPU-only by default).
+    # This ensures defaults match the device of input tensors.
     # =========================================================================
     device = None
     for key in ["u", "w", "rho_zz", "theta_m"]:
@@ -6475,7 +6461,7 @@ def execute_rk_step(
 
         # Config scalars: use get_config_value_safe with Registry.xml authoritative defaults
         # These are config_ prefixed values that should come from config dict, not state_dict
-        # Corrected defaults to match Registry.xml
+        # Defaults match Registry.xml
         config_del4u_div_factor_dynamics_tendency = get_config_value_safe(
             config, "config_del4u_div_factor", 10.0
         )
@@ -6631,7 +6617,7 @@ def execute_rk_step(
             (nVertLevels,),
             device=device,
         )
-        # These legacy dynamics-tendency arguments are not consumed by the canonical numeric
+        # These dynamics-tendency arguments are not consumed by the canonical numeric
         # body. Preserve supplied tensors for API compatibility, but do not
         # fabricate two full-cell zero fields on every RK invocation.
         tend_w_pgf_dynamics_tendency = get_optional_tensor_dynamics_tendency(
@@ -6643,7 +6629,7 @@ def execute_rk_step(
 
         # Every execution mode enters dynamics-tendency through one runner-owned topology plan.
         # Metric products remain in the canonical Fortran operand order; substituting
-        # reassociated precomputed products is a separate proven-drift optimization.
+        # reassociated precomputed products would change the rounding.
         build_cached_metric_products_dynamics_tendency = False
         build_ordered_ad_transpose_dynamics_tendency = (
             _dynamics_tendency_ordered_ad_transpose_required(
@@ -8258,7 +8244,7 @@ def execute_rk_step(
 
         # Keep recovery outputs MPAS-consistent: valid data in rows 0..N-1,
         # garbage row at index N untouched (except rho_zz[nCells]=1 set inside large-step-recovery).
-        # GAP-C2: Update rho_zz_new from large-step-recovery recovery output
+        # Update rho_zz_new from large-step-recovery recovery output
         # Fortran: large-step-recovery writes into rho_zz(:,:,2), which scalar advection reads as rho_zz_new
         if "rho_zz" in result:
             result["rho_zz_new"] = _clone_for_grad(result["rho_zz"])
@@ -8285,11 +8271,11 @@ def execute_rk_step(
     # - Monotonic/positive-definite advection (monotonic-scalar-transport) ONLY on final RK step (rk_step == 3)
     #   and only if config_monotonic or config_positive_definite is enabled
 
-    # GAP-4: When split dynamics-transport is enabled, scalar advection is
+    # When split dynamics-transport is enabled, scalar advection is
     # SKIPPED inside the dynamics RK loop and done in a separate transport
     # RK3 loop after all dynamics substeps complete.
     # =========================================================================
-    # execute_rk_step is used both by atm_srk3 (full timestep orchestration)
+    # execute_rk_step is used both by atm_srk3 (full timestep)
     # and by direct kernel-level tests with minimal config dicts.
 
     # For full runs, split-dynamics/transport intent must come from explicit
@@ -8331,13 +8317,13 @@ def execute_rk_step(
         and (config_monotonic or config_positive_definite)
     )
 
-    # Honor config_scalar_advection/config['advect_scalars'] gate exactly.
+    # Honor the config_scalar_advection/config['advect_scalars'] switch exactly.
     # Fortran only calls scalar transport when config_scalar_advection is true.
     # When false, both explicit-scalar-transport/monotonic-scalar-transport
     # must be skipped in the coupled RK loop.
     if not advect_scalars_requested:
         pass
-    # GAP-4: When split dynamics-transport is enabled, scalar advection
+    # When split dynamics-transport is enabled, scalar advection
     # is deferred to a separate transport RK3 loop after all dynamics
     # substeps complete. Skip it here inside the dynamics RK loop.
     elif config_split_dynamics_transport:
@@ -8433,7 +8419,7 @@ def execute_rk_step(
                 return state_dict[key]
 
             # Get working arrays - clone to avoid modifying inputs
-            # GAP-C3: Read from result (populated in setup) so live integration sees evolving state
+            # Read from result (populated in setup) so live integration sees evolving state
             scalars_old = _clone_for_grad(
                 get_tensor_monotonic_scalar_transport("scalars_old")
             )
@@ -8966,7 +8952,7 @@ def execute_rk_step(
                 return state_dict[key]
 
             # Get working arrays - clone to avoid modifying inputs
-            # GAP-C3: Read from result (populated in setup) so live integration sees evolving state
+            # Read from result (populated in setup) so live integration sees evolving state
             if "scalars_old" in result:
                 scalar_old_source = result["scalars_old"]
             elif "scalars_old" in state_dict:
@@ -9198,8 +9184,8 @@ def execute_rk_step(
                 return result[key]
             return state_dict[key]
 
-        # Work checkpoints for diagnostic-solve are minted from the kernel entrypoint and
-        # may not carry a prior-stage tangential velocity (v). When v is
+        # Direct diagnostic-solve inputs may not carry a prior-stage
+        # tangential velocity (v). When v is
         # absent, omit rk_step to trigger diagnostic-solve's optional-argument
         # reconstruction path.
         v_in_diagnostic_solve = (

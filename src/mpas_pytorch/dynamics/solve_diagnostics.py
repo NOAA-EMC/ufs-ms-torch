@@ -1193,7 +1193,7 @@ def compile_diagnostic_solve_numeric_plan(
     mode: str,
     backend: str,
 ) -> DiagnosticSolveNumericPlan:
-    """Compile the prebound compact-scratch diagnostic-solve body outside orchestration.
+    """Compile the prebound compact-scratch diagnostic-solve body as its own region.
 
     The padded binder (same composition plus the public padding rows) is
     compiled beside it, so public calls pad inside the region.

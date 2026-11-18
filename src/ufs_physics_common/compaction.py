@@ -1,7 +1,7 @@
 # Copyright (c) 2026 IC Weather LLC. Licensed under LICENSE and PERMISSIONS.md.
 # Portions are modified from the sources listed in NOTICE, under their terms.
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""Exact column compaction with a recoverable overflow (coupled GPU plan, direction D3).
+"""Exact column compaction with a recoverable overflow.
 
 A compacted region runs part of a scheme only on the columns that need it: a stable ``argsort``
 gathers them into a buffer of static capacity, the region runs there, and the results are copied
@@ -110,10 +110,9 @@ def merge_by_gather(original: torch.Tensor, update: torch.Tensor, axis: int, pos
                     take: torch.Tensor) -> torch.Tensor:
     """``original`` with the columns where ``take`` holds replaced by their buffer rows of ``update``.
 
-    A gather and a select, never a scatter into a buffer: Inductor (torch 2.8) fused a later reader
-    of an ``index_copy`` result with the pre-scatter values (TEMPO's rain-number tendency in the
-    compiled sedimentation tiers, round-4 log entry 3). ``position`` is ``buffer_positions(need)``;
-    the values are copied unchanged.
+    A gather and a select, never a scatter into a buffer: Inductor (torch 2.8) can fuse a later
+    reader of an ``index_copy`` result with the pre-scatter values. ``position`` is
+    ``buffer_positions(need)``; the values are copied unchanged.
     """
     shape = [1] * original.ndim
     shape[axis] = position.shape[0]

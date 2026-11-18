@@ -5,7 +5,7 @@
 
 This module handles one-time NetCDF ingestion only.  Loaded coefficient arrays
 are represented as device-native torch tensors so gas-optics, cloud-optics, and
-RTE kernels can consume the frozen corpus without host materialization in the
+RTE kernels can consume the frozen tables without host materialization in the
 scientific hot path.
 """
 
@@ -148,7 +148,7 @@ def load_rrtmgp_tables(
     table_dir: str | Path | None = None,
     device: str | torch.device = "cpu",
 ) -> RrtmgpTableBundle:
-    """Load the frozen gas/cloud optics coefficient corpus as torch tensors.
+    """Load the frozen gas/cloud optics coefficient tables as torch tensors.
 
     ``table_dir`` holds the four files of ``TABLE_FILES``; each must match its SHA-256.
 
