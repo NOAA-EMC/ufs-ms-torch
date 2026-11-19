@@ -583,8 +583,7 @@ def _warn_on_untested_nondefault_config(user_config: Mapping[str, Any]) -> None:
             continue
         warnings.warn(
             f"Config key '{canonical_key}' is set to {resolved_scalar!r} "
-            f"(default {default_scalar!r}) but this non-default path is not "
-            "qualified for release use.",
+            f"(default {default_scalar!r}); no check covers this non-default value.",
             UserWarning,
             stacklevel=2,
         )

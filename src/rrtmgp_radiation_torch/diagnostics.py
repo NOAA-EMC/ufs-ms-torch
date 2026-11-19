@@ -15,7 +15,7 @@ from ufs_physics_common.precision import working_power
 def radiation_surface(state, pre, config):
     if (config.ialb, config.iems, config.lsm,
         config.cplice, config.use_cice_alb, config.lndp_type) != (2, 2, 2, False, False, 0):
-        raise ValueError('G3.4 surface supports the oracle Noah-MP uncoupled ialb=iems=2 profile only')
+        raise ValueError('radiation surface supports only ialb=iems=2 with Noah-MP (lsm=2), cplice and use_cice_alb false and lndp_type=0')
     cimin = torch.where(state['lakefrac'] > 0, torch.full_like(state['fice'], config.min_lakeice),
                         torch.full_like(state['fice'], config.min_seaice))
     if config.frac_grid:

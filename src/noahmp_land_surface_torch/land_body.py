@@ -378,12 +378,12 @@ def _g_boundary_matrix(g_outputs: Mapping[str, torch.Tensor], field: str, indice
     prefix = f"G__{field}__col"
     labels = sorted(int(key[len(prefix):]) for key in g_outputs if key.startswith(prefix))
     if not labels:
-        raise KeyError(f"Missing {field} checkpoint columns")
+        raise KeyError(f"the G-stage outputs have no {field} columns")
     rows = torch.stack([g_outputs[f"{prefix}{label}"] for label in labels], dim=0)
     label_tensor = torch.tensor(labels, dtype=indices.dtype, device=indices.device)
     positions = torch.searchsorted(label_tensor, indices + 1)
     found = (positions < len(labels)) & (label_tensor.index_select(0, positions.clamp(max=len(labels) - 1)) == indices + 1)
-    torch_compat.assert_async(torch.all(found), f"Missing {field} checkpoint columns")
+    torch_compat.assert_async(torch.all(found), f"the G-stage outputs have no {field} value for a selected column")
     return rows.index_select(0, positions)
 
 
@@ -601,7 +601,7 @@ def _ground_precip_after_interception(
 
 def _require_real(name: str, value: torch.Tensor) -> None:
     if value.dtype not in (torch.float32, torch.float64):
-        raise ValueError(f"{name} must be torch.float64 (checkpoint parity) or torch.float32; got {value.dtype}")
+        raise ValueError(f"{name} must be torch.float64 or torch.float32; got {value.dtype}")
 
 
 def _validate_state(opts: Mapping[str, Any], tables: NoahMpTableBundle, state: LandBodyState) -> None:
@@ -615,13 +615,13 @@ def _validate_state(opts: Mapping[str, Any], tables: NoahMpTableBundle, state: L
         )
     }
     if bad:
-        raise NotImplementedError(f"Noah-MP land-body H/I/J helper supports only the sealed source-smoke options; got {bad}")
+        raise NotImplementedError(f"Noah-MP land physics supports only the options {LAND_BODY_SUPPORTED_OPTIONS} (iopt_sfc also 4); got {bad}")
     if int(opts.get("opt_crop", 0)) != 0:
         raise NotImplementedError("Noah-MP crop carbon branches are not supported by the H/I/J helper.")
     if bool(opts.get("cpllnd", False)) or bool(opts.get("cpllnd2atm", False)):
-        raise NotImplementedError("Noah-MP land IAU coupling branches are outside the sealed H/I/J source-smoke corridor.")
+        raise NotImplementedError("Noah-MP land IAU coupling (cpllnd, cpllnd2atm) is not supported.")
     if not bool(opts.get("thsfc_loc", True)):
-        raise NotImplementedError("The H/I/J helper supports only the sealed thsfc_loc=.true. surface-temperature mode.")
+        raise NotImplementedError("Noah-MP land physics supports only thsfc_loc=.true.")
     _ = tables
     for field in fields(state):
         value = getattr(state, field.name)
@@ -694,15 +694,15 @@ def state_from_case_after_g(
     """
     dtype = _case_real(case_data) if dtype is None else dtype
     if dtype not in (torch.float32, torch.float64):
-        raise ValueError("Noah-MP runs in float64 (checkpoint parity) or float32.")
+        raise ValueError("Noah-MP runs in float64 or float32.")
     dev = torch.device("cpu") if device is None else torch.device(device)
     dims = case_data["dimensions"]
     if int(dims["km"]) != 4 or int(dims["lsnowl"]) != -2:
-        raise NotImplementedError("The sealed Noah-MP source-smoke corpus uses km=4 and lsnowl=-2.")
+        raise NotImplementedError("Noah-MP supports only km=4 soil layers and lsnowl=-2.")
 
     indices, active_land_indices_cover_all = _active_land_selection(case_data, tables, device=dev)
     if indices is None:
-        raise NotImplementedError("No active non-glacier land columns are available for H/I/J.")
+        raise NotImplementedError("the case has no active non-glacier land column")
     vegtype_all = _column_int_tensor(case_data, "vegtype", device=dev)
     active_vegtype = _select_active_columns(vegtype_all, indices, indices_cover_all=active_land_indices_cover_all)
     active_soiltyp = _select_active_columns(

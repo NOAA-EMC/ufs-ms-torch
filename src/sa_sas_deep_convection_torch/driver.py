@@ -37,12 +37,12 @@ def unsupported_config_reasons(config: dict[str, Any], *, through: str = "V") ->
     layout_name = "mpas_tempo" if config.get("tracer_layout") is not None else "legacy"
     sealed_ntk, sealed_itc, sealed_ntc = sealed[layout_name]
     if _runs_through(through, "T") and int(config.get("ntk", sealed_ntk)) != sealed_ntk:
-        reasons.append("non-default TKE tracer-index branch requires target checkpoints")
+        reasons.append(f"TKE tracer index ntk other than {sealed_ntk} is not supported")
     if _runs_through(through, "T") and (
         int(config.get("itc", sealed_itc)) != sealed_itc or int(config.get("ntc", sealed_ntc)) not in
         ((0, sealed_ntc) if layout_name == "mpas_tempo" else (sealed_ntc,))
     ):
-        reasons.append("non-default chemistry tracer-index branch requires target checkpoints")
+        reasons.append(f"chemistry tracer indices other than itc={sealed_itc}, ntc={sealed_ntc} are not supported")
     if _runs_through(through, "V"):
         post_variants = []
         if bool(config.get("ldiag3d", True)) is not True:
@@ -57,7 +57,7 @@ def unsupported_config_reasons(config: dict[str, Any], *, through: str = "V") ->
             post_variants.append("cscnv")
         if post_variants:
             reasons.append(
-                "post-diagnostic variant is not sealed by the active-case V oracle: "
+                "post-diagnostic variants are not supported: "
                 + ", ".join(sorted(set(post_variants)))
             )
     return tuple(reasons)
@@ -67,8 +67,8 @@ def validate_supported_config(config: dict[str, Any], *, through: str = "V") -> 
     reasons = unsupported_config_reasons(config, through=through)
     if reasons:
         raise NotImplementedError(
-            "unsupported SA-SAS target config branch for the sealed PyTorch checkpoint path "
-            f"through={through}: " + "; ".join(reasons)
+            "SA-SAS deep convection does not support this configuration "
+            f"(through segment {through}): " + "; ".join(reasons)
         )
 
 

@@ -114,7 +114,7 @@ from .post import compute_heating_rate
 from .pre import AMDO3, AMDW, compute_nonprognostic_gases, fpvs
 from .setup import _coszmn, _solar_state
 from .shortwave import _increment_shortwave_same_spectral_kernel, compute_shortwave_cloud_optics_byband
-from .tables import RrtmgpTableBundle, load_rrtmgp_tables
+from .tables import RrtmgpTableBundle
 from ufs_physics_common.compaction import run_compacted
 from .diagnostics import radiation_surface, cloud_diagnostics, radiation_fluxr
 from .merra2 import NBDLW, NBDSW, _aerosol_preparation, merra2_aer_nm, merra2_aod550, merra2_band_optics, merra2_sw_optics
@@ -280,6 +280,8 @@ class RadiationConfig:
             problems.append("MERRA-2 aerosol needs the prepared climatology, optics and aer_jdat")
         if self.isol not in (0, 2) or (self.isol == 2 and self.solc0 is None):
             problems.append(f"isol={self.isol} (only 0 and 2 with prepared annual values are ported)")
+        if self.ico2 not in (0, 2) or (self.ico2 == 2 and self.co2_monthly is None):
+            problems.append(f"ico2={self.ico2} (only 0 and 2 with prepared monthly tables are ported)")
         if not self.doGP_lwscat or self.nGauss_angles != 1:
             problems.append("only doGP_lwscat=T with one Gauss angle is ported")
         if self.do_mynnedmf:
@@ -742,16 +744,7 @@ def run_rrtmgp_pre(
     if config.ntoz <= 0:
         raise RadiationConfigError("climatological ozone (i_o3 <= 0) is not ported")
     o3_lay = torch.clamp_min(_tracer(gq0, config.ntoz), CON_EPSQS)
-    vmr_o2, vmr_ch4, vmr_n2o, vmr_co2 = compute_nonprognostic_gases(
-        p_lev,
-        state["xlon"],
-        state["xlat"],
-        ico2=0 if config.co2_monthly is not None else config.ico2,
-        top_at_1=False,
-        con_pi=CON_PI,
-        co2_year=config.co2_year,
-        co2_month=config.co2_month,
-    )
+    vmr_o2, vmr_ch4, vmr_n2o, vmr_co2 = compute_nonprognostic_gases(p_lev)
     if config.co2_monthly is not None:
         vmr_co2 = _co2_from_tables(p_lev, state["xlon"], state["xlat"], config)
     vmr_h2o = torch.where(q_lay != 1.0, (q_lay / (1.0 - q_lay)) * AMDW, torch.zeros_like(q_lay))
@@ -1010,7 +1003,7 @@ def run_rrtmgp_cloud_mp(
         raise RadiationConfigError("ERROR: GFS_rrtmgp_cloud_mp has no cloud coupling for this MP choice")
     if config.imp_physics != IMP_PHYSICS_TEMPO:
         raise RadiationConfigError(
-            f"imp_physics={config.imp_physics}: only the TEMPO branch is ported in the oracle lineage"
+            f"imp_physics={config.imp_physics}: only TEMPO (imp_physics={IMP_PHYSICS_TEMPO}) is supported"
         )
     p_lev = pre["p_lev"]
     p_lay = pre["p_lay"]
@@ -2881,7 +2874,7 @@ def run_radiation_group(
     state: Mapping[str, torch.Tensor],
     config: RadiationConfig,
     *,
-    tables: RrtmgpTableBundle | None = None,
+    tables: RrtmgpTableBundle,
     sw_day_fraction: float = 1.0,
     blocks=None,
     region=None,
@@ -2897,16 +2890,15 @@ def run_radiation_group(
     """
 
     config.require_supported()
-    bundle = tables if tables is not None else load_rrtmgp_tables(device=state["prsl"].device)
     head, tail = (_group_head, _group_tail) if region is None else (region(_group_head), region(_group_tail))
     # The inference forms run only when no derivative is formed; decided once here and passed down.
     inference = _derivative_free()
-    solcon, setup, pre, aerosol, surface, cloud, overlap, diagnostics = head(state, config, bundle, parameter_scales)
+    solcon, setup, pre, aerosol, surface, cloud, overlap, diagnostics = head(state, config, tables, parameter_scales)
     config = replace(config, solcon=solcon)
     state = {**state, **surface}
-    sw = run_rrtmgp_sw_main(state, pre, cloud, config, tables=bundle, day_fraction=sw_day_fraction, blocks=blocks,
+    sw = run_rrtmgp_sw_main(state, pre, cloud, config, tables=tables, day_fraction=sw_day_fraction, blocks=blocks,
                             overlap=overlap, inference=inference)
-    lw = run_rrtmgp_lw_main(state, pre, cloud, config, tables=bundle, blocks=blocks, overlap=overlap,
+    lw = run_rrtmgp_lw_main(state, pre, cloud, config, tables=tables, blocks=blocks, overlap=overlap,
                             inference=inference)
     post = tail(state, pre, sw, lw, config, aerosol, diagnostics)
     pre = {name: value for name, value in pre.items() if name not in _AEROSOL_PREPARATION_FIELDS}

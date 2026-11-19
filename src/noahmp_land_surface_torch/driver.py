@@ -10,8 +10,6 @@ delegates the land-column physics to ``land_body``. Unsupported Noah-MP options 
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any, Mapping, NamedTuple
 
 import torch
@@ -48,8 +46,6 @@ from .tables import (
 )
 
 
-ROOT = Path(__file__).resolve().parents[4]
-CASE_DIR = ROOT / "orchestration" / "noahmp_land_surface" / "materialized_scenarios" / "cases"
 SMOOTH_TENSOR_OVERRIDE_KEY = "_smooth_tensor_overrides"
 PREPARED_TENSOR_COLUMNS_KEY = "_prepared_tensor_columns"
 PREPARED_METADATA_KEY = "_prepared_metadata"
@@ -91,16 +87,12 @@ PENMAN_A23M4 = 17.2693882 * (273.16 - 35.86)
 PENMAN_A4 = 35.86
 
 
-def load_case(case: str | Mapping[str, Any], *, copy_mapping: bool = True) -> dict[str, Any] | Mapping[str, Any]:
-    if isinstance(case, Mapping):
-        # {**case}, not dict(case): Dynamo traces dict(mapping) by wrapping every nested value, here each
-        # per-column entry of "columns" (with a guard on each), so a compiled call traces O(ncol) Python
-        # values. The unpacked copy keeps them unrealized.
-        return {**case} if copy_mapping else case
-    path = CASE_DIR / f"{case}.json"
-    if not path.exists():
-        raise FileNotFoundError(f"unknown Noah-MP materialized case {case!r}")
-    return json.loads(path.read_text(encoding="utf-8"))
+def load_case(case: Mapping[str, Any]) -> dict[str, Any]:
+    """A shallow copy of the case mapping, for the driver to extend."""
+    # {**case}, not dict(case): Dynamo traces dict(mapping) by wrapping every nested value, here each
+    # per-column entry of "columns" (with a guard on each), so a compiled call traces O(ncol) Python
+    # values. The unpacked copy keeps them unrealized.
+    return {**case}
 
 
 def _first_leaf(value: Any) -> Any:
@@ -148,7 +140,7 @@ def _physical_grid_metadata(columns: list[Mapping[str, Any]], tables: NoahMpTabl
     }
 
 
-def prepare_noahmp_land_surface_case(case: str | Mapping[str, Any], *, device: torch.device, table_variant: str = PACKAGE_TABLE_VARIANT, bound: Mapping[str, torch.Tensor] | None = None) -> dict[str, Any]:
+def prepare_noahmp_land_surface_case(case: Mapping[str, Any], *, device: torch.device, table_variant: str = PACKAGE_TABLE_VARIANT, bound: Mapping[str, torch.Tensor] | None = None) -> dict[str, Any]:
     """``bound`` device columns stand in for the host lists of the same name, without a host copy."""
     case_data = load_case(case)
     if "_coupled_live_column_names" in case_data:
@@ -1716,7 +1708,7 @@ def _with_live_columns(template: Mapping[str, Any], case_data: Mapping[str, Any]
     return merged
 
 
-def prepare_noahmp_driver_plan(case: str | Mapping[str, Any], *, device: str | torch.device,
+def prepare_noahmp_driver_plan(case: Mapping[str, Any], *, device: str | torch.device,
                                table_variant: str = PACKAGE_TABLE_VARIANT, live_activity: bool = True) -> dict[str, Any]:
     """Everything ``run_noahmp_land_surface_driver`` derives from the host column lists, once per grid.
 
@@ -1878,7 +1870,7 @@ def _driver_water_budget(case, copyback, tail, *, glacier, glacier_fields, devic
 
 
 def noahmp_driver_begin(
-    case: str | Mapping[str, Any], *, device: str | torch.device | None = None,
+    case: Mapping[str, Any], *, device: str | torch.device | None = None,
     table_variant: str = PACKAGE_TABLE_VARIANT,
     activity: torch.Tensor | None = None,
     water_budget: dict[str, torch.Tensor] | None = None,
@@ -1896,7 +1888,7 @@ def noahmp_driver_begin(
         if water_budget:
             raise ValueError("Noah-MP water_budget must be an empty output mapping")
         if table_variant != PACKAGE_TABLE_VARIANT:
-            raise ValueError("Noah-MP water budget requires the R4/package source lineage")
+            raise ValueError(f"Noah-MP water budget requires table_variant={PACKAGE_TABLE_VARIANT!r}")
         water_budget.update({name: torch.zeros_like(output["tskin"]) for name in NOAHMP_WATER_BUDGET_TERMS})
         water_budget.update(active=torch.zeros_like(output["tskin"], dtype=torch.bool),
             glacier=torch.zeros_like(output["tskin"], dtype=torch.bool))

@@ -1165,7 +1165,7 @@ def _run_coupled_operation(previous, arguments, *, on_overflow, operator=None, s
     if on_overflow not in ("assert", "rerun"):
         raise ValueError("on_overflow must be 'assert' or 'rerun'")
     if operator is not None and step_graphs_enabled():
-        raise ValueError("native coupled phases do not yet support captured step graphs")
+        raise ValueError("the native coupled phases do not support step graphs")
     device = previous.sec.device
     checkpointed = torch.is_grad_enabled()
     selected_state = _completed_cycle_state if state_of is None else state_of

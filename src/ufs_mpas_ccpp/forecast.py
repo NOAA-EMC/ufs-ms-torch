@@ -59,6 +59,9 @@ from .radiation import sw_daylit_bound
 from .step_graphs import StepGraphRunner, flatten_state
 
 GRAVITY = 9.80665  # GFS con_g
+# The diag stream: one value per cell (the fhzero buckets arrive as [cells, 1]).
+DIAGNOSTIC_FIELDS = frozenset({"totprcp", "cnvprcp", "totprcpb", "cnvprcpb", "u10m", "v10m", "topflw_upfxc", "t2m",
+                               "q2m", "surface_pressure", "precipitable_water"})
 # The HDF5 library under netCDF4 is not thread-safe (concurrent files crash it): the stream writer thread
 # and the driver's reads take this lock. The schemes read their NetCDF tables at their first call (step 1),
 # before the first output, and nothing else in the forecast loop opens NetCDF.
@@ -200,6 +203,8 @@ def write_stream(path: Path, fields: Mapping[str, torch.Tensor], *, attributes: 
             if tensor.is_floating_point():
                 torch_compat.assert_async(torch.isfinite(tensor).all(), f"{name}: nonfinite forecast output")
             array = tensor.cpu().numpy()  # host output boundary (no-grad forecast state)
+            if name in DIAGNOSTIC_FIELDS:
+                array = array.reshape(-1)
             first = "nEdges" if name in ("u", "global_edge_id") else "nCells"
             dims = [first] if array.ndim else []
             if name in ("u", "theta_m", "rho_zz", "scalars"):
@@ -369,7 +374,7 @@ def run_forecast(case: Mapping[str, Any] | str | Path, output_dir: str | Path, *
     partition = exchanger.partition if exchanger is not None else renumbered
     order = output_order(partition, labeled=parallel, device=native["u"].device)
     if parallel and step_graphs:
-        raise ValueError("distributed CUDA Graph replay is not qualified; use --no-step-graphs")
+        raise ValueError("distributed runs do not support step graphs (CUDA Graph replay); use --no-step-graphs")
     arguments = case["arguments"]
     if dycore_compile:
         config = runtime_policy.with_dycore_compile(config)

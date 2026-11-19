@@ -13,7 +13,7 @@ from .shortwave import (
     _combine_cloud_components,
     _interp_cloud_table,
 )
-from .tables import RrtmgpTableBundle, load_rrtmgp_tables
+from .tables import RrtmgpTableBundle
 
 TensorOrString = torch.Tensor | str
 _LONGWAVE_CLOUD_TABLE_CACHE: dict[tuple[int, int], tuple[Any, ...]] = {}
@@ -78,16 +78,15 @@ def compute_longwave_cloud_optics_byband(
     cld_reliq: torch.Tensor,
     cld_reice: torch.Tensor,
     *,
-    tables: RrtmgpTableBundle | None = None,
+    tables: RrtmgpTableBundle,
     ice_roughness_index: int | None = None,
     band_axis: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute `lw_cloud_props%cloud_optics` by band for liquid plus ice (``band_axis``: ``_interp_cloud_table``)."""
 
     lwp = _to_real(cld_lwp, name="cld_lwp")
-    bundle = tables if tables is not None else load_rrtmgp_tables(device=lwp.device)
     prepared = _longwave_cloud_table_inputs(
-        bundle.files["lw_cloud"],
+        tables.files["lw_cloud"],
         ice_roughness_index=ice_roughness_index,
     )
     liquid = _interp_cloud_table(

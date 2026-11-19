@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import torch
 
-from .tables import RrtmgpTableBundle, RrtmgpTableFile, load_rrtmgp_tables
+from .tables import RrtmgpTableBundle, RrtmgpTableFile
 
 TensorOrString = torch.Tensor | str
 
@@ -113,11 +113,6 @@ def _combine_cloud_components(
     return tau, ssa, g
 
 
-def _sw_cloud_table(bundle: RrtmgpTableBundle | None, *, device: torch.device) -> RrtmgpTableFile:
-    tables = bundle if bundle is not None else load_rrtmgp_tables(device=device)
-    return tables.files["sw_cloud"]
-
-
 @torch.inference_mode(False)
 def _shortwave_cloud_table_inputs(
     table: RrtmgpTableFile,
@@ -167,14 +162,14 @@ def compute_shortwave_cloud_optics_byband(
     cld_reliq: torch.Tensor,
     cld_reice: torch.Tensor,
     *,
-    tables: RrtmgpTableBundle | None = None,
+    tables: RrtmgpTableBundle,
     ice_roughness_index: int | None = None,
     band_axis: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute `sw_cloud_props%cloud_optics` by band for liquid plus ice (``band_axis``: ``_interp_cloud_table``)."""
 
     lwp = _to_real(cld_lwp, name="cld_lwp")
-    table = _sw_cloud_table(tables, device=lwp.device)
+    table = tables.files["sw_cloud"]
     (
         liq_ext,
         liq_ssa,

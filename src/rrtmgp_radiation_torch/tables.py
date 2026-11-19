@@ -68,13 +68,6 @@ TABLE_FILES = {
                  "rrtmgp-cloud-optics-coeffs-reordered-sw.nc",
                  "189ae00e97f41d3c2c8de793786aa47d7d21a6bfd87adab64965231f7002b96c"),
 }
-# Without ``table_dir`` the files are read from the repository's reference copy.
-_REFERENCE_DIRS = {"lw_gas": "data", "sw_gas": "data",
-                   "lw_cloud": "extensions/cloud_optics", "sw_cloud": "extensions/cloud_optics"}
-
-
-def _reference_root() -> Path:
-    return Path(__file__).resolve().parents[4] / "orchestration" / "rrtmgp_radiation" / "reference_inputs" / "rrtmgp"
 
 
 def _sha256(path: Path) -> str:
@@ -145,7 +138,7 @@ def _load_table_file(
 @torch.inference_mode(False)
 def load_rrtmgp_tables(
     *,
-    table_dir: str | Path | None = None,
+    table_dir: str | Path,
     device: str | torch.device = "cpu",
 ) -> RrtmgpTableBundle:
     """Load the frozen gas/cloud optics coefficient tables as torch tensors.
@@ -160,7 +153,7 @@ def load_rrtmgp_tables(
     """
 
     torch_device = torch.device(device)
-    directory = Path(table_dir).resolve() if table_dir is not None else None
+    directory = Path(table_dir).resolve()
     cache_key = (str(directory), str(torch_device))
     cached = _TABLE_BUNDLE_CACHE.get(cache_key)
     if cached is not None:
@@ -169,8 +162,7 @@ def load_rrtmgp_tables(
         key: _load_table_file(
             key=key,
             role=role,
-            path=(directory / name if directory is not None
-                  else _reference_root() / _REFERENCE_DIRS[key] / name).resolve(),
+            path=(directory / name).resolve(),
             expected_sha256=sha256,
             device=torch_device,
         )

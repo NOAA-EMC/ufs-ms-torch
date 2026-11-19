@@ -5,8 +5,8 @@
 
 The folder holds what the Fortran model reads: the initial conditions, the
 ``x<refinement>.<cells>.grid.nc`` mesh (``x1.10242``, ``x4.2562``), ``input.nml``,
-``namelist.atmosphere``, the Noah-MP, ozone, RRTMGP (``rrtmgp/``) and TEMPO
-tables. ``build_native_case`` returns the operands of ``initialize_cold_cycle``
+``namelist.atmosphere``, the Noah-MP, ozone, RRTMGP (``rrtmgp/``, the folder itself or ``$RRTMGP_TABLE_DIR``)
+and TEMPO tables. ``build_native_case`` returns the operands of ``initialize_cold_cycle``
 and ``run_coupled_interval`` for one rank, on CPU, in float64, with every column of the mesh.
 
 Values that the GFS host leaves unassigned on this path are set explicitly:
@@ -45,7 +45,7 @@ from noahmp_land_surface_torch.tables import (
     _section,
 )
 from rrtmgp_radiation_torch.radiation_group import table_metadata
-from rrtmgp_radiation_torch.tables import load_rrtmgp_tables
+from rrtmgp_radiation_torch.tables import TABLE_FILES, load_rrtmgp_tables
 from tempo_torch.mp_tempo import mp_tempo_init
 
 from . import (
@@ -269,6 +269,23 @@ def tempo_table_dir(run_dir: Path) -> Path:
     )
 
 
+def rrtmgp_table_dir(run_dir: Path) -> Path:
+    """``rrtmgp/`` of the runtime folder, else the folder itself if it holds the RRTMGP tables, else
+    ``$RRTMGP_TABLE_DIR``."""
+    if (run_dir / "rrtmgp").is_dir():
+        return run_dir / "rrtmgp"
+    names = [name for _, name, _ in TABLE_FILES.values()]
+    if all((run_dir / name).is_file() for name in names):
+        return run_dir
+    fallback = os.environ.get("RRTMGP_TABLE_DIR")
+    if fallback:
+        return Path(fallback)
+    raise FileNotFoundError(
+        f"{run_dir} lacks the RRTMGP tables {', '.join(names)} (in rrtmgp/ or the folder itself); "
+        "copy them there or set RRTMGP_TABLE_DIR"
+    )
+
+
 @lru_cache(maxsize=2)
 def cold_tempo_tables(table_dir=None):
     """TEMPO lookup tables as tensors, from ``table_dir`` or ``$TEMPO_TABLE_DIR``."""
@@ -401,7 +418,7 @@ def build_native_case(
     ).sfcprop
     tables = load_rrtmgp_tables(
         device="cpu",
-        table_dir=run_dir / "rrtmgp" if (run_dir / "rrtmgp").is_dir() else None,
+        table_dir=rrtmgp_table_dir(run_dir),
     )
     table_metadata(tables)
     radiation_config = prepare_r4_radiation_config(

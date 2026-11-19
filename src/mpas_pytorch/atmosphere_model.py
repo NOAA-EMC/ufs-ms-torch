@@ -2220,7 +2220,7 @@ def _materialize_native_step(
 
         if (not isinstance(exchanger, DynamicsHaloExchange)
                 or state["ru"].device.type != "cpu"):
-            raise MpasConfigError("native step closure is not yet qualified for this halo policy")
+            raise MpasConfigError("the native step closure supports only a DynamicsHaloExchange halo exchanger on CPU")
         for kind, dimension in _NATIVE_PARTITION_DIMENSIONS:
             entity = exchanger.partition.entity(kind)
             required = {

@@ -188,7 +188,7 @@ def apply_pbl_mixing(
 def apply_pbl_canopy(prefix: PhysicsPrefixResult, *, control: Mapping[str, object]) -> PhysicsPrefixResult:
     """Retain canopy_driver's exact early return for the selected R4 flags."""
     if control["do_canopy"] and control["cplaqm"]:
-        raise NotImplementedError("live active canopy_driver binding is not qualified")
+        raise NotImplementedError("canopy_driver with do_canopy and cplaqm is not supported")
     return prefix
 
 
@@ -214,7 +214,7 @@ def apply_pbl_post(
     coupling must not silently use this selected noncoupled binding.
     """
     if any(control[n] for n in ("cplflx", "cplaqm", "cplchm", "cplcat")):
-        raise NotImplementedError("live external PBL flux coupling is not qualified")
+        raise NotImplementedError("external flux and chemistry coupling (cplflx, cplaqm, cplchm, cplcat) is not supported")
     for name, value in (("dtp", dtp), ("dtf", dtf)):
         if value.ndim != 0 or value.dtype not in WORKING_DTYPES or value.device != prefix.stateout.gt0.device:
             raise ValueError(f"PBL post {name} requires a device-local float32/float64 scalar")

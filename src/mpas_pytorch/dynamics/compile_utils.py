@@ -3444,8 +3444,8 @@ def validate_differentiable_compile_request(
         and not forward_ad_qualified
     ):
         raise ValueError(
-            "differentiable torch.compile forward AD/JVP is not qualified; "
-            "use the eager differentiable path"
+            "differentiable torch.compile does not support forward-mode AD (JVP) for these target "
+            "kernels; use the eager differentiable path"
         )
     if targets is None:
         raise ValueError(
@@ -3467,8 +3467,8 @@ def validate_differentiable_compile_request(
     ]
     if blocked:
         raise ValueError(
-            "differentiable torch.compile targets are not AD-qualified for "
-            f"device {_device_type(device)!r}: {blocked}"
+            "differentiable torch.compile does not support reverse-mode AD on "
+            f"device {_device_type(device)!r} for target kernels {blocked}"
         )
     experiment = _resolve_config_scalar(
         config, "config_torch_compile_differentiable_policy", "blocked"
@@ -3493,7 +3493,7 @@ def validate_differentiable_compile_request(
             }
             if not dtypes <= covered:
                 raise ValueError(
-                    f"normal compiled AD of {name} is qualified only for {sorted(covered)} inputs"
+                    f"compiled AD of {name} supports only {sorted(covered)} inputs"
                 )
     return targets
 

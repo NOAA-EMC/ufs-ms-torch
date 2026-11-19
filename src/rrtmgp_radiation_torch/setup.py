@@ -12,8 +12,6 @@ from pathlib import Path
 import torch
 from mpas_pytorch import _torch_compat as torch_compat
 
-from .reference_inputs import physics_input_dir as _physics_input_dir
-
 
 CZLIMT = 0.0001
 
@@ -35,11 +33,11 @@ def _load_annual_solar_constant(
     year: int,
     *,
     filename: str,
-    physics_input_dir: str | Path | None = None,
+    physics_input_dir: str | Path,
 ) -> float:
-    """Load the annual TSI value used by `module_radiation_astronomy::sol_update`."""
+    """Load the annual TSI value used by `module_radiation_astronomy::sol_update` from ``physics_input_dir``."""
 
-    path = (Path(physics_input_dir) if physics_input_dir is not None else _physics_input_dir()) / filename
+    path = Path(physics_input_dir) / filename
     lines = path.read_text(encoding="utf-8").splitlines()
     if not lines:
         raise ValueError(f"empty solar table: {path}")

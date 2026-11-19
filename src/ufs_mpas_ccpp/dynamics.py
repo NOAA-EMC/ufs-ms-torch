@@ -107,7 +107,7 @@ def advance_physics_dynamics(
     step_config = dycore_step_config(config, mesh, differentiable=differentiable, forward_mode=forward_mode)
     if _native_boundary_output:
         if not native_boundary_supported(config, reference.device):
-            raise ValueError("native coupled output is not qualified for this boundary policy")
+            raise ValueError("native coupled output supports only no halo exchanger or a DynamicsHaloExchange on CPU")
         # A partition's owned columns end before its halo rows. Only the
         # true sentinel row is interface-pressure padding.
         padding = committed["surface_pressure"][committed["rho_p"].shape[0] - 1:]

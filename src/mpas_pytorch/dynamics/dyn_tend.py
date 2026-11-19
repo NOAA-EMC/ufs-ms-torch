@@ -405,8 +405,8 @@ def resolve_dynamics_tendency_ad_compile_mode(
         and not cuda_experiment
     ):
         raise ValueError(
-            "compiled dynamics-tendency ordered adjoints are CPU-qualified only; "
-            f"device {device_type!r} remains fail-closed"
+            "compiled dynamics-tendency ordered adjoints run on CPU only; "
+            f"device {device_type!r} is not supported"
         )
     return effective
 
@@ -3630,8 +3630,8 @@ def build_dynamics_tendency_ad_compile_plan(
         and not (device_type == "cuda" and experimental_cuda)
     ):
         raise ValueError(
-            "compiled dynamics-tendency ordered adjoints are CPU-qualified only; "
-            f"device {device_type!r} remains fail-closed"
+            "compiled dynamics-tendency ordered adjoints run on CPU only; "
+            f"device {device_type!r} is not supported"
         )
 
     callables: dict[str, Callable[..., Any]] = {
@@ -8925,13 +8925,13 @@ def _validate_dynamics_tendency_numeric_plan_inputs(
     )
     if cell_owned and u.device.type != "cuda":
         raise ValueError(
-            "config_dynamics_tendency_cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab is GPU A/B-only; do not build "
-            "a CPU dynamics-tendency numeric plan for it."
+            "config_dynamics_tendency_cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab runs on CUDA only; "
+            "a CPU dynamics-tendency numeric plan cannot use it."
         )
     if cell_owned and is_grad_mode():
         raise ValueError(
-            "config_dynamics_tendency_cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab is a forward-only GPU A/B "
-            "experiment; do not build an AD-active dynamics-tendency numeric plan for it."
+            "config_dynamics_tendency_cell_owned_vertical_velocity_horizontal_advection_theta_horizontal_advection_ab supports forward runs only; "
+            "a dynamics-tendency numeric plan that carries gradients cannot use it."
         )
 
 

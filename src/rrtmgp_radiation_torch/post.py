@@ -44,8 +44,8 @@ def compute_heating_rate(
     pressure = _to_real(p_lev, name="p_lev")
     if up.shape != down.shape or up.shape != pressure.shape:
         raise ValueError(
-            "flux_up, flux_down, and p_lev must have identical checkpoint-shaped "
-            f"interfaces, got {up.shape}, {down.shape}, {pressure.shape}"
+            "flux_up, flux_down and p_lev must have the same [nlev, ncol] interface shape, "
+            f"got {up.shape}, {down.shape}, {pressure.shape}"
         )
     if up.ndim != 2 or up.shape[0] < 2:
         raise ValueError(f"interface fields must have shape [nlev, ncol], got {up.shape}")

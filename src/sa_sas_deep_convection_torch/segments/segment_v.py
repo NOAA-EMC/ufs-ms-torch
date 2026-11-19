@@ -125,7 +125,7 @@ def run(state: SaSasDeepConvectionState) -> SaSasDeepConvectionState:
     reconcile = bool(state.config.get("samf_water_reconciliation", False))
     if reconcile and tend_opt not in (1, 3):
         raise ValueError(
-            "SAMF water reconciliation requires tend_opt_dcnv 1 or 3 (the oracle returns errflg otherwise)"
+            "SAMF water reconciliation requires tend_opt_dcnv 1 or 3 (the Fortran scheme returns errflg for other values)"
         )
 
     gt0 = state.fields.get("gt0", t1).clone()

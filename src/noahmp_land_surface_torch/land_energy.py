@@ -2024,7 +2024,7 @@ def _soilwater_opt_run1_inf1_source_corridor_flat_impl(
     runsrf_save = dt_tensor * 0.0
     wcnd_last = smc * 0.0
     if iteration_count not in {3, 6}:
-        raise ValueError(f"soilwater iteration_count must be 3 or 6 for the sealed opt_run=1 corridor; got {iteration_count}")
+        raise ValueError(f"soilwater iteration_count must be 3 or 6 (opt_run=1); got {iteration_count}")
     for iteration in range(iteration_count):
         active = iteration < niter
         rhstt, ai, bi, ci, qdrain, wcnd = _soilwater_srt_opt_run1_inf1(

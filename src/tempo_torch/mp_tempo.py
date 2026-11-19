@@ -173,7 +173,7 @@ def mp_tempo_init(*, spechum: torch.Tensor, tables: torch_native.TorchFrozenTabl
         if type(value) is not bool:
             raise TypeError(f"TEMPO initialization requires static {name}")
     if do_sat_adj:
-        raise NotImplementedError("R4 MPAS TEMPO must condense internally")
+        raise NotImplementedError("TEMPO initialization supports only do_sat_adj=False (TEMPO condenses internally)")
     require_host_constants(False)
     if spechum.ndim != 2 or min(spechum.shape) < 1 or spechum.dtype not in torch_native.WORKING_DTYPES:
         raise ValueError("TEMPO initialization requires column-first float32/float64 humidity")
@@ -263,7 +263,7 @@ def mp_tempo_run(
     """
 
     if is_aerosol_aware or is_hail_aware:
-        raise NotImplementedError("mp_tempo port covers the oracle suite: is_aerosol_aware=F, is_hail_aware=F")
+        raise NotImplementedError("mp_tempo supports only is_aerosol_aware=False and is_hail_aware=False")
     require_host_constants(is_hail_aware)
     with (_sedimentation_compaction(sedimentation_compaction),
           _semi_lagrangian_window(semi_lagrangian_window_sources), _lane_compaction(lane_compaction),

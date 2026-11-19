@@ -2051,7 +2051,7 @@ def _run_post(fields: dict[str, torch.Tensor], config: dict[str, Any]) -> None:
     reconcile = bool(config.get("samf_water_reconciliation", False))
     if reconcile and tend_opt not in (1, 3):
         raise ValueError(
-            "SAMF water reconciliation requires tend_opt_scnv 1 or 3 (the oracle returns errflg otherwise)"
+            "SAMF water reconciliation requires tend_opt_scnv 1 or 3 (the Fortran scheme returns errflg for other values)"
         )
     # Even pass-through outputs must survive a refresh of caller-owned inputs.
     # Updated fields acquire their own storage in the expressions below.

@@ -65,7 +65,7 @@ def convection_core(fields, *, control, shallow=False):
             raise NotImplementedError(f"R4 convection binding does not activate {name}")
     layout = mpas_tempo_layout(ntc=control["ntc"])
     if layout.ntc not in (0, 7):
-        raise NotImplementedError("R4 SAMF chemistry extent is zero; seven is the qualified G3.2 fixture")
+        raise NotImplementedError("SAMF convection supports only 0 or 7 chemistry tracers (ntc)")
     for name, value in (("nn", layout.nn), ("ntr", layout.ntr),
                         ("ntk", layout.ntk), ("itc", layout.itc), ("ntc", layout.ntc)):
         if type(control[name]) is not int or control[name] != value:
