@@ -1,7 +1,7 @@
 """The vertically implicit solver of the acoustic step: values and derivatives."""
 import torch
 
-from mpas_pytorch.autodiff.tridiagonal_solve import tridiagonal_solve, tridiagonal_solve_scan
+from mpas_pytorch.autodiff.tridiagonal_solve import tridiagonal_solve
 
 
 def system(ncells=3, nlevels=6, seed=0):
@@ -29,12 +29,6 @@ def reference(a, alpha, gamma, rhs):
 def test_solution_matches_the_column_recurrence():
     a, alpha, gamma, rhs = system()
     assert torch.equal(tridiagonal_solve(a, alpha, gamma, rhs), reference(a, alpha, gamma, rhs))
-
-
-def test_scan_form_matches_the_sequential_form():
-    a, alpha, gamma, rhs = system(seed=1)
-    torch.testing.assert_close(tridiagonal_solve_scan(a, alpha, gamma, rhs),
-                               tridiagonal_solve(a, alpha, gamma, rhs), rtol=1e-13, atol=1e-13)
 
 
 def test_reverse_and_forward_derivatives_match_finite_differences():

@@ -56,3 +56,16 @@ def test_ozone_file_must_be_the_supported_one(tmp_path):
                                               (3600.0, 1440.0, 3), (3600.0, 7200.0, 1)])
 def test_radiation_is_called_every_whole_number_of_steps(fhswr, dt, steps):
     assert native_case.radiation_interval_steps(fhswr, dt) == steps
+
+
+def test_rrtmgp_tables_come_from_rrtmgp_then_the_folder_then_the_environment(tmp_path, monkeypatch):
+    monkeypatch.delenv("RRTMGP_TABLE_DIR", raising=False)
+    with pytest.raises(FileNotFoundError, match="RRTMGP_TABLE_DIR"):
+        native_case.rrtmgp_table_dir(tmp_path)
+    monkeypatch.setenv("RRTMGP_TABLE_DIR", str(tmp_path / "elsewhere"))
+    assert native_case.rrtmgp_table_dir(tmp_path) == tmp_path / "elsewhere"
+    for _, name, _ in TABLE_FILES.values():
+        (tmp_path / name).touch()
+    assert native_case.rrtmgp_table_dir(tmp_path) == tmp_path
+    (tmp_path / "rrtmgp").mkdir()
+    assert native_case.rrtmgp_table_dir(tmp_path) == tmp_path / "rrtmgp"
