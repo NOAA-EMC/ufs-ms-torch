@@ -48,6 +48,19 @@ variable-resolution. It holds:
 - the TEMPO tables `freeze_water_data_tempo_v3`, `qr_acr_qg_data_tempo_v3`,
   `qr_acr_qs_data_tempo_v3` and `ccn_activate.bin` (or set `TEMPO_TABLE_DIR`).
 
+Some options in the `gfs_physics_nml` group of `input.nml` read more files from
+the folder:
+
+| Option | Files |
+|---|---|
+| `isol = 2` | `solarconstant_noaa_an.txt` |
+| `ico2 = 2` | `co2historicaldata_YYYY.txt` for the initial year and the next (an earlier year is used if one is missing) |
+| `iaer = 1011` | `aeroclim.m01.nc`, the `aeroclim.mMM.nc` months that bracket the 384 hours after the start (whatever the run length), and `optics_DU.dat`, `optics_SS.dat`, `optics_SU.dat`, `optics_BC.dat`, `optics_OC.dat` |
+| `h2o_phys = .true.` | `global_h2oprdlos.f77` |
+| `do_ugwp_v1 = .true.` and `do_ugwp_v0 = .false.` | `ugwp_limb_tau.nc` |
+
+The GFS v17 target configuration sets all five.
+
 The forecast writes `history.<time>.nc` with the prognostic fields and
 `diag.<time>.nc` with surface diagnostics at each output time, with the cells
 and edges in MPAS mesh order. Options: `--device cuda`, `--dtype f32`,
