@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ufs-ms-torch"
-version = "0.2.0"
+version = "0.2.1"
 description = "MPAS-Atmosphere dynamics coupled to the GFS v17 CCPP physics, in PyTorch"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"

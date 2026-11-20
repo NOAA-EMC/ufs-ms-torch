@@ -439,7 +439,13 @@ def samf_water_reconciliation(
     # The relative bounds below count float64 rounding steps (5e-13 = 2252 ulp); in float32 the
     # same count is scaled by the epsilon ratio (``relative`` is 5e-13 exactly in float64).
     relative = 5.0e-13 * (torch.finfo(gq0.dtype).eps / 2.0 ** -52)
-    column_tol = torch.clamp_min(relative * (torch.abs(column_delta) + requested), 1.0)
+    # Each level's stored water rounds once before and once after the call, so a closed column's residual is a few
+    # rounding steps of its water mass, not of its net change: eight steps of the column vapour. In FP32 a 1e12 kg
+    # vapour column rounds by about 7e4 kg per step, and the change-scaled bound alone rejected closed columns
+    # (x1.10242 2024-01-01 cycle 1: 9 of 10,242 shallow columns, residuals at most 0.1 step). In FP64 the term
+    # is below the 1 kg floor.
+    column_tol = torch.clamp_min(relative * (torch.abs(column_delta) + requested)
+                                 + 8.0 * torch.finfo(gq0.dtype).eps * column_qv_mass, 1.0)
     has_vapour = column_qv_mass > 0.0
     fraction = torch.where(has_vapour, -column_delta / torch.where(has_vapour, column_qv_mass, 1.0), zero)
     error = ((~has_vapour) & (torch.abs(column_delta) > column_tol)
